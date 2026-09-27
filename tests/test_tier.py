@@ -707,7 +707,9 @@ def ep(show, season, episode, viewed=0, size=1024, added=0):
 
 items = [ep("A", 1, 1, viewed=1000), ep("A", 1, 2, viewed=2000),
          ep("A", 1, 3), ep("A", 1, 4), ep("A", 1, 5),
-         ep("B", 1, 1, added=9000), ep("B", 1, 2, added=9000),
+         # `added` must be RECENT: an unstarted series untouched for months is
+         # deliberately not pinned now, so a 1970 sentinel would be excluded.
+         ep("B", 1, 1, added=time.time()), ep("B", 1, 2, added=time.time()),
          ep("C", 1, 1, viewed=500)]
 pins = pamts.next_up(items, 99, 10 ** 9, per_show=1)
 check("A pins its first UNWATCHED item, not its first item", "/f/tv/A/S1/e3" in pins,
@@ -720,11 +722,93 @@ check("depth 3 pins a longer run for A",
       {"/f/tv/A/S1/e3", "/f/tv/A/S1/e4", "/f/tv/A/S1/e5"} <= set(deep), str(sorted(deep)))
 check("and does not invent items B does not have", len(deep) == 5, str(sorted(deep)))
 
+print("=== NEXT-UP: an unstarted series must NEVER outrank one in progress")
+NOW = time.time()
+
+
+def ep2(show, season, episode, viewed=0, size=1024, added=0):
+    return {"kind": "episode", "show": show, "show_key": show, "season": season,
+            "episode": episode, "title": f"e{episode}",
+            "rel": f"{show}/S{season}/e{episode}",
+            "fast": f"/f/tv/{show}/S{season}/e{episode}",
+            "slow": f"/s/tv/{show}/S{season}/e{episode}",
+            "size": size, "last_viewed": viewed, "added": added}
+
+
+# The exact bug: "Fresh" was ADDED today and never watched; "Binge" was WATCHED
+# yesterday. Ranking both on one timestamp scale put Fresh first.
+mixed = [
+    ep2("Binge", 1, 1, viewed=NOW - 86400, added=NOW - 400 * 86400),
+    ep2("Binge", 1, 2, added=NOW - 400 * 86400),
+    ep2("Fresh", 1, 1, added=NOW),
+    ep2("Fresh", 1, 2, added=NOW),
+]
+one = pamts.next_up(mixed, max_items=1, max_bytes=10 ** 9, per_show=1, now=NOW)
+check("one slot goes to the series in PROGRESS, not the one added today",
+      list(one) == ["/f/tv/Binge/S1/e2"], str(list(one)))
+
+both = pamts.next_up(mixed, max_items=9, max_bytes=10 ** 9, per_show=1, now=NOW)
+check("with room for both, both are pinned",
+      "/f/tv/Binge/S1/e2" in both and "/f/tv/Fresh/S1/e1" in both, str(sorted(both)))
+check("each pin records which class it came from",
+      both["/f/tv/Binge/S1/e2"]["unstarted"] is False
+      and both["/f/tv/Fresh/S1/e1"]["unstarted"] is True,
+      str({k: v["unstarted"] for k, v in both.items()}))
+
+print("=== NEXT-UP: unstarted series are capped separately")
+many_new = [ep2(f"New{i}", 1, 1, added=NOW - i) for i in range(6)]
+many_new += [ep2(f"New{i}", 1, 2, added=NOW - i) for i in range(6)]
+capped2 = pamts.next_up(many_new, max_items=99, max_bytes=10 ** 9,
+                        per_show=1, unstarted_max=2, now=NOW)
+check("unstarted_max is honoured", len(capped2) == 2, str(sorted(capped2)))
+check("and every pin is flagged unstarted",
+      all(v["unstarted"] for v in capped2.values()), str(capped2))
+check("unstarted_max=0 pins none of them",
+      pamts.next_up(many_new, max_items=99, max_bytes=10 ** 9, per_show=1,
+                    unstarted_max=0, now=NOW) == {})
+check("include_unstarted=False pins none of them",
+      pamts.next_up(many_new, max_items=99, max_bytes=10 ** 9, per_show=1,
+                    include_unstarted=False, now=NOW) == {})
+
+print("=== NEXT-UP: a series left unwatched for months is not imminent")
+stale = [ep2("Stale", 1, 1, added=NOW - 200 * 86400),
+         ep2("Stale", 1, 2, added=NOW - 200 * 86400)]
+check("added 200 days ago and never started -> not pinned",
+      pamts.next_up(stale, max_items=9, max_bytes=10 ** 9, per_show=1,
+                    unstarted_days=30, now=NOW) == {})
+check("unstarted_days=0 disables the age limit",
+      len(pamts.next_up(stale, max_items=9, max_bytes=10 ** 9, per_show=1,
+                        unstarted_days=0, now=NOW)) == 1)
+
+print("=== NEXT-UP: in-progress series never lose budget to unstarted ones")
+budget_test = []
+for i in (1, 2):
+    budget_test += [ep2(f"Prog{i}", 1, 1, viewed=NOW - i * 86400),
+                    ep2(f"Prog{i}", 1, 2)]
+for i in (1, 2, 3):
+    budget_test += [ep2(f"New{i}", 1, 1, added=NOW)]
+three = pamts.next_up(budget_test, max_items=3, max_bytes=10 ** 9, per_show=1, now=NOW)
+prog = [k for k, v in three.items() if not v["unstarted"]]
+check("both in-progress series got their pin first", len(prog) == 2, str(sorted(three)))
+check("and the remaining slot went to an unstarted one", len(three) == 3, str(sorted(three)))
+
+print("=== NEXT-UP: round-robin still holds WITHIN the in-progress class")
+rr = []
+for i in (1, 2):
+    rr += [ep2(f"P{i}", 1, 1, viewed=NOW - i * 86400),
+           ep2(f"P{i}", 1, 2), ep2(f"P{i}", 1, 3)]
+two = pamts.next_up(rr, max_items=2, max_bytes=10 ** 9, per_show=3, now=NOW)
+check("two in-progress series each get their FIRST pending episode before either "
+      "gets a second",
+      set(two) == {"/f/tv/P1/S1/e2", "/f/tv/P2/S1/e2"}, str(sorted(two)))
+
 print("=== NEXT-UP: caps and round-robin fairness")
 capped = pamts.next_up(items, 2, 10 ** 9, per_show=3)
 check("max_items honoured", len(capped) == 2, str(sorted(capped)))
-check("every series gets its FIRST unwatched item before any gets a second",
-      {"/f/tv/A/S1/e3", "/f/tv/B/S1/e1"} == set(capped), str(sorted(capped)))
+# A is in progress, B has never been started. Both slots go to A -- even A's SECOND
+# pending episode outranks B's first, which is the whole point of the two classes.
+check("an in-progress series takes the budget ahead of an unstarted one",
+      {"/f/tv/A/S1/e3", "/f/tv/A/S1/e4"} == set(capped), str(sorted(capped)))
 check("max_bytes honoured", len(pamts.next_up(items, 99, 1024, per_show=3)) == 1)
 
 print("=== NEXT-UP: pin depth scales with headroom")

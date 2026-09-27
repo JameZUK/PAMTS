@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sys
+import time
 
 try:
     import tomllib                      # Python 3.11+
@@ -41,6 +42,14 @@ DEFAULTS = {
         "next_up_max_items": 40,
         "next_up_max_gb": 80,
         "pin_depth_max": 4,
+        # A series you have never started is a GUESS. The next episode of one you are
+        # part-way through is a near-certainty. So unstarted series rank strictly below
+        # every in-progress one and are capped separately -- otherwise a series added
+        # today outranks one watched yesterday and speculation eats the budget.
+        "next_up_include_unstarted": True,
+        "next_up_unstarted_days": 30,     # only if added this recently: a series sitting
+                                          # untouched for months is not imminent
+        "next_up_unstarted_max": 3,       # at most this many unstarted series
         # Filesystem types a replica/slow destination may legitimately live on.
         # The guard exists because writing to an UNMOUNTED mountpoint silently fills
         # the local root filesystem -- and with --remove-source-files, then deletes
@@ -331,7 +340,8 @@ def pin_depth(headroom_bytes, budget_bytes):
     return max(1, int(round(1 + frac * (dmax - 1))))
 
 
-def next_up(items, max_items, max_bytes, per_show=1):
+def next_up(items, max_items, max_bytes, per_show=1, include_unstarted=None,
+            unstarted_days=None, unstarted_max=None, now=None):
     """{fast path: info} -- the next unwatched item of each series.
 
     Why this exists: a whole-season download lands on the fast tier at once. Keeping
@@ -343,47 +353,91 @@ def next_up(items, max_items, max_bytes, per_show=1):
     the player has a file for, so gaps in a season do not stall the pin.
 
     Capped, because a large library has hundreds of series and pinning one episode of
-    every one could run to terabytes. Series are prioritised by recent activity (most
-    recently played; for one never started, most recently added). Allocation is
-    round-robin, so every active series gets its FIRST unwatched episode before any
-    series gets a second.
+    every one could run to terabytes. Allocation is round-robin, so every series
+    considered gets its FIRST pending episode before any gets a second.
+
+    IN-PROGRESS BEATS UNSTARTED, ALWAYS
+    -----------------------------------
+    The next episode of a series you are part-way through is a near-certainty. Episode
+    one of a series you have never started is a guess -- the same speculation this
+    project declines to make for films.
+
+    An earlier version ranked both on one scale: last-played for series with history,
+    date-added for those without. Those are different kinds of timestamp, so a series
+    added today outranked one watched yesterday, took the top of the list, and consumed
+    the largest share of the budget on content nobody had touched. Now the two are
+    separate classes: every in-progress series is allocated first and without a cap,
+    and unstarted ones get only what survives -- at most `unstarted_max` of them, and
+    only if added within `unstarted_days`. A series sitting unwatched for months is not
+    imminent and is skipped entirely.
     """
+    if include_unstarted is None:
+        include_unstarted = bool(TIER.get("next_up_include_unstarted", True))
+    if unstarted_days is None:
+        unstarted_days = int(TIER.get("next_up_unstarted_days", 30))
+    if unstarted_max is None:
+        unstarted_max = int(TIER.get("next_up_unstarted_max", 3))
+    if now is None:
+        now = time.time()
     by_show = {}
     for it in items:
         if it.get("kind") != "episode" or it.get("show_key") is None:
             continue
         by_show.setdefault(it["show_key"], []).append(it)
 
-    picks = []
+    started, unstarted = [], []
     for _key, eps in by_show.items():
-        unwatched = sorted(
+        pending = sorted(
             (e for e in eps if not e["last_viewed"]
              and e["season"] is not None and e["episode"] is not None),
             key=lambda e: (e["season"], e["episode"]))
-        if not unwatched:
+        if not pending:
             continue
+        run = pending[:max(1, per_show)]
         watched = [e["last_viewed"] for e in eps if e["last_viewed"]]
-        priority = max(watched) if watched else max((e.get("added") or 0 for e in eps),
-                                                   default=0)
-        picks.append((priority, unwatched[:max(1, per_show)]))
+        if watched:
+            started.append((max(watched), run))
+            continue
+        if not include_unstarted:
+            continue
+        added = max((e.get("added") or 0 for e in eps), default=0)
+        if unstarted_days and added and (now - added) > unstarted_days * 86400:
+            continue                    # untouched for months; not imminent
+        unstarted.append((added, run))
 
-    picks.sort(key=lambda t: t[0], reverse=True)
+    started.sort(key=lambda t: t[0], reverse=True)
+    unstarted.sort(key=lambda t: t[0], reverse=True)
+
     pins, used = {}, 0
-    for depth in range(max(1, per_show)):
-        for _prio, run in picks:
-            if depth >= len(run):
-                continue
-            e = run[depth]
-            if len(pins) >= max_items:
-                return pins
-            if used + (e["size"] or 0) > max_bytes:
-                continue
-            pins[e["fast"]] = {
-                "show": e.get("show"), "season": e.get("season"),
-                "episode": e.get("episode"), "slow": e["slow"],
-                "size": e["size"], "rel": e["rel"], "depth": depth,
-            }
-            used += e["size"] or 0
+
+    def take(groups, is_unstarted, show_cap=None):
+        nonlocal used
+        shows = set()
+        for depth in range(max(1, per_show)):
+            for _prio, run in groups:
+                if depth >= len(run):
+                    continue
+                e = run[depth]
+                if len(pins) >= max_items:
+                    return
+                key = e.get("show") or e["rel"].split("/", 1)[0]
+                if show_cap is not None and key not in shows and len(shows) >= show_cap:
+                    continue
+                if used + (e["size"] or 0) > max_bytes:
+                    continue
+                pins[e["fast"]] = {
+                    "show": e.get("show"), "season": e.get("season"),
+                    "episode": e.get("episode"), "slow": e["slow"],
+                    "size": e["size"], "rel": e["rel"], "depth": depth,
+                    "unstarted": is_unstarted,
+                }
+                used += e["size"] or 0
+                shows.add(key)
+
+    # In-progress first and uncapped: these are the pins worth guaranteeing.
+    take(started, False)
+    # Only what survives may go to a few freshly added series.
+    take(unstarted, True, show_cap=max(0, unstarted_max))
     return pins
 
 
