@@ -297,10 +297,10 @@ def do_tier(jobs, budget, dry_run, views=_FETCH, pins=None):
             logging.warning("[tier] no player supplied play history; ranking on "
                             "PAMTS's observed plays alone. This is expected for "
                             "session-only players, and improves as history accumulates.")
-        # Pin depth scales with headroom, so measure the footprint first.
+        # Pin depth scales with how full the tier is, so measure the footprint first.
         pre = sum(scan_dir(j["source"], views)["size"]
                   for j in jobs if os.path.isdir(j["source"]))
-        depth = pamts.pin_depth(budget - pre, budget)
+        depth = pamts.pin_depth(pre, budget)
         pins = pamts.next_up(items, int(pamts.TIER["next_up_max_items"]),
                              int(pamts.TIER["next_up_max_gb"]) * pamts.GB, depth)
         logging.info(f"[tier] view data: {len(views)} played item(s)")

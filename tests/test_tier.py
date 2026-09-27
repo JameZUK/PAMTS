@@ -811,14 +811,20 @@ check("an in-progress series takes the budget ahead of an unstarted one",
       {"/f/tv/A/S1/e3", "/f/tv/A/S1/e4"} == set(capped), str(sorted(capped)))
 check("max_bytes honoured", len(pamts.next_up(items, 99, 1024, per_show=3)) == 1)
 
-print("=== NEXT-UP: pin depth scales with headroom")
+print("=== NEXT-UP: pin depth scales with how full the tier is")
 B = 400 * GB
 pamts.TIER = dict(pamts.DEFAULTS["tier"])
-check("empty tier pins the maximum depth",
-      pamts.pin_depth(B, B) == int(pamts.TIER["pin_depth_max"]), str(pamts.pin_depth(B, B)))
-check("full tier pins exactly one", pamts.pin_depth(0, B) == 1)
-check("half-full is in between", 1 < pamts.pin_depth(B // 2, B) < int(pamts.TIER["pin_depth_max"]))
-check("negative headroom still pins one", pamts.pin_depth(-5 * GB, B) == 1)
+# pin_depth takes the FOOTPRINT. It used to take a "headroom", and the two callers
+# disagreed about which headroom -- so the signature was changed to something with one
+# possible meaning.
+check("an EMPTY tier pins the maximum depth",
+      pamts.pin_depth(0, B) == int(pamts.TIER["pin_depth_max"]), str(pamts.pin_depth(0, B)))
+check("a FULL tier pins exactly one", pamts.pin_depth(B, B) == 1, str(pamts.pin_depth(B, B)))
+check("half-full is in between",
+      1 < pamts.pin_depth(B // 2, B) < int(pamts.TIER["pin_depth_max"]),
+      str(pamts.pin_depth(B // 2, B)))
+check("over budget still pins one", pamts.pin_depth(B * 2, B) == 1,
+      str(pamts.pin_depth(B * 2, B)))
 
 print()
 print(f"{'ALL TESTS PASSED' if not fails else 'FAILURES: ' + ', '.join(fails)}")

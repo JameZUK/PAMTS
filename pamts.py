@@ -327,16 +327,24 @@ def is_protected(candidate, records):
 
 
 # ------------------------------------------------------- next-to-watch pinning
-def pin_depth(headroom_bytes, budget_bytes):
-    """How many items ahead to pin, scaled by free headroom.
+def pin_depth(footprint_bytes, budget_bytes):
+    """How many items ahead to pin, scaled by how full the fast tier is.
 
     Nearly-empty tier -> keep a longer run local; there is no reason not to.
     Nearly-full tier  -> one item per series, which is the actual guarantee.
+
+    Takes the FOOTPRINT, not a headroom, deliberately. An earlier signature took
+    "headroom", and the two callers disagreed about what that meant: eviction passed
+    `budget - footprint` while promotion passed its own anti-thrash headroom
+    (`budget - reserve - footprint`). They therefore derived different depths from the
+    same state -- the exact divergence the shared module exists to prevent, masked only
+    because the byte cap usually binds first. A footprint has one meaning.
     """
     dmax = int(TIER["pin_depth_max"])
     if budget_bytes <= 0:
         return 1
-    frac = max(0.0, min(1.0, headroom_bytes / budget_bytes))
+    headroom = budget_bytes - max(0, footprint_bytes)
+    frac = max(0.0, min(1.0, headroom / budget_bytes))
     return max(1, int(round(1 + frac * (dmax - 1))))
 
 

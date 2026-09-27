@@ -188,7 +188,7 @@ def record_rate(state, stats):
                  f"estimate now {human(state['rate_bps'])}/s")
 
 
-def do_next_up(players, budget, budget_left, state, stats, now, dry_run):
+def do_next_up(players, budget, budget_left, footprint, state, stats, now, dry_run):
     """Make sure each series' next unwatched item is on fast storage.
 
     Run nightly, after eviction. Tiering deliberately lets a whole-season download age
@@ -216,7 +216,10 @@ def do_next_up(players, budget, budget_left, state, stats, now, dry_run):
                 it["last_viewed"] = o
                 folded += 1
         logging.info(f"[next-up] folded in {folded} observed play(s)")
-    depth = pamts.pin_depth(budget_left, budget)
+    # The FOOTPRINT, not budget_left: budget_left has the anti-thrash reserve taken
+    # out, and passing it here made this derive a different depth from the eviction
+    # side. Both must compute the identical pin set.
+    depth = pamts.pin_depth(footprint, budget)
     pins = pamts.next_up(items, int(pamts.TIER["next_up_max_items"]),
                          int(pamts.TIER["next_up_max_gb"]) * pamts.GB, depth)
     logging.info(f"[next-up] pinning {depth} item(s) ahead per series; {len(pins)} "
@@ -331,7 +334,8 @@ def main():
         return 2
 
     if args.next_up:
-        rc = do_next_up(players, budget, budget_left, state, stats, now, args.dry_run)
+        rc = do_next_up(players, budget, budget_left, footprint, state, stats, now,
+                        args.dry_run)
         record_rate(state, stats)
         pamts.prune_observed(state, now)
         pamts.save_state(state, args.dry_run)
