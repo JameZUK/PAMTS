@@ -354,6 +354,37 @@ def main():
             logging.error(f"[{pl.name}] cannot query: {e}")
             rc = 1
             continue
+
+        # Plays recorded since we last looked. This is the multi-user trigger: a
+        # server's own play records cover every user, whereas a session API may only
+        # show the calling account's sessions (and whether it shows others is
+        # server- and role-dependent). It also catches plays that happened between
+        # runs, which a session poll inevitably misses.
+        if not args.simulate_recent:
+            marks = state.setdefault("watermarks", {})
+            mark = marks.get(pl.name)
+            if mark is None:
+                # First sight of this player: adopt now as the baseline. Without this,
+                # the "since" window would be the whole of recorded history and the
+                # first run would try to promote the entire library.
+                marks[pl.name] = now
+                logging.info(f"[{pl.name}] first run - recording a play watermark; "
+                             "recent-play detection starts from now")
+            else:
+                try:
+                    recent = pl.recent_plays(mark)
+                except Exception as e:
+                    logging.error(f"[{pl.name}] recent_plays failed: {e}")
+                    recent = []
+                    rc = 1
+                if recent:
+                    logging.info(f"[{pl.name}] {len(recent)} play(s) recorded since "
+                                 f"the last pass")
+                    # A track can appear in both lists; keep one event per path.
+                    known = {e.path for e in evs}
+                    evs = list(evs) + [e for e in recent if e.path not in known]
+                marks[pl.name] = now
+
         if not evs:
             logging.info(f"[{pl.name}] nothing playing")
         pairs.extend((pl, ev) for ev in evs)

@@ -114,6 +114,33 @@ sessions before relying on it for that.
 Subsonic also reports song `path` **relative to the music folder**, so `music_folder` is
 required — it is the absolute base PAMTS prepends before mapping onto your tiers.
 
+## Two promotion triggers, and why the second exists
+
+`now_playing()` asks "what is streaming right now". That is ideal when it works: it gives
+the remaining runtime, so PAMTS can size the copy to finish before the current item ends.
+
+`recent_plays(since)` asks the server's own play records "what was played since I last
+looked". It exists because the first question has two blind spots:
+
+- **Other users.** Whether a session API reveals other people's sessions is server- and
+  role-dependent. Play *records* are not: they are written for everybody.
+- **The gaps between polls.** A session poll only sees what is playing at the instant it
+  asks. Anything that started and finished in between is invisible. A recorded play is
+  not.
+
+The cost is precision: a play is recorded at or near the end of a track, so there is no
+remaining time and no time budget can be computed. For music tracks that hardly matters,
+and the time budget has a floor, so it degrades rather than breaking.
+
+PAMTS uses both when both are available, de-duplicated by path, and keeps a per-player
+watermark in its state file. **On first sight of a player the watermark is set to "now"**
+and detection starts from there — otherwise the first run would treat the entire recorded
+history as "just played" and try to promote the whole library.
+
+This is what makes a multi-user music library work automatically, with no privileged
+account: `history_db` supplies both the ranking history and the play trigger, and both
+cover every user.
+
 ## Several players at once
 
 `[[players]]` takes any number of adapters, and this is the normal case for music: a
@@ -150,6 +177,7 @@ history.
 | `available()` | both | `True` if configured and reachable; log why not |
 | `library_items()` | tiering | every item, with last-played time — or `None` on failure |
 | `now_playing()` | promotion | `[PlayEvent]` for what is playing now |
+| `recent_plays(since)` | promotion | `[PlayEvent]` for plays *recorded* since then (optional) |
 | `locality_group(event)` | promotion | `[Candidate]` likely to follow, in play order |
 
 And two class attributes declaring what it can actually do:

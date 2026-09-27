@@ -157,9 +157,10 @@ construction, because a scan is never a playing session.
 
 For music there is a wrinkle worth knowing before you configure it: neither music server's
 API can answer *"what has anyone played"* — LMS exposes no play data at all, and Subsonic
-annotations are per-user. An optional read-only `history_db` closes that gap for both, and
-is the only way to get history that predates PAMTS. Details and trade-offs in
-[PLAYERS.md](docs/PLAYERS.md).
+annotations are per-user. An optional read-only `history_db` closes that gap, and for a
+**multi-user** library it is the whole answer: it supplies both the ranking history and the
+play trigger, covering every user automatically without giving PAMTS a privileged account.
+Details and trade-offs in [PLAYERS.md](docs/PLAYERS.md).
 
 Adding a player is one class and one registry line — see [PLAYERS.md](docs/PLAYERS.md),
 which also covers two gotchas worth reading before you configure music: LMS exposes no
@@ -192,7 +193,7 @@ python3 tests/test_tier.py
 python3 tests/test_promote.py
 ```
 
-204 checks. They use temporary directories and a fake player — they never contact a real
+214 checks. They use temporary directories and a fake player — they never contact a real
 media server and never touch real storage. `rsync` is required; the suites skip with a
 clear message if it is missing.
 

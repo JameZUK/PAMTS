@@ -144,6 +144,22 @@ class Player(abc.ABC):
         """
         return []
 
+    def recent_plays(self, since):
+        """-> [PlayEvent] for items played since `since` (epoch). Default: none.
+
+        An alternative promotion trigger for servers whose play records are per-user
+        while their session API may not be. Reading "what was played since we last
+        looked" from the server's own records covers EVERY user automatically, needs no
+        privileged account, and is authoritative -- it is what the server actually
+        recorded, not what it happens to be streaming at the instant we ask.
+
+        The trade-off against a live session API is precision: a play is recorded at or
+        near the end of a track, so the remaining time is unknown and no time budget can
+        be computed. For short items like music tracks that hardly matters, and the time
+        budget has a floor, so it degrades rather than breaking.
+        """
+        return []
+
     # ---------------------------------------------------------- optional history_db
     # Some servers simply do not expose play history over their API. Where the data
     # exists in a local database, an adapter may read it -- READ ONLY -- if the
@@ -484,13 +500,54 @@ class LmsPlayer(Player):
                 group={"track_id": t.get("id")}))
         return out
 
+    def recent_plays(self, since):
+        """Tracks played since `since`, from persist.db.
+
+        Complements now_playing(): a play is recorded even if PAMTS was not polling at
+        the moment it happened, so nothing is missed between runs.
+        """
+        if not self.cfg.get("history_db"):
+            return []
+        rows = self._read_db(
+            "SELECT url, lastPlayed FROM tracks_persistent "
+            "WHERE lastPlayed IS NOT NULL AND lastPlayed > ? ORDER BY lastPlayed",
+            (int(since),))
+        if not rows:
+            return []
+        out = []
+        for url, played in rows:
+            path = self._path_from_url(url)
+            if not path or not pamts.split_root(path):
+                continue
+            # persist.db has no album id; locality is resolved from the path's album via
+            # the API, so carry the URL and let locality_group look it up by track id.
+            out.append(PlayEvent(
+                source=self.name, kind="track", path=path, remaining_s=0.0,
+                label=f"{os.path.basename(path)} (played {int(played)})",
+                group={"url": url}))
+        return out
+
     def locality_group(self, event):
         """The rest of the album, in track order."""
         if event.kind != "track" or not event.group:
             return []
         tid = event.group.get("track_id")
         if tid is None:
-            return []
+            # recent_plays events carry a URL rather than a track id; resolve it.
+            url = event.group.get("url")
+            if not url:
+                return []
+            try:
+                r = self._rpc("", ["titles", "0", "1", f"search:{os.path.basename(url)}",
+                                   "tags:u"])
+                for t in r.get("titles_loop", []):
+                    if t.get("url") == url:
+                        tid = t.get("id")
+                        break
+            except (urllib.error.URLError, OSError, ValueError):
+                return []
+            if tid is None:
+                return []
         try:
             # status' playlist_loop does not carry album_id, so resolve it per track.
             info = self._rpc("", ["songinfo", "0", "50", f"track_id:{tid}", "tags:e"])
@@ -756,6 +813,42 @@ Verified against Navidrome 0.64.0.
                 label=f"{s.get('artist')} - {s.get('title')}"
                       + (f" [{remaining / 60:.0f} min left]" if remaining else ""),
                 group={"album_id": s.get("albumId"), "track": s.get("track") or 0}))
+        return out
+
+    def recent_plays(self, since):
+        """Plays by ANY user since `since`, from the annotation table.
+
+        This is the multi-user answer. Subsonic's per-user annotations cannot be read
+        across accounts through the API, and whether a session API exposes other users'
+        sessions is server- and role-dependent. The annotation table has one row per
+        (user, item) and is written on every play, so asking it "what changed since we
+        last looked" covers everybody with no special privileges.
+        """
+        if not self.cfg.get("history_db"):
+            return []
+        folder = str(self.cfg.get("music_folder") or "").rstrip("/")
+        if not folder:
+            return []
+        iso = datetime.datetime.fromtimestamp(
+            since, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        rows = self._read_db(
+            "SELECT mf.path, mf.size, mf.album_id, mf.track_number, mf.title, "
+            "       MAX(a.play_date) "
+            "FROM annotation a JOIN media_file mf ON mf.id = a.item_id "
+            "WHERE a.item_type = 'media_file' AND a.play_date IS NOT NULL "
+            "  AND a.play_date > ? "
+            "GROUP BY mf.id ORDER BY MAX(a.play_date)", (iso,))
+        if not rows:
+            return []
+        out = []
+        for path, _size, album_id, track, title, played in rows:
+            full = path if str(path).startswith("/") else os.path.join(folder, path)
+            if not pamts.split_root(full):
+                continue
+            out.append(PlayEvent(
+                source=self.name, kind="track", path=full, remaining_s=0.0,
+                label=f"{title} (played {played})",
+                group={"album_id": album_id, "track": track or 0}))
         return out
 
     def locality_group(self, event):

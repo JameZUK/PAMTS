@@ -355,6 +355,37 @@ def main():
     check(byrel["Alb/01 a.flac"]["size"] == 111, "size carried from media_file")
     check(byrel["Alb/02 b.flac"]["episode"] == 2, "track number becomes the order key")
 
+    print("\n=== recent_plays: the multi-user trigger, from the play records")
+    nd4 = pamts_players.NavidromePlayer({
+        "name": "nd4", "url": "http://unused", "username": "u",
+        "token_file": "/dev/null", "music_folder": "/player/tv",
+        "history_db": nd_db})
+    # userB played m1 in June, m2 in March. A watermark before both sees both.
+    ev_all = nd4.recent_plays(nd4._epoch("2026-01-01T00:00:00Z"))
+    check(len(ev_all) == 2, f"both plays seen from an early watermark (got {len(ev_all)})")
+    # A watermark after March but before June sees only the June one.
+    ev_some = nd4.recent_plays(nd4._epoch("2026-04-01T00:00:00Z"))
+    check([e.group["album_id"] for e in ev_some] == ["al1"] and len(ev_some) == 1,
+          f"only plays newer than the watermark (got {len(ev_some)})")
+    check(nd4.recent_plays(nd4._epoch("2026-12-01T00:00:00Z")) == [],
+          "a watermark after everything sees nothing")
+    check(all(e.remaining_s == 0.0 for e in ev_all),
+          "no remaining time is claimed -- a recorded play has already finished")
+    check(all(e.kind == "track" for e in ev_all), "events are tracks")
+    nd5 = pamts_players.NavidromePlayer({
+        "name": "nd5", "url": "http://unused", "username": "u",
+        "token_file": "/dev/null", "music_folder": "/player/tv"})
+    check(nd5.recent_plays(0) == [], "without history_db there is no recent-play trigger")
+    check(pamts_players.PlexPlayer({"url": "http://x", "token_file": "/t"})
+          .recent_plays(0) == [], "adapters that do not implement it return []")
+
+    lms_rp = pamts_players.LmsPlayer({"name": "lrp", "url": "http://unused",
+                                      "history_db": lms_db})
+    check(len(lms_rp.recent_plays(0)) == 2,
+          f"LMS recent_plays reads persist.db (got {len(lms_rp.recent_plays(0))})")
+    check(len(lms_rp.recent_plays(1500)) == 1, "and honours the watermark")
+    check(lms_rp.recent_plays(9999) == [], "nothing newer than the watermark")
+
     print("\n=== history_db: failures degrade safely")
     missing = pamts_players.LmsPlayer({"name": "x", "url": "http://u",
                                        "history_db": os.path.join(tmp, "nope.db")})

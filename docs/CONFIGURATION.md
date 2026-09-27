@@ -61,9 +61,19 @@ may change; if that happens, history is skipped with a clear error rather than b
 silently wrong. Navidrome also needs `music_folder` set, since the database stores paths
 relative to it.
 
-This is the only way to get history that predates PAMTS. For history *from now on*,
-`[history] observe` already covers every user with no database access at all — so a
-reasonable setup is `history_db` once for the backfill and observed plays thereafter.
+`history_db` does two jobs, not one:
+
+1. **Ranking history** — including history that predates PAMTS, and (for Navidrome) every
+   user's rather than just the calling account's.
+2. **A promotion trigger** — PAMTS also asks the database "what was played since I last
+   looked", which covers every user with no privileged account, and catches plays that
+   started and finished between polls. A per-player watermark is kept in the state file;
+   on first sight of a player it starts from "now", so the first run cannot mistake your
+   whole listening history for a burst of activity.
+
+For a multi-user music library this is the whole answer: point `history_db` at the
+server's database and every user is covered automatically, for both ranking and
+promotion, without giving PAMTS an elevated account.
 
 ## `[history]`
 
