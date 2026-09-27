@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<extension>
+    <id>68425897-F7D9-498A-A809-45296E82B6B5</id>
+    <name>PLUGIN_PAMTS</name>
+    <module>Plugins::PAMTS::Plugin</module>
+    <version>0.1.0</version>
+    <description>PLUGIN_PAMTS_DESC</description>
+    <creator>PAMTS</creator>
+    <category>tools</category>
+    <defaultState>enabled</defaultState>
+    <type>2</type><!-- type=extension -->
+
+    <targetApplication>
+        <id>Lyrion Music Server</id>
+        <minVersion>8.0</minVersion>
+        <maxVersion>*</maxVersion>
+    </targetApplication>
+</extension>

@@ -10,7 +10,7 @@ Adding one is one class and one line in the `ADAPTERS` registry.
 | adapter | play history | now playing | locality unit | notes |
 |---|---|---|---|---|
 | `plex` | ✅ `lastViewedAt` | ✅ | season, crossing into the next | verified |
-| `lms` | ❌ **not exposed by its API** | ✅ | album | verified against 9.x |
+| `lms` | ✅ **via the companion plugin** | ✅ | album | verified against 9.x |
 | `navidrome` | ✅ `played` — **per user** | ✅ | album | verified against 0.64.0 |
 
 Two of those need explaining, because both caught me out.
@@ -18,17 +18,25 @@ Two of those need explaining, because both caught me out.
 ### Getting history out of a music server
 
 Neither music server's API can answer "what has anyone played", for different reasons.
-There are three routes, and the useful answer is a combination of two:
+There are three routes:
 
 | route | covers | cost |
 |---|---|---|
-| observed plays (built in) | everyone, **going forward** | nothing — it is already on |
-| `history_db` | everyone, **including the past** | one read-only SQL query |
-| a server plugin | everyone, going forward | a build artifact; does what route 1 already does |
+| **a server plugin** | everyone, past **and** present | best answer where one can be written |
+| observed plays (built in) | everyone, **going forward** | nothing — already on |
+| `history_db` | everyone, past and present | read-only DB access; a fallback |
 
-A plugin is the most work for the least gain: it only helps from the moment you install
-it, which polling already covers. The gap polling *cannot* fill is history that already
-exists — and that is what `history_db` is for.
+**Prefer a plugin.** It runs inside the server, where the data is legitimately available,
+and it can publish that data through the server's own API. Nothing outside then needs
+filesystem access, schema knowledge, or a snapshot to keep fresh.
+
+For LMS that is a small Perl plugin shipped in [`plugins/lms/`](../plugins/lms/) — it
+registers a CLI query, so the history arrives over the same `jsonrpc.js` endpoint the
+adapter already uses. **35,034 play records in 0.9 seconds over 7 paged requests**, versus
+copying a 135 MB database around. Install it and the adapter finds it automatically.
+
+`history_db` remains as a fallback for servers with no plugin route, and it is the reason
+the next section is worth reading before relying on it.
 
 **`history_db` is a deliberate, narrow exception to "use the API".** It is not a shortcut
 around a working API; it exists because these APIs genuinely cannot answer the question:
@@ -72,13 +80,23 @@ Lyrion/Logitech Media Server keeps play counts and last-played times in a privat
 `persist.db`, and **neither `titles` nor `songinfo` reports them** — verified against 9.x
 with the full documented tag set. There is no plugin CLI query for it either.
 
-So `LmsPlayer.provides_history = False` by default. It drives promotion perfectly well
-(it reports what is playing, with duration and elapsed time), and ranking comes from
-PAMTS's own **observed play history** — which starts empty and fills in as PAMTS polls, so
-an LMS-only setup has no ranking data on day one. PAMTS says so rather than evicting
-blindly. Set `history_db` to its `persist.db` to get the existing history immediately;
-that table deliberately survives library rescans, which is exactly the property PAMTS
-wants.
+**The fix is the companion plugin** in [`plugins/lms/`](../plugins/lms/). It runs
+in-process and publishes the history as an ordinary CLI query, so it travels over the
+`jsonrpc.js` endpoint the adapter already talks to — no new port, no credentials, no
+filesystem access. The adapter probes for it at startup and uses it automatically:
+
+```
+[lms] history plugin v0.1.0 present: 35034 played of 218667 track(s)
+[lms] 34612 played track(s) from the plugin
+```
+
+It also supports `since:`, so incremental polling only moves new rows.
+
+Without the plugin, `provides_history` is `False`. LMS still drives promotion perfectly
+well (it reports what is playing, with duration and elapsed time), and ranking falls back
+to PAMTS's own **observed play history** — which starts empty and fills in as PAMTS polls,
+so an LMS-only setup has no ranking data on day one. PAMTS says so rather than evicting
+blindly. `history_db` pointed at `persist.db` is the other fallback.
 
 `LmsPlayer.library_items()` returns `[]`, not `None`, precisely because this is a
 definite "I have no history to give" rather than a failure.

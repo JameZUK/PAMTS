@@ -1,0 +1,5 @@
+PLUGIN_PAMTS
+	EN	PAMTS play history
+
+PLUGIN_PAMTS_DESC
+	EN	Exposes this server's play history (play counts and last-played times) over the existing CLI/JSON-RPC interface, so an external tiering system can read it without touching the database.

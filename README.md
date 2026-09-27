@@ -143,7 +143,7 @@ implies the rest of the album; a film implies nothing.
 | adapter | play history | now playing | locality |
 |---|---|---|---|
 | **Plex** | ✅ | ✅ | season, crossing into the next |
-| **LMS** / Lyrion | ❌ not exposed by its API | ✅ | album |
+| **LMS** / Lyrion | ✅ via the bundled plugin | ✅ | album |
 | **Navidrome** | ✅ but **per-user** | ✅ | album |
 
 **Several players at once.** `[[players]]` takes any number, and history is merged across
@@ -155,12 +155,17 @@ played in one of the others and simply not seen.
 an adapter with no history API — LMS — usable for ranking, and it is scan-immune by
 construction, because a scan is never a playing session.
 
-For music there is a wrinkle worth knowing before you configure it: neither music server's
-API can answer *"what has anyone played"* — LMS exposes no play data at all, and Subsonic
-annotations are per-user. An optional read-only `history_db` closes that gap, and for a
-**multi-user** library it is the whole answer: it supplies both the ranking history and the
-play trigger, covering every user automatically without giving PAMTS a privileged account.
-Details and trade-offs in [PLAYERS.md](docs/PLAYERS.md).
+For music, neither server's API answers *"what has anyone played"* out of the box — LMS
+exposes no play data at all, and Subsonic annotations are per-user. The right fix is a
+plugin that runs inside the server and publishes the data through its own API, and
+**PAMTS ships one for LMS** ([`plugins/lms/`](plugins/lms/)): a small Perl plugin adding a
+CLI query, so history arrives over the endpoint the adapter already uses — 35,034 records
+in under a second, with no filesystem access or database coupling. Install it and the
+adapter finds it automatically.
+
+Where no plugin exists, an optional read-only `history_db` covers the same ground, and for
+a multi-user Navidrome it also supplies the play *trigger*. Details and trade-offs in
+[PLAYERS.md](docs/PLAYERS.md).
 
 Adding a player is one class and one registry line — see [PLAYERS.md](docs/PLAYERS.md),
 which also covers two gotchas worth reading before you configure music: LMS exposes no
@@ -193,7 +198,7 @@ python3 tests/test_tier.py
 python3 tests/test_promote.py
 ```
 
-214 checks. They use temporary directories and a fake player — they never contact a real
+231 checks. They use temporary directories and a fake player — they never contact a real
 media server and never touch real storage. `rsync` is required; the suites skip with a
 clear message if it is missing.
 

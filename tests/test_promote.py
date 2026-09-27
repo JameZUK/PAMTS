@@ -297,14 +297,18 @@ def main():
     con.commit()
     con.close()
 
-    plain = pamts_players.LmsPlayer({"name": "lms", "url": "http://unused"})
+    # 127.0.0.1:1 refuses immediately, so the plugin probe fails fast. Capability is
+    # only known after available() has looked -- see the sweep() ordering test below.
+    plain = pamts_players.LmsPlayer({"name": "lms", "url": "http://127.0.0.1:1"})
+    plain.available()
     check(plain.provides_history is False,
-          "without history_db, LMS declares no history (its API has none)")
+          "with no plugin and no history_db, LMS declares no history")
     check(plain.library_items() == [],
           "and returns [] -- a definite 'nothing', not a failure")
 
-    withdb = pamts_players.LmsPlayer({"name": "lmsdb", "url": "http://unused",
+    withdb = pamts_players.LmsPlayer({"name": "lmsdb", "url": "http://127.0.0.1:1",
                                       "history_db": lms_db})
+    withdb.available()
     check(withdb.provides_history is True, "with history_db, LMS declares history")
     items = withdb.library_items()
     rels = sorted(i["rel"] for i in items)
@@ -385,6 +389,86 @@ def main():
           f"LMS recent_plays reads persist.db (got {len(lms_rp.recent_plays(0))})")
     check(len(lms_rp.recent_plays(1500)) == 1, "and honours the watermark")
     check(lms_rp.recent_plays(9999) == [], "nothing newer than the watermark")
+
+    print("\n=== LMS companion plugin: discovered, preferred, and paged")
+    PAGE = 2
+    hist = [
+        {"url": "file:///player/tv/Alb/01%20a.flac", "lastplayed": 1000,
+         "playcount": 2, "filesize": 111},
+        {"url": "file:///player/tv/Alb/02%20b.flac", "lastplayed": 2000,
+         "playcount": 1, "filesize": 222},
+        {"url": "http://example.com/stream", "lastplayed": 3000,
+         "playcount": 9, "filesize": 0},          # remote: not a library file
+        {"url": "file:///outside/x.flac", "lastplayed": 4000,
+         "playcount": 1, "filesize": 5},          # outside the configured roots
+    ]
+
+    def plugin_rpc(pid, cmd):
+        if cmd[:2] == ["pamts", "info"]:
+            return {"played": len(hist), "tracks": 99, "max_page": PAGE,
+                    "version": "0.1.0"}
+        if cmd[:2] == ["pamts", "history"]:
+            off, qty = int(cmd[2]), int(cmd[3])
+            since = 0
+            for a in cmd[4:]:
+                if str(a).startswith("since:"):
+                    since = int(str(a).split(":", 1)[1])
+            rows = [h for h in hist if h["lastplayed"] > since]
+            return {"count": len(rows), "history_loop": rows[off:off + qty]}
+        return {}
+
+    lms_p = pamts_players.LmsPlayer({"name": "lmsp", "url": "http://unused"})
+    lms_p._rpc = plugin_rpc
+    check(lms_p.available() is True, "available() succeeds")
+    check(lms_p._plugin is True, "the companion plugin is discovered")
+    check(lms_p.provides_history is True,
+          "and flips provides_history on -- LMS has no history without it")
+    check(lms_p._page == PAGE, f"page size adopted from the plugin (got {lms_p._page})")
+    got = lms_p.library_items()
+    rels = sorted(i["rel"] for i in got)
+    check(rels == ["Alb/01 a.flac", "Alb/02 b.flac"],
+          f"only mappable library files, paged correctly (got {rels})")
+    byrel = {i["rel"]: i for i in got}
+    check(byrel["Alb/02 b.flac"]["last_viewed"] == 2000, "play time carried through")
+    check(byrel["Alb/01 a.flac"]["size"] == 111, "filesize carried through")
+    check(byrel["Alb/01 a.flac"]["fast"].startswith(fast), "mapped onto the fast tier")
+
+    evs = lms_p.recent_plays(1500)
+    check([e.path for e in evs] == ["/player/tv/Alb/02 b.flac"],
+          f"recent_plays honours since: server-side (got {[e.path for e in evs]})")
+    check(all(e.remaining_s == 0 for e in evs),
+          "a recorded play claims no remaining time")
+
+    print("\n=== LMS without the plugin: falls back, or reports no history")
+    def no_plugin_rpc(pid, cmd):
+        if cmd[:2] == ["pamts", "info"]:
+            return {}                      # unknown query -> no 'played' key
+        return {}
+
+    bare = pamts_players.LmsPlayer({"name": "bare", "url": "http://unused"})
+    bare._rpc = no_plugin_rpc
+    bare.available()
+    check(bare._plugin is False, "plugin absence is detected, not an error")
+    check(bare.provides_history is False, "and provides_history goes off")
+    check(bare.library_items() == [], "library_items is [] -- a definite 'nothing'")
+    check(bare.recent_plays(0) == [], "and no recent-play trigger")
+
+    fallback = pamts_players.LmsPlayer({"name": "fb", "url": "http://unused",
+                                        "history_db": lms_db})
+    fallback._rpc = no_plugin_rpc
+    fallback.available()
+    check(fallback.provides_history is True,
+          "with history_db configured it still provides history")
+    check(len(fallback.library_items()) == 2, "and reads it from the database")
+
+    print("\n=== sweep() asks available() BEFORE trusting capability flags")
+    # An adapter can only learn what it can do by asking the server, so a flag read
+    # before available() would be wrong. lms_p starts optimistic and is confirmed.
+    fresh = pamts_players.LmsPlayer({"name": "fresh", "url": "http://unused"})
+    fresh._rpc = plugin_rpc
+    items_sw, ok_sw = pamts_players.sweep([fresh])
+    check(ok_sw is True and len(items_sw) == 2,
+          f"sweep discovered the plugin and got its items (ok={ok_sw}, n={len(items_sw)})")
 
     print("\n=== history_db: failures degrade safely")
     missing = pamts_players.LmsPlayer({"name": "x", "url": "http://u",

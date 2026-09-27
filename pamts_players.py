@@ -401,15 +401,77 @@ class LmsPlayer(Player):
 
     def __init__(self, cfg):
         super().__init__(cfg)
-        # Opting in to reading persist.db is the ONLY way to get play history out of
-        # LMS -- its API reports none. See Player._read_db.
-        self.provides_history = bool(cfg.get("history_db"))
+        self._plugin = False
+        self._page = 500
+        # Optimistic until available() has looked: history may come from the companion
+        # plugin (preferred) or, failing that, from persist.db.
+        self.provides_history = True
 
     def available(self):
         if not self.url:
             logging.error(f"[{self.name}] no url configured")
             return False
+
+        # Is the companion plugin installed? It publishes play history as an ordinary
+        # CLI query, which is far better than reading the database from outside: no
+        # filesystem access, no schema coupling, no snapshot to keep fresh. See
+        # plugins/lms/ in this repo.
+        self._plugin = False
+        try:
+            info = self._rpc("", ["pamts", "info", "?"]) or {}
+            if "played" in info:
+                self._plugin = True
+                self._page = max(1, min(int(info.get("max_page") or 500), 5000))
+                logging.info(f"[{self.name}] history plugin v{info.get('version')} "
+                             f"present: {info.get('played')} played of "
+                             f"{info.get('tracks')} track(s)")
+        except (urllib.error.URLError, OSError, ValueError, KeyError):
+            pass          # absence is normal, not an error
+
+        if not self._plugin and self.cfg.get("history_db"):
+            logging.info(f"[{self.name}] no history plugin; falling back to history_db")
+        self.provides_history = bool(self._plugin or self.cfg.get("history_db"))
+        if not self.provides_history:
+            logging.info(f"[{self.name}] no play history available (install the "
+                         "companion plugin, or set history_db) - promotion still works")
         return True
+
+    def _item(self, path, last_played, size=0):
+        m = pamts.split_root(path)
+        if not m:
+            return None
+        rel, fast_root, slow_root = m
+        return {"kind": "track", "show": None, "show_key": None,
+                "season": None, "episode": None,
+                "title": os.path.basename(path), "rel": rel,
+                "fast": os.path.join(fast_root, rel),
+                "slow": os.path.join(slow_root, rel),
+                "size": int(size or 0),
+                "last_viewed": int(last_played or 0), "added": 0}
+
+    def _items_from_plugin(self):
+        """Play history from the companion plugin, paged."""
+        out, offset = [], 0
+        while True:
+            try:
+                r = self._rpc("", ["pamts", "history", str(offset), str(self._page)])
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                logging.error(f"[{self.name}] history query failed at offset "
+                              f"{offset}: {e}")
+                return None
+            rows = r.get("history_loop") or []
+            for h in rows:
+                path = self._path_from_url(h.get("url"))
+                if not path:
+                    continue          # a stream or podcast, not a library file
+                it = self._item(path, h.get("lastplayed"), h.get("filesize"))
+                if it:
+                    out.append(it)
+            if len(rows) < self._page:
+                break
+            offset += self._page
+        logging.info(f"[{self.name}] {len(out)} played track(s) from the plugin")
+        return out
 
     def _rpc(self, player_id, command):
         body = json.dumps({"id": 1, "method": "slim.request",
@@ -431,12 +493,14 @@ class LmsPlayer(Player):
         return urllib.parse.unquote(u[7:])
 
     def library_items(self):
-        """Play history from persist.db, if the operator opted in.
+        """Play history, from the plugin if installed, else persist.db.
 
         LMS keeps play data in `tracks_persistent`, which deliberately survives library
-        rescans -- exactly the property PAMTS wants. Without `history_db` this returns
-        an empty list: a definite "no history to give", not a failure (None).
+        rescans -- exactly the property PAMTS wants. With neither source this returns an
+        empty list: a definite "no history to give", not a failure (None).
         """
+        if self._plugin:
+            return self._items_from_plugin()
         if not self.cfg.get("history_db"):
             return []
         rows = self._read_db(
@@ -501,11 +565,30 @@ class LmsPlayer(Player):
         return out
 
     def recent_plays(self, since):
-        """Tracks played since `since`, from persist.db.
+        """Tracks played since `since`.
 
         Complements now_playing(): a play is recorded even if PAMTS was not polling at
-        the moment it happened, so nothing is missed between runs.
+        the moment it happened, so nothing is missed between runs. The plugin supports
+        this natively via its `since:` parameter, so only the new rows cross the wire.
         """
+        if self._plugin:
+            try:
+                r = self._rpc("", ["pamts", "history", "0", str(self._page),
+                                   f"since:{int(since)}"])
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                logging.error(f"[{self.name}] recent-play query failed: {e}")
+                return []
+            out = []
+            for h in r.get("history_loop") or []:
+                path = self._path_from_url(h.get("url"))
+                if not path or not pamts.split_root(path):
+                    continue
+                out.append(PlayEvent(
+                    source=self.name, kind="track", path=path, remaining_s=0.0,
+                    label=f"{os.path.basename(path)} (played "
+                          f"{int(h.get('lastplayed') or 0)})",
+                    group={"url": h.get("url")}))
+            return out
         if not self.cfg.get("history_db"):
             return []
         rows = self._read_db(
@@ -918,11 +1001,14 @@ def sweep(players):
     """
     merged, ok = {}, False
     for p in players:
-        if not p.provides_history:
-            logging.info(f"[{p.name}] provides no play history via its API - ranking "
-                         "will rely on observed plays")
-            continue
+        # available() first: an adapter may only discover what it can do by asking the
+        # server (e.g. whether a history plugin is installed), so its capability flags
+        # are not reliable until then.
         if not p.available():
+            continue
+        if not p.provides_history:
+            logging.info(f"[{p.name}] provides no play history - ranking will rely on "
+                         "observed plays")
             continue
         items = p.library_items()
         if items is None:
