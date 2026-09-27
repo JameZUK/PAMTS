@@ -182,4 +182,7 @@ Working, and in use. Treat the `backup` mode with the caution it deserves: run
 `--dry-run` first, check the deletion counts it reports, and set `max_delete` to
 something you have actually thought about.
 
-No licence has been chosen yet.
+## Licence
+
+[MIT](LICENSE). It moves and deletes your files — the warranty disclaimer is not
+boilerplate here, so read the safety notes above and dry-run first.
