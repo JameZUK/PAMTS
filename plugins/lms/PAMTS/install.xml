@@ -3,7 +3,7 @@
     <id>68425897-F7D9-498A-A809-45296E82B6B5</id>
     <name>PLUGIN_PAMTS</name>
     <module>Plugins::PAMTS::Plugin</module>
-    <version>0.1.0</version>
+    <version>0.2.0</version>
     <description>PLUGIN_PAMTS_DESC</description>
     <creator>PAMTS</creator>
     <category>tools</category>

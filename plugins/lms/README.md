@@ -54,8 +54,33 @@ If `result` comes back empty, the plugin is not loaded. Check the server log for
 | `tracks` | rows in `tracks_persistent` |
 | `played` | of those, how many have ever been played |
 | `newest_lastplayed` | unix timestamp of the most recent play |
+| `library_tracks` | tracks currently in the library (`tracks`, excluding remote) |
+| `newest_added` | unix timestamp of the most recent library addition |
+| `newest_year` | highest release year present |
 | `max_page` | largest page this plugin will return |
 | `version` | plugin version |
+
+### `pamts added <index> <quantity> [since:<epoch>]`
+
+Recently **added** tracks, newest first — whether or not they have ever been played.
+
+### `pamts released <index> <quantity> [minyear:<year>]`
+
+Tracks by **release year**, newest first. Tracks with no year tagged are excluded, since
+they would otherwise sort as the oldest possible and fill a "newest releases" page.
+
+Both return `url`, `added`, `year`, `filesize`, `lastplayed`, `playcount`, with a `count`
+of the total matching. `lastplayed` is `0` for never-played tracks, which for these two
+queries is the common case — and the point of them.
+
+**Why these exist.** "Never played" is not the same as "not wanted". Music added last week,
+or released this year, is very likely to be played soon and belongs on fast storage despite
+having no play history. Ranking purely on plays would send it straight to slow storage, so
+the first listen would have to wake a spun-down array. These queries read `tracks` rather
+than `tracks_persistent`, so never-played tracks are included.
+
+The age thresholds are the caller's parameters (`since:`, `minyear:`), deliberately — the
+policy belongs with whatever is making the tiering decision, not baked in here.
 
 ### `pamts history <index> <quantity> [since:<epoch>]`
 
@@ -67,6 +92,8 @@ One page of played tracks, **oldest play first**, with a `count` of the total ma
 | `lastplayed` | unix timestamp of the most recent play |
 | `playcount` | total plays |
 | `filesize` | bytes, or `0` if the file is no longer in the library |
+| `added` | unix timestamp the track entered the library, `0` if unknown |
+| `year` | release year, `0` if not tagged |
 
 `since:` returns only tracks played after that timestamp, which is what makes incremental
 polling cheap — PAMTS uses it to ask "what changed since I last looked".
