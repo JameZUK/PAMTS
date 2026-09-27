@@ -1,0 +1,17 @@
+[Unit]
+Description=PAMTS: promote played content onto fast storage
+Documentation=https://github.com/JameZUK/PAMTS
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pamts-promote.py
+# Promotion is opportunistic. If the player is unreachable, or tiering holds the shared
+# lock, it exits 0 having done nothing rather than retrying into busy storage.
+TimeoutStartSec=1800
+Nice=10
+IOSchedulingClass=idle
+OOMScoreAdjust=1000
+
+[Install]
+WantedBy=multi-user.target

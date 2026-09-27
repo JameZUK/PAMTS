@@ -1,0 +1,253 @@
+# Configuration
+
+PAMTS reads one TOML file, `/etc/pamts/pamts.toml` by default. Override with `--config`
+or the `PAMTS_CONFIG` environment variable. A fully commented starting point is in
+[`examples/pamts.toml`](../examples/pamts.toml).
+
+Sizes are binary GB (1 GB = 1024³). Times are seconds or days as named.
+
+The loader validates strictly and refuses to start on anything ambiguous — a tiering
+system that has misunderstood its own configuration moves data to the wrong place.
+
+---
+
+## `[player]`
+
+The only section that knows about a specific media server.
+
+| key | default | notes |
+|---|---|---|
+| `kind` | `"plex"` | adapter name; see [PLAYERS.md](PLAYERS.md) |
+| `url` | *required* | e.g. `http://127.0.0.1:32400` |
+| `token_file` | *required* | file containing the API token, mode `600` |
+
+The token goes in its **own file**, not in this config. Keep it out of version control.
+
+## `[paths]`
+
+| key | default |
+|---|---|
+| `lock_file` | `/run/pamts.lock` |
+| `state_file` | `/var/lib/pamts/state.json` |
+| `tier_log` | `/var/log/pamts-tier.log` |
+| `promote_log` | `/var/log/pamts-promote.log` |
+
+`lock_file` is shared by tiering and promotion so they can never run at once. Do not give
+them separate locks.
+
+`state_file` holds promotion protection records and the measured throughput estimate.
+Losing it is harmless — protections lapse and throughput is re-measured.
+
+## `[[roots]]` — how player paths map to your tiers
+
+**Required, and the thing most likely to be wrong.** This is how PAMTS knows that the
+file the player calls `/media/library/tv/Show/S01E01.mkv` lives at
+`/srv/fast/tv/Show/S01E01.mkv` locally.
+
+```toml
+[[roots]]
+player_path = "/media/library/tv"    # exactly what the player reports
+fast = "/srv/fast/tv"
+slow = "/srv/slow/tv"
+```
+
+All three must be absolute, and `fast` must differ from `slow`.
+
+The relative path below the root must be **identical** on both tiers. PAMTS never
+renames anything, so this holds naturally if you let it do the moving.
+
+**Longest prefix wins**, so overlapping roots may coexist. That is genuinely useful when
+migrating: if your player used to point at the two tiers separately and now points at a
+merged path, list all three and PAMTS keeps working during and after the change.
+
+```toml
+[[roots]]                            # the merged path (what the player uses now)
+player_path = "/media/library/tv"
+fast = "/srv/fast/tv"
+slow = "/srv/slow/tv"
+
+[[roots]]                            # a legacy path, still reported for some items
+player_path = "/mnt/tv-fast"
+fast = "/srv/fast/tv"
+slow = "/srv/slow/tv"
+```
+
+If you see `not under a configured root` in the logs, a `[[roots]]` entry does not match
+what the player actually reports. Check the exact string with
+`pamts-promote.py --dry-run --simulate-recent`.
+
+## `[[jobs]]` — what to manage
+
+| key | modes | notes |
+|---|---|---|
+| `name` | both | unique; selectable with `--job` |
+| `mode` | both | `"tier"` or `"backup"` |
+| `source` | both | the fast-tier path |
+| `dest` | both | the slow-tier / replica path |
+| `depth` | tier | eviction granularity, default `1` |
+| `grace` | tier | honour the grace window, default `true` |
+| `max_delete` | backup | **required**; refused on tier jobs |
+| `exclude` | backup | list of rsync patterns |
+| `exclude_from` | backup | file of rsync patterns |
+
+### `mode`
+
+`tier` moves content to `dest` as it ages, and **never** uses `--delete`. `backup`
+mirrors and propagates deletions. See [DESIGN.md](DESIGN.md#two-job-modes-and-why-mixing-them-up-is-impossible) —
+this distinction is the most safety-critical thing in the tool, and the loader refuses to
+let the two be confused.
+
+### `depth`
+
+`1` where each item is its own directory (films). `2` for `Show/Season` layouts, making a
+**season** the unit of eviction so that working through a series lets earlier seasons age
+off while the current one stays. A directory shallower than `depth` with no
+subdirectories becomes its own candidate, so a series without season folders still works.
+
+### `grace`
+
+`true` — never-played content is not evicted for `new_grace_days`. Right for films.
+
+`false` — right for series, because next-to-watch pinning already guarantees the episode
+you are about to watch. With `grace = true` on series, a whole-season download is held on
+fast storage *in its entirety* for a fortnight, which wastes the budget on twenty-three
+episodes you will not watch this week.
+
+### `max_delete`
+
+A **circuit breaker**. PAMTS counts what `--delete` would remove before deleting
+anything, and refuses the whole job if the count is higher, having deleted nothing.
+
+Set it a little above the largest number of deletions you would consider normal for that
+pair. If a run reports a number far larger than you expect, that almost always means the
+source is not fully mounted — which is precisely what this catches.
+
+### Excludes
+
+Patterns are passed to rsync. Excluded paths are **never deleted** on the destination
+(PAMTS does not use `--delete-excluded`), so content that exists only on the replica
+behind an exclude is protected. A configured `exclude_from` file that has gone missing
+aborts the job, because running without it would delete what the excludes protect.
+
+## `[tier]`
+
+| key | default | notes |
+|---|---|---|
+| `budget_gb` | `400` | how much fast storage PAMTS may fill with tiered content |
+| `settle_seconds` | `3600` | never evict something written this recently |
+| `new_grace_days` | `14` | never-played content is kept this long (where `grace = true`) |
+| `promote_protect_days` | `7` | promoted content is not evicted for this long |
+| `next_up_max_items` | `40` | ceiling on pinned items |
+| `next_up_max_gb` | `80` | ceiling on pinned bytes |
+| `pin_depth_max` | `4` | items ahead to pin when space is plentiful |
+| `dest_fstypes` | `["nfs","nfs4"]` | **safety guard — read below** |
+| `inprogress_suffixes` | `.part .tmp .!qB .partial .crdownload` | a directory containing one is never evicted |
+
+### `budget_gb`
+
+The single most important number. Content above it is evicted, least-recently-played
+first. Leave room for pinning (`next_up_max_gb`) and promotion headroom
+(`[promote] headroom_gb`) inside it — if those two add up to most of the budget there is
+nothing left for ordinary tiered content.
+
+### `dest_fstypes`
+
+The filesystem types the **slow** destination may be on. This is a real safety guard.
+
+An unmounted mountpoint is just an empty directory. A job writing there fills your root
+filesystem, and because tiering uses `--remove-source-files` it then deletes the only
+other copy. Checking "is it a mountpoint" does not help — `/` is always one — so PAMTS
+checks the filesystem *type*.
+
+Set it to what your slow tier actually is: `["nfs","nfs4"]`, `["cifs"]`, `["zfs"]`,
+`["ext4"]`, `["btrfs"]`… Find it with:
+
+```sh
+findmnt -no FSTYPE --target /srv/slow/tv
+```
+
+`["*"]` disables the check. Do not, unless you have a specific reason and accept the
+consequence above.
+
+### `promote_protect_days`
+
+Days, not hours. If you watch one episode every two or three days, a window of hours
+means the promoted episode is evicted before you return to it and the work repeats
+nightly. Match it to how you actually watch.
+
+### Pinning caps
+
+`next_up_max_items` / `next_up_max_gb` cap how much of the budget pinning may consume.
+A large library has hundreds of series and pinning one item of each could run to
+terabytes. Series are prioritised by recent activity, and allocation is round-robin so
+every active series gets its first unwatched item before any gets a second.
+
+`pin_depth_max` is how many items ahead to pin when the tier is nearly empty; it scales
+down to 1 as the tier fills. Raise it if your fast tier is comfortably large.
+
+## `[promote]`
+
+| key | default | notes |
+|---|---|---|
+| `headroom_gb` | `60` | stop promoting this far below budget (anti-thrash) |
+| `min_free_gb` | `100` | refuse to promote below this much **real** free space |
+| `headroom_fraction` | `0.30` | share of remaining headroom one event may use |
+| `min_event_bytes_gb` | `6` | floor, so the next item is always attempted |
+| `min_event_items` | `2` | item floor |
+| `max_items` | `24` | ceiling per event |
+| `max_bytes_gb` | `60` | byte ceiling per event |
+| `time_safety` | `0.40` | assumed share of throughput while a stream is being served |
+| `default_rate_mbps` | `80` | starting throughput guess, MB/s |
+| `rate_alpha` | `0.3` | EWMA weight for measured throughput |
+
+### `headroom_gb`
+
+Reserved so a promotion cannot push the tier over budget and cause its own eviction on
+the next run. Roughly one promotion event's worth is a sensible floor.
+
+### `min_free_gb`
+
+`budget_gb` is a policy number; it does not know what *else* shares that filesystem. This
+is a hard stop on real free space. Set it above whatever your other workloads might need.
+
+### `max_items` / `max_bytes_gb`
+
+**Ceilings, not targets.** PAMTS scales down from them by space and time. Both exist
+because either alone is meaningless: six episodes is 8 GB of 1080p television and 40 GB of
+4K, so an item count alone tells you nothing about cost, and a byte cap alone would
+promote an absurd number of small items.
+
+### `time_safety`
+
+While PAMTS promotes, slow storage is concurrently serving the stream you are watching.
+This is the share of measured throughput PAMTS assumes it can use. Lower it if promotion
+ever disturbs playback; raise it if your slow tier has headroom to spare.
+
+### `default_rate_mbps` / `rate_alpha`
+
+The starting guess, used only until real transfers have been measured. PAMTS then smooths
+measurements into a running estimate. Leave `rate_alpha` alone unless your throughput is
+unusually variable.
+
+---
+
+## Command-line reference
+
+```
+pamts-tier.py [--config F] [--dry-run] [--only tier|backup] [--job NAME]... [--budget-gb N]
+pamts-promote.py [--config F] [--dry-run] [--next-up]
+                 [--simulate-recent [--simulate-count N]] [--budget-gb N]
+```
+
+| flag | notes |
+|---|---|
+| `--dry-run` | change nothing; honoured all the way down to rsync |
+| `--only` | restrict to one mode |
+| `--job` | run only named jobs; repeatable |
+| `--next-up` | fetch pinned items that are not on fast storage (nightly) |
+| `--simulate-recent` | replay recently *played* items as if playing; requires `--dry-run` |
+| `--budget-gb` | override `[tier] budget_gb` for one run |
+
+`--simulate-recent` is the most useful validation tool here: it exercises the real
+selection logic against your real library without waiting for someone to press play, and
+the log shows exactly why selection stopped where it did.

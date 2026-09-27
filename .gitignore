@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.log
+
+# Never commit a real config or a token. The example config is explicitly kept.
+pamts.toml
+!examples/pamts.toml
+*-token
+*.token
+state.json

@@ -1,0 +1,22 @@
+[Unit]
+Description=PAMTS nightly: evict, fetch next-to-watch, then replicate
+Documentation=https://github.com/JameZUK/PAMTS
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Order matters. Evict first so the space exists, then fetch the pins into it, then
+# replicate. All three take the same lock, so they cannot overlap.
+#
+# If your slow storage spins down when idle, running these back to back in one window
+# wakes it once instead of three times.
+ExecStart=/usr/local/bin/pamts-tier.py --only tier
+ExecStart=/usr/local/bin/pamts-promote.py --next-up
+ExecStart=/usr/local/bin/pamts-tier.py --only backup
+TimeoutStartSec=6h
+Nice=10
+IOSchedulingClass=idle
+OOMScoreAdjust=1000
+
+[Install]
+WantedBy=multi-user.target

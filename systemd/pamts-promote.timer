@@ -1,0 +1,13 @@
+[Unit]
+Description=PAMTS: poll the player for playback and promote what follows
+
+[Timer]
+# 60s is ample. Episodes are tens of minutes long, so up to a minute of detection
+# latency is irrelevant. Polling is preferred over player webhooks because a webhook
+# endpoint is another service to keep alive for no real benefit here.
+OnBootSec=3min
+OnUnitActiveSec=60s
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

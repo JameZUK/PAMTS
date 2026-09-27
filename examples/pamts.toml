@@ -1,0 +1,141 @@
+# PAMTS configuration. Copy to /etc/pamts/pamts.toml and edit.
+#
+# Every value below is optional except [player] and the [[roots]] / [[jobs]] tables.
+# The defaults are deliberately cautious: they favour leaving content where it is.
+#
+# Sizes are in GB (binary, 1 GB = 1024^3) unless the name says otherwise.
+
+# ---------------------------------------------------------------------- player
+# The media player PAMTS reads "what has been played" and "what is playing" from.
+# This is the ONLY component that knows about a specific media server.
+[player]
+kind = "plex"                              # see docs/PLAYERS.md for adding others
+url = "http://plex.example.lan:32400"
+# A file containing the API token, readable only by the user PAMTS runs as.
+# Never put the token itself in this file, and never commit it.
+token_file = "/etc/pamts/player-token"
+
+# ----------------------------------------------------------------------- paths
+[paths]
+lock_file = "/run/pamts.lock"              # shared by tiering and promotion, so the
+                                           # two can never run at the same time
+state_file = "/var/lib/pamts/state.json"   # promotion records + throughput estimate
+tier_log = "/var/log/pamts-tier.log"
+promote_log = "/var/log/pamts-promote.log"
+
+# ------------------------------------------------------------------------ tier
+[tier]
+budget_gb = 400            # how much of the fast tier PAMTS may fill with tiered
+                           # content. Content over this is evicted, oldest-played first.
+settle_seconds = 3600      # never evict something written in the last hour
+new_grace_days = 14        # never-played content is not evicted for this long, giving
+                           # it a chance to be watched. A preference, not a guarantee:
+                           # if grace-protected content alone exceeds the budget, the
+                           # oldest is evicted anyway. Series usually set grace = false
+                           # per job and rely on pinning instead.
+promote_protect_days = 7   # content promoted in response to playback is not evicted
+                           # for this long. Days, not hours: if you watch one episode
+                           # every few days, hours of protection achieves nothing.
+
+# --- next-to-watch pinning ---
+# The next unwatched item of each series is PINNED to fast storage: never evicted, and
+# fetched back if missing. This is what lets a whole-season download be swept to slow
+# storage while still guaranteeing the episode you are about to watch is local.
+next_up_max_items = 40     # a large library has hundreds of series; pinning one item
+next_up_max_gb = 80        # of each could run to terabytes, so this is capped. Series
+                           # are prioritised by recent activity.
+pin_depth_max = 4          # how many items ahead to pin when space is plentiful. Scales
+                           # down to 1 as the fast tier fills.
+
+# Filesystem types the SLOW destination may legitimately be on.
+#
+# Read this before changing it. An unmounted mountpoint is just an empty directory: a
+# job that writes there fills your root filesystem, and because tiering uses
+# --remove-source-files it then deletes the only other copy. Checking "is it a
+# mountpoint" is not enough, because / is always a mountpoint -- the filesystem TYPE is
+# what proves the remote storage is actually attached.
+#
+# Set this to what your slow tier really is: ["nfs", "nfs4"], ["cifs"], ["zfs"],
+# ["ext4"], etc. ["*"] disables the check and is NOT recommended.
+dest_fstypes = ["nfs", "nfs4"]
+
+# Partial-download markers. A directory containing one of these is never evicted.
+inprogress_suffixes = [".part", ".tmp", ".!qB", ".partial", ".crdownload"]
+
+# --------------------------------------------------------------------- promote
+[promote]
+headroom_gb = 60           # stop promoting this far below budget, so a promotion cannot
+                           # immediately trigger its own eviction (anti-thrash)
+min_free_gb = 100          # refuse to promote below this much REAL free space. The
+                           # budget is a policy number and does not know what else
+                           # shares the filesystem.
+headroom_fraction = 0.30   # one promotion event may use this much of the remaining
+                           # headroom. Generous when nearly empty, cautious when full.
+min_event_bytes_gb = 6     # floor, so the immediately-next item is always attempted
+min_event_items = 2
+max_items = 24             # ceiling: at most this many items per event...
+max_bytes_gb = 60          # ...and at most this many bytes
+time_safety = 0.40         # assume we get this share of throughput while promoting,
+                           # because slow storage is concurrently serving the stream
+default_rate_mbps = 80     # starting throughput guess, in MB/s. PAMTS measures real
+rate_alpha = 0.3           # transfers and smooths the estimate (EWMA) from then on.
+poll_seconds = 60          # informational; the systemd timer sets the real cadence
+
+# ----------------------------------------------------------------------- roots
+# How a path REPORTED BY THE PLAYER maps onto your two tiers. PAMTS cannot work
+# without this: it is how it knows that the file the player calls
+# /media/library/tv/Show/S01E01.mkv is /srv/fast/tv/Show/S01E01.mkv locally.
+#
+# Longest prefix wins, so overlapping roots may coexist. That is useful if you are
+# migrating from per-tier paths to a single unified path (e.g. behind mergerfs): list
+# the unified path AND the old ones, and PAMTS keeps working throughout.
+[[roots]]
+player_path = "/media/library/tv"
+fast = "/srv/fast/tv"
+slow = "/srv/slow/tv"
+
+[[roots]]
+player_path = "/media/library/movies"
+fast = "/srv/fast/movies"
+slow = "/srv/slow/movies"
+
+# ------------------------------------------------------------------------ jobs
+# mode = "tier"   the fast copy is a CACHE. It is expected to empty as content ages.
+#                 Content is MOVED to `dest`. --delete is never used.
+# mode = "backup" the fast copy is AUTHORITATIVE and `dest` is a replica. Deletions
+#                 propagate. max_delete is mandatory.
+
+[[jobs]]
+name = "tv"
+mode = "tier"
+source = "/srv/fast/tv"
+dest = "/srv/slow/tv"
+depth = 2        # Show/Season -> a SEASON is the unit of eviction, so watching through
+                 # a series lets earlier seasons age off while the current one stays.
+                 # Use depth = 1 where each item is its own directory.
+grace = false    # Series rely on next-to-watch pinning instead of the grace window, so
+                 # a whole-season download is free to age onto slow storage while the
+                 # episode you are about to watch stays local.
+
+[[jobs]]
+name = "movies"
+mode = "tier"
+source = "/srv/fast/movies"
+dest = "/srv/slow/movies"
+depth = 1
+grace = true     # Films have no episode ordering to reason about, so a new unwatched
+                 # film keeps the grace window.
+
+# An example backup job. Deletions PROPAGATE here, so max_delete is required.
+# Set it a little above the largest number of deletions you would consider normal; if a
+# run wants to delete more, it fails loudly having deleted nothing.
+[[jobs]]
+name = "photos"
+mode = "backup"
+source = "/srv/fast/photos"
+dest = "/srv/slow/photos"
+max_delete = 5000
+# Inline excludes, and/or a file of patterns. Excluded paths are never deleted on the
+# destination, so content that exists only on the replica behind an exclude is safe.
+# exclude = ["*.tmp", "cache/"]
+# exclude_from = "/etc/pamts/photos-excludes.lst"
