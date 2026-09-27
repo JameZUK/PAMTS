@@ -283,13 +283,17 @@ def main():
     P = pamts.PROMOTE
     budget_gb = args.budget_gb if args.budget_gb is not None else pamts.TIER["budget_gb"]
 
-    # Shared lock: if tiering holds it, it is moving content the other way and the
-    # budget arithmetic would be meaningless.
-    lock = open(pamts.PATHS["lock_file"], "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        logging.info("another PAMTS job holds the lock - skipping this pass")
+    # If tiering holds the lock it is moving content the other way and the budget
+    # arithmetic would be meaningless, so do not proceed.
+    #
+    # The 60-second poll does NOT wait: it will try again on the next tick, and queueing
+    # up waiting pollers behind a long eviction would be worse than skipping. --next-up
+    # DOES wait, because it runs once in the nightly window and skipping it means the
+    # pins simply do not get fetched that night.
+    lock = pamts.acquire_lock(pamts.PATHS["lock_file"], shared=args.dry_run,
+                              wait_seconds=900 if (args.next_up and not args.dry_run) else 0)
+    if lock is None:
+        logging.info("another job holds the lock - skipping this pass")
         return 0
 
     now = time.time()

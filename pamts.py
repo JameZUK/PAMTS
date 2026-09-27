@@ -10,6 +10,7 @@ That is deliberately simple: the scripts read plain module constants, and the te
 suites override those constants directly.
 """
 
+import fcntl
 import json
 import logging
 import os
@@ -447,6 +448,47 @@ def next_up(items, max_items, max_bytes, per_show=1, include_unstarted=None,
     # Only what survives may go to a few freshly added series.
     take(unstarted, True, show_cap=max(0, unstarted_max))
     return pins
+
+
+# ------------------------------------------------------------------------- locking
+def acquire_lock(path, shared=False, wait_seconds=0):
+    """Take the shared lock file. -> the open file object, or None on failure.
+
+    `wait_seconds` matters. A job that gives up the instant it loses a race silently
+    skips its work, and with promotion polling every 60 seconds that race is easy to
+    lose: a real nightly deletion pass was skipped exactly this way, logging one ERROR
+    line that was mistaken for success because the wrapper carried on. Long-running
+    scheduled work should WAIT -- the other holder usually finishes in seconds -- while
+    the frequent poller should not, because it will simply try again on its next tick.
+
+    `shared` is for dry runs. They change nothing, so they should neither block nor be
+    blocked, and two diagnostics should be able to run at once. Only a real run needs
+    exclusivity.
+    """
+    try:
+        f = open(path, "w")
+    except OSError as e:
+        logging.error(f"cannot open lock file {path}: {e}")
+        return None
+    mode = (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB
+    deadline = time.time() + max(0, wait_seconds)
+    waited = False
+    while True:
+        try:
+            fcntl.flock(f, mode)
+            if waited:
+                logging.info("lock acquired after waiting")
+            return f
+        except OSError:
+            if time.time() >= deadline:
+                if wait_seconds:
+                    logging.error(f"could not acquire the lock within {wait_seconds}s - "
+                                  "another run is still going")
+                return None
+            if not waited:
+                logging.info(f"another run holds the lock; waiting up to {wait_seconds}s")
+                waited = True
+            time.sleep(2)
 
 
 # ------------------------------------------------------------------------ state

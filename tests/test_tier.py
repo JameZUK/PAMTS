@@ -84,6 +84,53 @@ def job(mode, source, dest, **kw):
     return d
 
 
+# ----------------------------------------------------------------------- locking
+print("=== LOCKING: a real run waits; a poller does not; dry runs coexist")
+import fcntl as _f                                                      # noqa: E402
+_lockroot = pathlib.Path(tempfile.mkdtemp(prefix="pamts-lock-"))
+_lp = str(_lockroot / "lock")
+
+first = pamts.acquire_lock(_lp)
+check("an uncontended exclusive lock succeeds", first is not None)
+check("a second exclusive attempt with no wait fails fast",
+      pamts.acquire_lock(_lp, wait_seconds=0) is None)
+_t0 = time.time()
+check("and a short wait still fails, without hanging",
+      pamts.acquire_lock(_lp, wait_seconds=3) is None)
+check("it actually waited rather than returning instantly",
+      2.0 < time.time() - _t0 < 12.0, f"{time.time() - _t0:.1f}s")
+check("a SHARED attempt is also blocked by an exclusive holder",
+      pamts.acquire_lock(_lp, shared=True, wait_seconds=0) is None)
+first.close()
+
+# Two dry runs must be able to inspect at the same time.
+sh1 = pamts.acquire_lock(_lp, shared=True)
+sh2 = pamts.acquire_lock(_lp, shared=True)
+check("two SHARED locks coexist (two dry runs can inspect together)",
+      sh1 is not None and sh2 is not None)
+check("but an exclusive run is blocked while a dry run holds it",
+      pamts.acquire_lock(_lp, wait_seconds=0) is None)
+sh1.close()
+sh2.close()
+check("and succeeds once they release", pamts.acquire_lock(_lp) is not None)
+
+# The real scenario: a holder that releases part-way through the wait.
+import subprocess as _sp                                               # noqa: E402
+_holder = _sp.Popen([sys.executable, "-c",
+                     f"import fcntl,time;f=open({_lp!r},'w');"
+                     "fcntl.flock(f,fcntl.LOCK_EX);time.sleep(4)"])
+time.sleep(1.5)
+_t0 = time.time()
+_got = pamts.acquire_lock(_lp, wait_seconds=30)
+_el = time.time() - _t0
+_holder.wait()
+check("a waiting run acquires the lock once the holder releases",
+      _got is not None, f"waited {_el:.1f}s")
+check("and it waited for it rather than failing", _el > 1.0, f"{_el:.1f}s")
+if _got:
+    _got.close()
+shutil.rmtree(_lockroot, ignore_errors=True)
+
 # --------------------------------------------------------------- config validation
 print("=== CONFIG: the loader refuses configurations that could destroy data")
 base = {"player": {"kind": "plex", "url": "http://x:32400", "token_file": "/t"},

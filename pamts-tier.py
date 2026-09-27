@@ -478,11 +478,13 @@ def main():
     pamts.setup_logging(pamts.PATHS["tier_log"], args.dry_run)
     budget_gb = args.budget_gb if args.budget_gb is not None else pamts.TIER["budget_gb"]
 
-    lock = open(pamts.PATHS["lock_file"], "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        logging.error("another PAMTS job holds the lock - exiting")
+    # Scheduled work waits rather than abandoning its run: losing a race with the
+    # promotion poller used to skip a whole deletion pass. A dry run takes a SHARED
+    # lock, so inspecting the system while it runs is possible.
+    lock = pamts.acquire_lock(pamts.PATHS["lock_file"], shared=args.dry_run,
+                              wait_seconds=0 if args.dry_run else 900)
+    if lock is None:
+        logging.error("could not acquire the lock - exiting without doing anything")
         return 1
     # If the machine is short of memory, this job is the right thing to kill.
     try:
