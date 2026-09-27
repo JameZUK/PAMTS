@@ -155,6 +155,12 @@ played in one of the others and simply not seen.
 an adapter with no history API — LMS — usable for ranking, and it is scan-immune by
 construction, because a scan is never a playing session.
 
+For music there is a wrinkle worth knowing before you configure it: neither music server's
+API can answer *"what has anyone played"* — LMS exposes no play data at all, and Subsonic
+annotations are per-user. An optional read-only `history_db` closes that gap for both, and
+is the only way to get history that predates PAMTS. Details and trade-offs in
+[PLAYERS.md](docs/PLAYERS.md).
+
 Adding a player is one class and one registry line — see [PLAYERS.md](docs/PLAYERS.md),
 which also covers two gotchas worth reading before you configure music: LMS exposes no
 play history at all, and Navidrome's annotations are per-user so a fresh service account
@@ -186,7 +192,7 @@ python3 tests/test_tier.py
 python3 tests/test_promote.py
 ```
 
-188 checks. They use temporary directories and a fake player — they never contact a real
+204 checks. They use temporary directories and a fake player — they never contact a real
 media server and never touch real storage. `rsync` is required; the suites skip with a
 clear message if it is missing.
 

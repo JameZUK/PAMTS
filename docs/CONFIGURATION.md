@@ -29,6 +29,7 @@ A singular `[player]` is accepted as shorthand for one entry. Using both is an e
 | `username` | navidrome, lms | Navidrome: required. LMS: only if HTTP auth is on |
 | `password` | lms | only if HTTP auth is on |
 | `music_folder` | navidrome | **required** — Subsonic reports paths relative to it |
+| `history_db` | lms, navidrome | *optional* read-only path to the server's database — see below |
 
 Secrets go in their **own file**, not in this config, and not in version control.
 
@@ -40,9 +41,29 @@ reports none of them. It drives promotion fine; ranking comes from observed play
 data on day one, and PAMTS refuses to evict rather than guessing.
 
 **Navidrome annotations are per-user.** A fresh service account reports no play history
-however much the library has been listened to. Point it at the account that actually
-listens; if several people listen under separate accounts, add the adapter once per
-account with distinct `name` values. PAMTS warns if it sees items but no plays.
+however much the library has been listened to. Without `history_db`, point it at the
+account that actually listens. PAMTS warns if it sees items but no plays.
+
+### `history_db`
+
+Neither music server's API can answer "what has *anyone* played" — LMS reports no play
+data at all, and Subsonic annotations are per-user. Setting `history_db` to the server's
+own database closes that gap:
+
+| server | database | gives you |
+|---|---|---|
+| LMS | `persist.db` | play history at all — its API has none |
+| Navidrome | `navidrome.db` | **every user's** history, not just the caller's |
+
+Read-only, opened `immutable`, so a live server is never disturbed and no lock is taken.
+It needs filesystem access to the database and depends on a schema the upstream project
+may change; if that happens, history is skipped with a clear error rather than being
+silently wrong. Navidrome also needs `music_folder` set, since the database stores paths
+relative to it.
+
+This is the only way to get history that predates PAMTS. For history *from now on*,
+`[history] observe` already covers every user with no database access at all — so a
+reasonable setup is `history_db` once for the backfill and observed plays thereafter.
 
 ## `[history]`
 

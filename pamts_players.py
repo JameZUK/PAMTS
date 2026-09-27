@@ -32,6 +32,7 @@ considers *played*, which scans do not touch.
 import abc
 import base64
 import datetime
+import sqlite3
 import hashlib
 import json
 import logging
@@ -142,6 +143,39 @@ class Player(abc.ABC):
         someone to press play. Adapters that cannot do this return [].
         """
         return []
+
+    # ---------------------------------------------------------- optional history_db
+    # Some servers simply do not expose play history over their API. Where the data
+    # exists in a local database, an adapter may read it -- READ ONLY -- if the
+    # operator opts in by setting `history_db`.
+    #
+    # This is a deliberate, narrow exception to "use the API". It is not a shortcut
+    # around a working API: for LMS the API reports no play data at all, and for
+    # Subsonic servers the API reports only the CALLING USER's plays, so neither can
+    # answer "what has anyone played" however politely you ask. The trade-offs are
+    # real and the operator should know them:
+    #   * it needs filesystem access to the database
+    #   * it depends on a schema the upstream project may change
+    #   * it is the only way to get history that predates PAMTS, or history belonging
+    #     to other users
+    # Opening immutable means a live server is never disturbed and no lock is taken.
+    def _read_db(self, sql, params=()):
+        path = self.cfg.get("history_db")
+        if not path:
+            return None
+        if not os.path.exists(path):
+            logging.error(f"[{self.name}] history_db {path} does not exist")
+            return None
+        try:
+            con = sqlite3.connect(f"file:{path}?immutable=1", uri=True)
+            try:
+                return con.execute(sql, params).fetchall()
+            finally:
+                con.close()
+        except sqlite3.Error as e:
+            logging.error(f"[{self.name}] history_db read failed ({path}): {e}. The "
+                          "schema may have changed upstream; history will be skipped.")
+            return None
 
 
 class PlexPlayer(Player):
@@ -349,6 +383,12 @@ class LmsPlayer(Player):
     # An album, not a season: many small files rather than a few large ones.
     caps = Caps(max_items=40, max_bytes=3 * pamts.GB)
 
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        # Opting in to reading persist.db is the ONLY way to get play history out of
+        # LMS -- its API reports none. See Player._read_db.
+        self.provides_history = bool(cfg.get("history_db"))
+
     def available(self):
         if not self.url:
             logging.error(f"[{self.name}] no url configured")
@@ -375,9 +415,40 @@ class LmsPlayer(Player):
         return urllib.parse.unquote(u[7:])
 
     def library_items(self):
-        # Deliberately empty rather than None: None means "could not determine", and
-        # this is a definite "this adapter has no history to give".
-        return []
+        """Play history from persist.db, if the operator opted in.
+
+        LMS keeps play data in `tracks_persistent`, which deliberately survives library
+        rescans -- exactly the property PAMTS wants. Without `history_db` this returns
+        an empty list: a definite "no history to give", not a failure (None).
+        """
+        if not self.cfg.get("history_db"):
+            return []
+        rows = self._read_db(
+            "SELECT url, lastPlayed, playCount FROM tracks_persistent "
+            "WHERE lastPlayed IS NOT NULL AND lastPlayed > 0")
+        if rows is None:
+            return None
+        out = []
+        for url, last_played, _plays in rows:
+            path = self._path_from_url(url)
+            if not path:
+                continue
+            m = pamts.split_root(path)
+            if not m:
+                continue
+            rel, fast_root, slow_root = m
+            out.append({
+                "kind": "track", "show": None, "show_key": None,
+                "season": None, "episode": None,
+                "title": os.path.basename(path), "rel": rel,
+                "fast": os.path.join(fast_root, rel),
+                "slow": os.path.join(slow_root, rel),
+                "size": 0,
+                "last_viewed": int(last_played or 0),
+                "added": 0,
+            })
+        logging.info(f"[{self.name}] {len(out)} played track(s) from persist.db")
+        return out
 
     def now_playing(self):
         out = []
@@ -501,6 +572,12 @@ Verified against Navidrome 0.64.0.
 
     API_VERSION = "1.16.1"
 
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        # With history_db set, history comes from the database and covers EVERY user.
+        # Without it, the API is used and covers only the calling user.
+        self.all_users = bool(cfg.get("history_db"))
+
     def available(self):
         if not self.url:
             logging.error(f"[{self.name}] no url configured")
@@ -573,6 +650,8 @@ Verified against Navidrome 0.64.0.
         }
 
     def library_items(self):
+        if self.cfg.get("history_db"):
+            return self._items_from_db()
         if not self.available():
             return None
         out, offset, page = [], 0, 500
@@ -601,6 +680,52 @@ Verified against Navidrome 0.64.0.
                 "is the account that actually listens, not a fresh service account.")
         return out
 
+    def _items_from_db(self):
+        """Play history for EVERY user, from navidrome.db.
+
+        The API cannot do this. Subsonic `played`/`playCount` are per-user annotations,
+        so an API sweep reports only the calling account -- which means a household
+        where several people listen under separate logins would look almost unplayed,
+        and PAMTS would evict music that had been listened to. The `annotation` table
+        holds one row per (user, item); taking MAX(play_date) per file is the answer to
+        "has anyone played this".
+        """
+        folder = str(self.cfg.get("music_folder") or "").rstrip("/")
+        if not folder:
+            logging.error(f"[{self.name}] history_db needs 'music_folder' too: the "
+                          "database stores paths relative to it")
+            return None
+        rows = self._read_db(
+            "SELECT mf.path, mf.size, mf.album_id, mf.track_number, mf.disc_number, "
+            "       mf.title, MAX(a.play_date) "
+            "FROM annotation a JOIN media_file mf ON mf.id = a.item_id "
+            "WHERE a.item_type = 'media_file' AND a.play_date IS NOT NULL "
+            "GROUP BY mf.id")
+        if rows is None:
+            return None
+        out = []
+        for path, size, album_id, track, disc, title, played in rows:
+            if not path:
+                continue
+            full = path if path.startswith("/") else os.path.join(folder, path)
+            m = pamts.split_root(full)
+            if not m:
+                continue
+            rel, fast_root, slow_root = m
+            out.append({
+                "kind": "track", "show": None, "show_key": album_id,
+                "season": disc or 1, "episode": track or 0, "title": title,
+                "rel": rel,
+                "fast": os.path.join(fast_root, rel),
+                "slow": os.path.join(slow_root, rel),
+                "size": int(size or 0),
+                "last_viewed": self._epoch(played),
+                "added": 0,
+            })
+        logging.info(f"[{self.name}] {len(out)} played file(s) from navidrome.db "
+                     "(all users)")
+        return out
+
     def now_playing(self):
         try:
             r = self._get("getNowPlaying")
@@ -608,10 +733,17 @@ Verified against Navidrome 0.64.0.
             logging.error(f"[{self.name}] getNowPlaying failed: {e}")
             return []
         out = []
+        # Unlike the per-user annotations, getNowPlaying is NOT user-scoped: the
+        # Subsonic API returns every user's active session, each carrying a `username`.
+        # So a single polling account sees everyone's plays, and PAMTS's observed-play
+        # history accumulates them all.
         for s in (r.get("nowPlaying") or {}).get("entry") or []:
             it = self._song_item(s)
             if not it:
                 continue
+            who = s.get("username")
+            if who:
+                logging.debug(f"[{self.name}] session belongs to {who}")
             # getNowPlaying reports how long ago the play STARTED, in whole minutes --
             # coarse, so the remaining time is an estimate. It only feeds the time
             # budget, which has a floor, so a rough number is acceptable.

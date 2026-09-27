@@ -15,17 +15,70 @@ Adding one is one class and one line in the `ADAPTERS` registry.
 
 Two of those need explaining, because both caught me out.
 
+### Getting history out of a music server
+
+Neither music server's API can answer "what has anyone played", for different reasons.
+There are three routes, and the useful answer is a combination of two:
+
+| route | covers | cost |
+|---|---|---|
+| observed plays (built in) | everyone, **going forward** | nothing — it is already on |
+| `history_db` | everyone, **including the past** | one read-only SQL query |
+| a server plugin | everyone, going forward | a build artifact; does what route 1 already does |
+
+A plugin is the most work for the least gain: it only helps from the moment you install
+it, which polling already covers. The gap polling *cannot* fill is history that already
+exists — and that is what `history_db` is for.
+
+**`history_db` is a deliberate, narrow exception to "use the API".** It is not a shortcut
+around a working API; it exists because these APIs genuinely cannot answer the question:
+
+- LMS reports **no** play data at all (below)
+- Subsonic `played`/`playCount` are **per-user**, so an API sweep sees only the calling
+  account — a household listening under separate logins would look almost unplayed, and
+  PAMTS would evict music people had listened to
+
+The trade-offs are real, and PAMTS states them rather than hiding them: it needs
+filesystem access to the database, it depends on a schema the upstream project may
+change, and it is read-only (opened `immutable`, so a live server is never disturbed and
+no lock is taken). If the schema changes, history is skipped with a clear error — never
+silently wrong.
+
+Verified against real installations: **35,034** played tracks from an LMS `persist.db`
+(34,613 with mappable `file://` paths; the rest are streams and podcasts), and **1,425**
+from a `navidrome.db` aggregated across all users.
+
+```toml
+[[players]]
+kind = "lms"
+url = "http://music.example.lan:9000"
+history_db = "/var/lib/squeezeboxserver/prefs/persist.db"   # optional
+
+[[players]]
+kind = "navidrome"
+url = "http://music.example.lan:4533"
+username = "someone"
+token_file = "/etc/pamts/navidrome-password"
+music_folder = "/srv/fast/music"
+history_db = "/path/to/navidrome.db"                        # optional, ALL users
+```
+
+With `history_db` set, LMS gains `provides_history`, and Navidrome's history covers every
+user instead of just the caller.
+
 ### LMS exposes no play history at all
 
 Lyrion/Logitech Media Server keeps play counts and last-played times in a private
 `persist.db`, and **neither `titles` nor `songinfo` reports them** — verified against 9.x
 with the full documented tag set. There is no plugin CLI query for it either.
 
-So `LmsPlayer.provides_history = False`. It drives promotion perfectly well (it reports
-what is playing, with duration and elapsed time), and ranking comes from PAMTS's own
-**observed play history** — see below. That works, but it starts empty and fills in as
-PAMTS polls, so an LMS-only setup has no ranking data on day one. PAMTS says so rather
-than evicting blindly.
+So `LmsPlayer.provides_history = False` by default. It drives promotion perfectly well
+(it reports what is playing, with duration and elapsed time), and ranking comes from
+PAMTS's own **observed play history** — which starts empty and fills in as PAMTS polls, so
+an LMS-only setup has no ranking data on day one. PAMTS says so rather than evicting
+blindly. Set `history_db` to its `persist.db` to get the existing history immediately;
+that table deliberately survives library rescans, which is exactly the property PAMTS
+wants.
 
 `LmsPlayer.library_items()` returns `[]`, not `None`, precisely because this is a
 definite "I have no history to give" rather than a failure.
@@ -44,13 +97,19 @@ reports no history however much the library has been listened to — verified: a
 saw **0 of 5000** songs with a `played` timestamp, and `getAlbumList2` with
 `type=frequent` and `type=recent` both returned nothing.
 
-So point the adapter at **the account that actually listens**. A dedicated read-only user
-is the wrong instinct here. The adapter warns if it sees items but no plays at all, naming
-this as the likely cause.
+Without `history_db`, point the adapter at **the account that actually listens** — a
+dedicated read-only user is the wrong instinct. The adapter warns if it sees items but no
+plays at all, naming this as the likely cause.
 
-If several people listen under separate accounts, configure the adapter **once per
-account** with distinct `name` values. History is merged across players, so everyone's
-listening counts.
+With `history_db`, this stops mattering: history comes from the `annotation` table, which
+holds one row per (user, item), and PAMTS takes `MAX(play_date)` per file. That is the
+direct answer to "has anyone played this", for any number of users, with no extra logins.
+
+`getNowPlaying` is worth knowing about too: unlike the annotations it is **not**
+user-scoped — the Subsonic API returns every user's active session, each carrying a
+`username`. So one polling account feeds observed plays for everybody. Some servers gate
+parts of the API by role, so confirm your polling account really does see other users'
+sessions before relying on it for that.
 
 Subsonic also reports song `path` **relative to the music folder**, so `music_folder` is
 required — it is the absolute base PAMTS prepends before mapping onto your tiers.

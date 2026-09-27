@@ -281,6 +281,94 @@ def main():
     check(nd._epoch(None) == 0 and nd._epoch("not-a-date") == 0,
           "unparseable timestamps become 0, not an exception")
 
+    print("\n=== history_db: LMS play history from a synthetic persist.db")
+    import sqlite3
+    lms_db = os.path.join(tmp, "persist.db")
+    con = sqlite3.connect(lms_db)
+    con.execute("CREATE TABLE tracks_persistent (id INTEGER, url TEXT, lastPlayed INTEGER, "
+                "playCount INTEGER)")
+    con.executemany("INSERT INTO tracks_persistent VALUES (?,?,?,?)", [
+        (1, "file:///player/tv/Alb/01%20a.flac", 1000, 3),
+        (2, "file:///player/tv/Alb/02%20b.flac", 2000, 1),
+        (3, "file:///player/tv/Alb/03%20c.flac", None, 0),      # never played
+        (4, "http://example.com/stream", 3000, 9),              # remote, unmappable
+        (5, "file:///somewhere/else/x.flac", 4000, 1),          # outside the roots
+    ])
+    con.commit()
+    con.close()
+
+    plain = pamts_players.LmsPlayer({"name": "lms", "url": "http://unused"})
+    check(plain.provides_history is False,
+          "without history_db, LMS declares no history (its API has none)")
+    check(plain.library_items() == [],
+          "and returns [] -- a definite 'nothing', not a failure")
+
+    withdb = pamts_players.LmsPlayer({"name": "lmsdb", "url": "http://unused",
+                                      "history_db": lms_db})
+    check(withdb.provides_history is True, "with history_db, LMS declares history")
+    items = withdb.library_items()
+    rels = sorted(i["rel"] for i in items)
+    check(rels == ["Alb/01 a.flac", "Alb/02 b.flac"],
+          f"only played, mappable, in-root tracks (got {rels})")
+    check(all(i["last_viewed"] > 0 for i in items), "play times carried through")
+    byrel = {i["rel"]: i for i in items}
+    check(byrel["Alb/02 b.flac"]["last_viewed"] == 2000, "the right timestamp per track")
+    check(byrel["Alb/01 a.flac"]["fast"].startswith(fast), "mapped onto the fast tier")
+
+    print("\n=== history_db: Navidrome history covers ALL users, unlike the API")
+    nd_db = os.path.join(tmp, "navidrome.db")
+    con = sqlite3.connect(nd_db)
+    con.execute("CREATE TABLE media_file (id TEXT, path TEXT, size INT, album_id TEXT, "
+                "track_number INT, disc_number INT, title TEXT)")
+    con.execute("CREATE TABLE annotation (user_id TEXT, item_id TEXT, item_type TEXT, "
+                "play_count INT, play_date TEXT)")
+    con.executemany("INSERT INTO media_file VALUES (?,?,?,?,?,?,?)", [
+        ("m1", "Alb/01 a.flac", 111, "al1", 1, 1, "a"),
+        ("m2", "Alb/02 b.flac", 222, "al1", 2, 1, "b"),
+        ("m3", "Alb/03 c.flac", 333, "al1", 3, 1, "c"),
+    ])
+    con.executemany("INSERT INTO annotation VALUES (?,?,?,?,?)", [
+        # Two different users played m1; the NEWER play must win.
+        ("userA", "m1", "media_file", 1, "2026-01-01T00:00:00Z"),
+        ("userB", "m1", "media_file", 1, "2026-06-01T00:00:00Z"),
+        ("userB", "m2", "media_file", 1, "2026-03-01T00:00:00Z"),
+        ("userA", "m3", "media_file", 0, None),            # never played
+        ("userA", "al1", "album", 1, "2026-07-01T00:00:00Z"),   # wrong item_type
+    ])
+    con.commit()
+    con.close()
+
+    nd2 = pamts_players.NavidromePlayer({
+        "name": "nddb", "url": "http://unused", "username": "u",
+        "token_file": "/dev/null", "music_folder": "/player/tv",
+        "history_db": nd_db})
+    check(nd2.all_users is True, "history_db means all users are covered")
+    items = nd2.library_items()
+    got = {i["rel"]: i["last_viewed"] for i in items}
+    check(sorted(got) == ["Alb/01 a.flac", "Alb/02 b.flac"],
+          f"only files anyone played, and only media_file rows (got {sorted(got)})")
+    check(got["Alb/01 a.flac"] > got["Alb/02 b.flac"],
+          "the NEWEST play across users wins for a file played by two people")
+    check(nd2._epoch("2026-06-01T00:00:00Z") == got["Alb/01 a.flac"],
+          "userB's June play won over userA's January one")
+    byrel = {i["rel"]: i for i in items}
+    check(byrel["Alb/01 a.flac"]["size"] == 111, "size carried from media_file")
+    check(byrel["Alb/02 b.flac"]["episode"] == 2, "track number becomes the order key")
+
+    print("\n=== history_db: failures degrade safely")
+    missing = pamts_players.LmsPlayer({"name": "x", "url": "http://u",
+                                       "history_db": os.path.join(tmp, "nope.db")})
+    check(missing.library_items() is None,
+          "a missing history_db returns None (could not determine), not []")
+    bad = os.path.join(tmp, "bad.db")
+    open(bad, "wb").write(b"this is not a database")
+    broken = pamts_players.LmsPlayer({"name": "y", "url": "http://u", "history_db": bad})
+    check(broken.library_items() is None, "an unreadable/changed schema returns None")
+    nd3 = pamts_players.NavidromePlayer({
+        "name": "z", "url": "http://u", "username": "u", "token_file": "/dev/null",
+        "history_db": nd_db})       # no music_folder
+    check(nd3.library_items() is None, "history_db without music_folder is refused")
+
     print("\n=== fake player drives the engine end to end")
     fp = FakePlayer(
         events=[PlayEvent(source="fake", kind="episode", label="Show S01E01",

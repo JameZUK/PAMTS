@@ -35,6 +35,10 @@ token_file = "/etc/pamts/plex-token"
 # url = "http://music.example.lan:9000"
 # username = ""                            # only if you have HTTP auth enabled
 # password = ""
+# Optional, and the ONLY way to get play history out of LMS. Read-only; opened
+# immutable so a running server is never disturbed. tracks_persistent deliberately
+# survives library rescans, which is exactly what PAMTS wants.
+# history_db = "/var/lib/squeezeboxserver/prefs/persist.db"
 
 # --- Navidrome (Subsonic API) ---
 # token_file holds the user's PASSWORD; Subsonic derives a per-request token from it
@@ -57,6 +61,9 @@ token_file = "/etc/pamts/plex-token"
 # username = "your-listening-account"
 # token_file = "/etc/pamts/navidrome-password"
 # music_folder = "/srv/fast/music"
+# Optional. With this set, history comes from the annotation table and covers EVERY
+# user -- which the API cannot do, because annotations are per-user. Read-only.
+# history_db = "/path/to/navidrome.db"
 
 # --------------------------------------------------------------------- history
 # PAMTS records what it observes playing, building its own play history.
