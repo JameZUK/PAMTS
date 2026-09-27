@@ -140,8 +140,25 @@ That third question is why adapters exist rather than a hard-coded API client: t
 locality rule differs per medium. An episode implies the rest of the season; a track
 implies the rest of the album; a film implies nothing.
 
-**Plex is implemented.** Adding another is one class and one registry line —
-see [PLAYERS.md](docs/PLAYERS.md).
+| adapter | play history | now playing | locality |
+|---|---|---|---|
+| **Plex** | ✅ | ✅ | season, crossing into the next |
+| **LMS** / Lyrion | ❌ not exposed by its API | ✅ | album |
+| **Navidrome** | ✅ but **per-user** | ✅ | album |
+
+**Several players at once.** `[[players]]` takes any number, and history is merged across
+them taking the most recent play. This is the normal case for music, where two or three
+things serve the same files: ranking on a single app's view would evict an album that was
+played in one of the others and simply not seen.
+
+**PAMTS also records what it sees playing**, building its own history. That is what makes
+an adapter with no history API — LMS — usable for ranking, and it is scan-immune by
+construction, because a scan is never a playing session.
+
+Adding a player is one class and one registry line — see [PLAYERS.md](docs/PLAYERS.md),
+which also covers two gotchas worth reading before you configure music: LMS exposes no
+play history at all, and Navidrome's annotations are per-user so a fresh service account
+reports nothing.
 
 ## Requirements
 
@@ -169,7 +186,7 @@ python3 tests/test_tier.py
 python3 tests/test_promote.py
 ```
 
-137 checks. They use temporary directories and a fake player — they never contact a real
+188 checks. They use temporary directories and a fake player — they never contact a real
 media server and never touch real storage. `rsync` is required; the suites skip with a
 clear message if it is missing.
 

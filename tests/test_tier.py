@@ -320,24 +320,178 @@ mkfile(fast / "tv" / "Show" / "S01" / "e.mkv", 4 * 1024 * 1024, mtime_days=300)
 
 
 class DeadPlayer:
-    kind = "dead"
+    """A player that is configured but cannot answer."""
+    kind = name = "dead"
+    provides_history = True
+    provides_sessions = True
 
-    def __init__(self, cfg):
+    def __init__(self, cfg=None):
         pass
+
+    def available(self):
+        return True
 
     def library_items(self):
         return None
 
 
-_orig_build = tier.pamts_players.build
-tier.pamts_players.build = lambda cfg: DeadPlayer(cfg)
+_orig_all = tier.pamts_players.build_all
+tier.pamts_players.build_all = lambda cfgs: [DeadPlayer()]
+pamts.PATHS["state_file"] = str(root / "no-observed.json")     # no observed plays either
 ok = tier.do_tier([job("tier", fast / "tv", slow / "tv", depth=2)],
                   budget=1, dry_run=False)          # no views= -> it fetches
-tier.pamts_players.build = _orig_build
+tier.pamts_players.build_all = _orig_all
 check("returns failure", ok is False)
 check("no rsync ran", not captured, f"ran {captured}")
 check("content stayed on fast storage", (fast / "tv" / "Show" / "S01" / "e.mkv").exists())
 shutil.rmtree(root)
+
+print("=== MULTI-PLAYER: history is merged across players, newest play wins")
+root = fresh()
+
+
+class HistPlayer:
+    """Reports a fixed library with play times."""
+    provides_history = True
+    provides_sessions = False
+
+    def __init__(self, name, items):
+        self.name = self.kind = name
+        self._items = items
+
+    def available(self):
+        return True
+
+    def library_items(self):
+        return self._items
+
+
+def it_(fast_p, viewed, show="Alb", ep=1, size=100):
+    return {"kind": "track", "show": show, "show_key": show, "season": 1, "episode": ep,
+            "title": "t", "rel": "x", "fast": fast_p, "slow": "/s/x", "size": size,
+            "last_viewed": viewed, "added": 0}
+
+
+a = HistPlayer("appA", [it_("/f/one", 1000), it_("/f/two", 5000)])
+b = HistPlayer("appB", [it_("/f/one", 9000), it_("/f/three", 100)])
+items, ok = tier.pamts_players.sweep([a, b])
+byfast = {i["fast"]: i["last_viewed"] for i in items}
+check("at least one player supplied history", ok is True)
+check("all distinct items are present", set(byfast) == {"/f/one", "/f/two", "/f/three"},
+      str(sorted(byfast)))
+check("the NEWEST play across players wins", byfast["/f/one"] == 9000, str(byfast))
+check("items are de-duplicated by fast path, not duplicated per player",
+      len(items) == 3, str(len(items)))
+
+print("=== MULTI-PLAYER: a player with no history API is skipped, not fatal")
+
+
+class SessionOnly(HistPlayer):
+    provides_history = False
+
+
+items, ok = tier.pamts_players.sweep([SessionOnly("lmslike", [])])
+check("no history provider means ok is False", ok is False)
+check("and no items", items == [], str(items))
+items, ok = tier.pamts_players.sweep([SessionOnly("lmslike", []), a])
+check("a mixed set still reports ok from the provider that worked", ok is True)
+check("and yields that provider's items", len(items) == 2, str(len(items)))
+
+print("=== OBSERVED PLAYS: PAMTS's own history, and it can rank on its own")
+root = fresh()
+fast, slow = root / "fast", root / "slow"
+mkfile(fast / "tv" / "SeenPlaying" / "S01" / "e.mkv", 4 * 1024 * 1024, mtime_days=200)
+mkfile(fast / "tv" / "NeverSeen" / "S01" / "e.mkv", 4 * 1024 * 1024, mtime_days=200)
+(slow / "tv").mkdir(parents=True)
+st = {}
+n = pamts.observe_plays(st, [str(fast / "tv" / "SeenPlaying" / "S01" / "e.mkv")],
+                        time.time() - 3600)
+check("a play is recorded", n == 1 and len(st["observed"]) == 1)
+pamts.save_state({"promotions": {}, "observed": st["observed"]}, dry_run=False)
+check("observed history is readable back",
+      len(pamts.observed_history()) == 1, str(pamts.observed_history()))
+# Only observed history exists -- no player provides any. Eviction must still work and
+# must prefer the item it has never seen played.
+tier.pamts_players.build_all = lambda cfgs: [SessionOnly("lmslike", [])]
+ok = tier.do_tier([job("tier", fast / "tv", slow / "tv", depth=2, grace=False)],
+                  budget=5 * 1024 * 1024, dry_run=False)
+tier.pamts_players.build_all = _orig_all
+check("eviction proceeds on observed plays alone", ok is True)
+check("the item seen playing stayed",
+      (fast / "tv" / "SeenPlaying" / "S01" / "e.mkv").exists())
+check("the item never seen playing was evicted",
+      (slow / "tv" / "NeverSeen" / "S01" / "e.mkv").exists())
+shutil.rmtree(root)
+
+print("=== OBSERVED PLAYS: bounded, and never moved backwards")
+st = {"observed": {"/f/a": 5000}}
+pamts.observe_plays(st, ["/f/a"], 1000)
+check("an older sighting does not overwrite a newer one", st["observed"]["/f/a"] == 5000)
+pamts.observe_plays(st, ["/f/a"], 9000)
+check("a newer sighting does", st["observed"]["/f/a"] == 9000)
+now = time.time()
+st = {"observed": {"/f/new": now - 100,
+                   "/f/ancient": now - (int(pamts.HISTORY["max_age_days"]) + 10) * 86400}}
+check("ancient records are pruned", pamts.prune_observed(st, now) == 1)
+check("recent ones are kept", list(st["observed"]) == ["/f/new"], str(st["observed"]))
+pamts.HISTORY["max_entries"] = 3
+st = {"observed": {f"/f/{i}": now - i for i in range(10)}}
+pamts.prune_observed(st, now)
+check("the entry cap is enforced", len(st["observed"]) == 3, str(len(st["observed"])))
+check("and it keeps the NEWEST entries",
+      set(st["observed"]) == {"/f/0", "/f/1", "/f/2"}, str(sorted(st["observed"])))
+pamts.HISTORY = dict(pamts.DEFAULTS["history"])
+check("observe=false disables recording",
+      (pamts.HISTORY.update({"observe": False}) or
+       pamts.observe_plays({}, ["/f/x"], now) == 0))
+pamts.HISTORY = dict(pamts.DEFAULTS["history"])
+
+print("=== MULTI-PLAYER CONFIG")
+mp = {"roots": [{"player_path": "/p", "fast": "/f", "slow": "/s"}],
+      "jobs": [{"name": "t", "mode": "tier", "source": "/a", "dest": "/b"}]}
+check("[[players]] with several entries is accepted",
+      cfg_err({**mp, "players": [
+          {"kind": "plex", "url": "http://a", "token_file": "/t"},
+          {"kind": "lms", "url": "http://b"}]}) is None)
+check("and both are registered", len(pamts.PLAYERS) == 2, str(len(pamts.PLAYERS)))
+check("using [player] and [[players]] together is refused",
+      cfg_err({**mp, "player": {"kind": "plex", "url": "http://a", "token_file": "/t"},
+               "players": [{"kind": "lms", "url": "http://b"}]}) is not None)
+check("a player with no url is refused",
+      cfg_err({**mp, "players": [{"kind": "lms"}]}) is not None)
+check("duplicate player names are refused",
+      cfg_err({**mp, "players": [{"kind": "lms", "url": "http://a"},
+                                 {"kind": "lms", "url": "http://b"}]}) is not None)
+check("distinct names make duplicates of one kind fine",
+      cfg_err({**mp, "players": [{"name": "lms1", "kind": "lms", "url": "http://a"},
+                                 {"name": "lms2", "kind": "lms", "url": "http://b"}]})
+      is None)
+check("singular [player] still works as shorthand",
+      cfg_err({**mp, "player": {"kind": "plex", "url": "http://a",
+                                "token_file": "/t"}}) is None
+      and len(pamts.PLAYERS) == 1)
+
+print("=== ADAPTERS: registry and declared capabilities")
+reg = tier.pamts_players.ADAPTERS
+check("plex is registered", "plex" in reg)
+check("lms is registered", "lms" in reg)
+check("navidrome is registered", "navidrome" in reg)
+check("LMS declares NO history (its API exposes none)",
+      reg["lms"].provides_history is False)
+check("LMS does provide sessions", reg["lms"].provides_sessions is True)
+check("LMS library_items returns [] not None (a definite 'nothing', not a failure)",
+      reg["lms"]({"url": "http://x"}).library_items() == [])
+check("Navidrome declares history", reg["navidrome"].provides_history is True)
+check("Plex declares both", reg["plex"].provides_history is True
+      and reg["plex"].provides_sessions is True)
+check("navidrome without music_folder reports unavailable",
+      reg["navidrome"]({"url": "http://x", "username": "u",
+                        "token_file": "/nonexistent"}).available() is False)
+check("LMS decodes percent-encoded file:// urls",
+      reg["lms"]._path_from_url("file:///srv/fast/music/A%20B/01%20x.flac")
+      == "/srv/fast/music/A B/01 x.flac")
+check("LMS ignores remote streams",
+      reg["lms"]._path_from_url("podcast://https://example.com/a.mp3") is None)
 
 # ------------------------------------------------------------------ season flow
 print("=== SEASON FLOW: depth 2 evicts a SEASON, not the whole series")

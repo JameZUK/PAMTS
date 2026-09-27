@@ -5,15 +5,70 @@
 #
 # Sizes are in GB (binary, 1 GB = 1024^3) unless the name says otherwise.
 
-# ---------------------------------------------------------------------- player
-# The media player PAMTS reads "what has been played" and "what is playing" from.
-# This is the ONLY component that knows about a specific media server.
-[player]
+# --------------------------------------------------------------------- players
+# The media players PAMTS reads "what has been played" and "what is playing" from.
+# These are the ONLY components that know about a specific media server.
+#
+# Use [[players]] when more than one thing serves the same files -- which is normal
+# for music. Play history is MERGED across them, taking the most recent play, because
+# an album played in one app looks untouched to the others: ranking on a single app's
+# view would evict content that WAS played and simply was not seen there.
+#
+# A singular [player] is accepted as shorthand for one entry. Do not use both.
+
+[[players]]
+name = "plex"                              # optional; defaults to `kind`
 kind = "plex"                              # see docs/PLAYERS.md for adding others
 url = "http://plex.example.lan:32400"
 # A file containing the API token, readable only by the user PAMTS runs as.
 # Never put the token itself in this file, and never commit it.
-token_file = "/etc/pamts/player-token"
+token_file = "/etc/pamts/plex-token"
+
+# --- Lyrion Music Server (formerly Logitech Media Server) ---
+# NOTE: LMS exposes NO play history through its API -- play counts live in a private
+# database and neither `titles` nor `songinfo` reports them. So this adapter drives
+# PROMOTION only, and ranking comes from PAMTS's own observed plays (see [history]),
+# which fill in as it polls. That is a real limitation, not a configuration mistake.
+# [[players]]
+# name = "lms"
+# kind = "lms"
+# url = "http://music.example.lan:9000"
+# username = ""                            # only if you have HTTP auth enabled
+# password = ""
+
+# --- Navidrome (Subsonic API) ---
+# token_file holds the user's PASSWORD; Subsonic derives a per-request token from it
+# and the password itself is never sent.
+#
+# USE THE ACCOUNT THAT ACTUALLY LISTENS. Subsonic play annotations (played,
+# playCount) are PER USER, so a freshly created service account reports no play
+# history at all no matter how much the library has been listened to. A dedicated
+# read-only user is the wrong choice here. PAMTS warns if it sees items but no plays.
+#
+# If several people listen under separate accounts, add this adapter once per account
+# with distinct `name` values -- history is merged across players.
+#
+# music_folder is REQUIRED: Subsonic reports song paths relative to the music folder,
+# so PAMTS cannot map a song onto your tiers without knowing the absolute base.
+# [[players]]
+# name = "navidrome"
+# kind = "navidrome"
+# url = "http://music.example.lan:4533"
+# username = "your-listening-account"
+# token_file = "/etc/pamts/navidrome-password"
+# music_folder = "/srv/fast/music"
+
+# --------------------------------------------------------------------- history
+# PAMTS records what it observes playing, building its own play history.
+#
+# This is what makes a player with no history API usable for ranking. It is
+# scan-immune by construction: a library scan is never a playing session, so it can
+# never write a record here. Harmless to leave on even when every player does report
+# history -- it simply agrees with them.
+[history]
+observe = true
+max_entries = 200000       # cap; oldest records dropped first
+max_age_days = 1825        # ~5 years
 
 # ----------------------------------------------------------------------- paths
 [paths]
@@ -99,6 +154,15 @@ player_path = "/media/library/movies"
 fast = "/srv/fast/movies"
 slow = "/srv/slow/movies"
 
+# Music, with a root per consumer. Different servers report different paths for the
+# same file -- LMS reports the filesystem path it scanned, Subsonic reports a path
+# relative to its music folder (which the navidrome adapter prepends). List whatever
+# each one actually reports; they all resolve to the same two tiers.
+# [[roots]]
+# player_path = "/srv/fast/music"
+# fast = "/srv/fast/music"
+# slow = "/srv/slow/music"
+
 # ------------------------------------------------------------------------ jobs
 # mode = "tier"   the fast copy is a CACHE. It is expected to empty as content ages.
 #                 Content is MOVED to `dest`. --delete is never used.
@@ -125,6 +189,19 @@ dest = "/srv/slow/movies"
 depth = 1
 grace = true     # Films have no episode ordering to reason about, so a new unwatched
                  # film keeps the grace window.
+
+# Music, if you tier it. The locality unit is the ALBUM rather than a season, so the
+# per-event caps in [promote] (tens of small files rather than a few large ones) come
+# from the adapter's own ceilings -- see docs/PLAYERS.md.
+#
+# depth = 2 suits Artist/Album layouts, making an ALBUM the unit of eviction.
+# [[jobs]]
+# name = "music"
+# mode = "tier"
+# source = "/srv/fast/music"
+# dest = "/srv/slow/music"
+# depth = 2
+# grace = true
 
 # An example backup job. Deletions PROPAGATE here, so max_delete is required.
 # Set it a little above the largest number of deletions you would consider normal; if a

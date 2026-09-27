@@ -188,7 +188,7 @@ def record_rate(state, stats):
                  f"estimate now {human(state['rate_bps'])}/s")
 
 
-def do_next_up(player, budget, budget_left, state, stats, now, dry_run):
+def do_next_up(players, budget, budget_left, state, stats, now, dry_run):
     """Make sure each series' next unwatched item is on fast storage.
 
     Run nightly, after eviction. Tiering deliberately lets a whole-season download age
@@ -198,10 +198,24 @@ def do_next_up(player, budget, budget_left, state, stats, now, dry_run):
     Not speculative in the way film prefetch would be: "the next unwatched episode of
     a series you are part-way through" is the strongest predictor there is.
     """
-    items = player.library_items()
-    if items is None:
-        logging.error("[next-up] could not sweep the library")
+    items, hist_ok = pamts_players.sweep(players)
+    if not items:
+        logging.error("[next-up] no library data from any player that provides history")
         return 1
+    if not hist_ok:
+        logging.warning("[next-up] no player supplied play history; pins are derived "
+                        "from item metadata only")
+    # Fold in observed plays, so an item played in a session-only app is not treated as
+    # unwatched and pinned forever.
+    observed = pamts.observed_history()
+    if observed:
+        folded = 0
+        for it in items:
+            o = observed.get(it["fast"], 0)
+            if o > (it.get("last_viewed") or 0):
+                it["last_viewed"] = o
+                folded += 1
+        logging.info(f"[next-up] folded in {folded} observed play(s)")
     depth = pamts.pin_depth(budget_left, budget)
     pins = pamts.next_up(items, int(pamts.TIER["next_up_max_items"]),
                          int(pamts.TIER["next_up_max_gb"]) * pamts.GB, depth)
@@ -311,36 +325,64 @@ def main():
     stats = {}
 
     try:
-        player = pamts_players.build(pamts.PLAYER)
+        players = pamts_players.build_all(pamts.PLAYERS)
     except pamts.ConfigError as e:
         logging.error(str(e))
         return 2
-    if not player.available():
-        return 1
 
     if args.next_up:
-        rc = do_next_up(player, budget, budget_left, state, stats, now, args.dry_run)
+        rc = do_next_up(players, budget, budget_left, state, stats, now, args.dry_run)
         record_rate(state, stats)
+        pamts.prune_observed(state, now)
         pamts.save_state(state, args.dry_run)
         return rc
 
-    try:
-        events = (player.simulate_recent(args.simulate_count) if args.simulate_recent
-                  else player.now_playing())
-    except Exception as e:
-        logging.error(f"[{player.kind}] cannot query: {e}")
-        return 1
-    if not events:
-        logging.info(f"[{player.kind}] nothing playing")
-        return 0
-    if args.simulate_recent:
-        logging.warning(f"[{player.kind}] SIMULATED events - nothing will be promoted")
-
-    promoted, rc = 0, 0
-    for ev in events:
-        logging.info(f"[{player.kind}] playing {ev.kind}: {ev.label}")
+    # Ask every player what is playing, keeping each event paired with the adapter that
+    # produced it -- locality is adapter-specific, so the answer must come from the same
+    # one. Several players may be serving different things at the same time.
+    pairs, rc = [], 0
+    for pl in players:
+        if not pl.provides_sessions:
+            continue
+        if not pl.available():
+            rc = 1
+            continue
         try:
-            cands = player.locality_group(ev)
+            evs = (pl.simulate_recent(args.simulate_count) if args.simulate_recent
+                   else pl.now_playing())
+        except Exception as e:
+            logging.error(f"[{pl.name}] cannot query: {e}")
+            rc = 1
+            continue
+        if not evs:
+            logging.info(f"[{pl.name}] nothing playing")
+        pairs.extend((pl, ev) for ev in evs)
+
+    if not pairs:
+        pamts.prune_observed(state, now)
+        pamts.save_state(state, args.dry_run)
+        return rc
+    if args.simulate_recent:
+        logging.warning("SIMULATED events - nothing will be promoted")
+
+    # Record what is playing as PAMTS's own play history. This is what makes ranking
+    # work for players that expose none (LMS), and it can never be written by a library
+    # scan, because a scan is not a playing session.
+    if not args.simulate_recent:
+        seen = []
+        for _pl, ev in pairs:
+            m = pamts.split_root(ev.path)
+            if m:
+                seen.append(os.path.join(m[1], m[0]))
+        added = pamts.observe_plays(state, seen, now)
+        if added:
+            logging.info(f"recorded {added} observed play(s)")
+
+    promoted = 0
+    for pl, ev in pairs:
+        logging.info(f"[{pl.name}] playing {ev.kind}: {ev.label}")
+        try:
+            cands = pl.locality_group(ev)
         except Exception as e:
             logging.error(f"  cannot resolve locality group: {e}")
             rc = 1
@@ -348,7 +390,7 @@ def main():
         if not cands:
             logging.info("  no locality group for this item - nothing to promote")
             continue
-        caps = effective_caps(player.caps, budget_left - promoted, ev.remaining_s, rate)
+        caps = effective_caps(pl.caps, budget_left - promoted, ev.remaining_s, rate)
         items = filter_candidates(cands, caps, budget_left - promoted)
         if not items:
             logging.info("  nothing to promote (already local, or capped)")
@@ -357,12 +399,13 @@ def main():
         if copy_items(items, args.dry_run, stats):
             for it in items:
                 state["promotions"][it["group_dir"]] = {
-                    "at": now, "source": player.kind, "label": ev.label,
+                    "at": now, "source": pl.name, "label": ev.label,
                     "last_rel": it["rel"]}
             promoted += sum(i["size"] for i in items)
         else:
             rc = 1
     record_rate(state, stats)
+    pamts.prune_observed(state, now)
     pamts.save_state(state, args.dry_run)
     logging.info(f"promoted {human(promoted)} this pass")
     return rc

@@ -11,17 +11,58 @@ system that has misunderstood its own configuration moves data to the wrong plac
 
 ---
 
-## `[player]`
+## `[[players]]`
 
-The only section that knows about a specific media server.
+The only section that knows about a specific media server. Repeatable — and for music you
+usually want more than one, because several things commonly serve the same files. History
+is **merged** across them, taking the most recent play, so an album played in one app is
+not treated as untouched by the others.
+
+A singular `[player]` is accepted as shorthand for one entry. Using both is an error.
+
+| key | applies to | notes |
+|---|---|---|
+| `kind` | all | `plex`, `lms`, `navidrome` |
+| `name` | all | optional label; defaults to `kind`. **Required** if you configure two of the same kind |
+| `url` | all | *required*, e.g. `http://127.0.0.1:32400` |
+| `token_file` | plex, navidrome | file containing the token/password, mode `600` |
+| `username` | navidrome, lms | Navidrome: required. LMS: only if HTTP auth is on |
+| `password` | lms | only if HTTP auth is on |
+| `music_folder` | navidrome | **required** — Subsonic reports paths relative to it |
+
+Secrets go in their **own file**, not in this config, and not in version control.
+
+### Per-adapter caveats
+
+**LMS exposes no play history.** Play counts live in a private database and its API
+reports none of them. It drives promotion fine; ranking comes from observed plays (see
+`[history]`), which start empty and fill in. An LMS-only setup therefore has no ranking
+data on day one, and PAMTS refuses to evict rather than guessing.
+
+**Navidrome annotations are per-user.** A fresh service account reports no play history
+however much the library has been listened to. Point it at the account that actually
+listens; if several people listen under separate accounts, add the adapter once per
+account with distinct `name` values. PAMTS warns if it sees items but no plays.
+
+## `[history]`
+
+PAMTS records what it observes playing, building its own play history, and merges it with
+whatever the players report.
 
 | key | default | notes |
 |---|---|---|
-| `kind` | `"plex"` | adapter name; see [PLAYERS.md](PLAYERS.md) |
-| `url` | *required* | e.g. `http://127.0.0.1:32400` |
-| `token_file` | *required* | file containing the API token, mode `600` |
+| `observe` | `true` | record observed plays |
+| `max_entries` | `200000` | cap; oldest records dropped first |
+| `max_age_days` | `1825` | ~5 years; older records pruned |
 
-The token goes in its **own file**, not in this config. Keep it out of version control.
+This is what makes a history-less adapter usable for ranking. It is scan-immune by
+construction — a library scan is never a playing session — so it cannot be polluted the
+way `atime` can. Harmless to leave on when every player reports history; it simply agrees
+with them.
+
+Caveats: a 60-second poll can miss a very short item, and "seen playing" is not quite
+"played to completion". Both are acceptable for tiering, where the question is whether a
+human was there.
 
 ## `[paths]`
 

@@ -30,9 +30,13 @@ considers *played*, which scans do not touch.
 """
 
 import abc
+import base64
+import datetime
+import hashlib
 import json
 import logging
 import os
+import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -79,8 +83,20 @@ class Player(abc.ABC):
     kind = "abstract"
     caps = Caps(max_items=24, max_bytes=60 * pamts.GB)
 
+    # Not every server exposes everything. An adapter declares what it can do, and
+    # the engine works with whatever is available rather than assuming.
+    #
+    # provides_history  can library_items() return real play history? Lyrion/LMS
+    #                   cannot: its API reports no play counts at all. Such an
+    #                   adapter still drives promotion, and PAMTS's own observed-play
+    #                   history (see pamts.observe_plays) covers ranking over time.
+    # provides_sessions can now_playing() report what is playing?
+    provides_history = True
+    provides_sessions = True
+
     def __init__(self, cfg):
         self.cfg = cfg
+        self.name = cfg.get("name") or self.kind
         self.url = str(cfg.get("url", "")).rstrip("/")
         self.token_file = cfg.get("token_file")
         self._token = None
@@ -314,17 +330,389 @@ class PlexPlayer(Player):
         return out
 
 
+class LmsPlayer(Player):
+    """Lyrion Music Server (formerly Logitech Media Server), over JSON-RPC.
+
+    Endpoint is POST {url}/jsonrpc.js with {"method":"slim.request",
+    "params":[<playerid>, [<command>...]]}. Optional HTTP basic auth.
+
+    IMPORTANT: LMS exposes NO play history through this API. Play counts and last-played
+    times live in its private persist.db, and neither `titles` nor `songinfo` reports
+    them (verified against 9.x). So provides_history is False: this adapter drives
+    promotion, and ranking comes from PAMTS's own observed-play history, which fills in
+    as it polls. See docs/PLAYERS.md.
+
+    Locality unit is the album, taken in track order.
+    """
+    kind = "lms"
+    provides_history = False
+    # An album, not a season: many small files rather than a few large ones.
+    caps = Caps(max_items=40, max_bytes=3 * pamts.GB)
+
+    def available(self):
+        if not self.url:
+            logging.error(f"[{self.name}] no url configured")
+            return False
+        return True
+
+    def _rpc(self, player_id, command):
+        body = json.dumps({"id": 1, "method": "slim.request",
+                           "params": [player_id or "", command]}).encode()
+        req = urllib.request.Request(f"{self.url}/jsonrpc.js", data=body,
+                                     headers={"Content-Type": "application/json"})
+        user, pw = self.cfg.get("username"), self.cfg.get("password")
+        if user:
+            token = base64.b64encode(f"{user}:{pw or ''}".encode()).decode()
+            req.add_header("Authorization", f"Basic {token}")
+        with urllib.request.urlopen(req, timeout=45) as r:
+            return json.loads(r.read().decode("utf-8", "replace")).get("result", {})
+
+    @staticmethod
+    def _path_from_url(u):
+        """LMS reports local files as percent-encoded file:// URLs."""
+        if not u or not u.startswith("file://"):
+            return None                      # remote stream (radio, podcast): not ours
+        return urllib.parse.unquote(u[7:])
+
+    def library_items(self):
+        # Deliberately empty rather than None: None means "could not determine", and
+        # this is a definite "this adapter has no history to give".
+        return []
+
+    def now_playing(self):
+        out = []
+        try:
+            players = self._rpc("", ["players", "0", "50"]).get("players_loop", [])
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            logging.error(f"[{self.name}] cannot list players: {e}")
+            return []
+        for pl in players:
+            pid = pl.get("playerid")
+            if not pid or not pl.get("connected"):
+                continue
+            try:
+                st = self._rpc(pid, ["status", "-", "1", "tags:u"])
+            except (urllib.error.URLError, OSError, ValueError):
+                continue
+            if st.get("mode") != "play":
+                continue
+            tracks = st.get("playlist_loop") or []
+            if not tracks:
+                continue
+            t = tracks[0]
+            path = self._path_from_url(t.get("url"))
+            if not path:
+                continue
+            dur = float(t.get("duration") or st.get("duration") or 0)
+            elapsed = float(st.get("time") or 0)
+            remaining = max(0.0, dur - elapsed) if dur else 0.0
+            out.append(PlayEvent(
+                source=self.name, kind="track", path=path, remaining_s=remaining,
+                label=f"{pl.get('name')}: {t.get('title')}"
+                      + (f" [{remaining / 60:.0f} min left]" if remaining else ""),
+                group={"track_id": t.get("id")}))
+        return out
+
+    def locality_group(self, event):
+        """The rest of the album, in track order."""
+        if event.kind != "track" or not event.group:
+            return []
+        tid = event.group.get("track_id")
+        if tid is None:
+            return []
+        try:
+            # status' playlist_loop does not carry album_id, so resolve it per track.
+            info = self._rpc("", ["songinfo", "0", "50", f"track_id:{tid}", "tags:e"])
+            album_id = None
+            for e in info.get("songinfo_loop", []):
+                album_id = e.get("album_id", album_id)
+            if album_id is None:
+                return []           # a single/remote track with no album: no locality
+            tracks = self._rpc("", ["titles", "0", "500", f"album_id:{album_id}",
+                                    "tags:uf", "sort:tracknum"]).get("titles_loop", [])
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            logging.error(f"[{self.name}] cannot resolve album: {e}")
+            return []
+
+        def num(t):
+            try:
+                return int(t.get("tracknum") or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        # Find where we are by matching the track ID within the album listing. songinfo
+        # does not reliably report a track number (the documented tag for `titles` is
+        # not honoured there), and matching on the id uses only fields both calls agree
+        # on. If the id is not found, fall back to promoting the whole album rather than
+        # nothing -- being slightly wasteful beats doing nothing useful.
+        cur_n = 0
+        for t in tracks:
+            if str(t.get("id")) == str(tid):
+                cur_n = num(t)
+                break
+        else:
+            logging.info(f"[{self.name}] current track not found in its album listing; "
+                         "offering the whole album")
+
+        out = []
+        for t in tracks:
+            path = self._path_from_url(t.get("url"))
+            if not path:
+                continue
+            n = num(t)
+            if n <= cur_n:
+                continue
+            try:
+                size = int(t.get("filesize") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            out.append(Candidate(path=path, label=f"track {n:02d}", size=size, order=n))
+        return out
+
+
+class NavidromePlayer(Player):
+    """Navidrome, over the Subsonic API.
+
+Verified against Navidrome 0.64.0.
+
+    Configuration needs `username`, and `token_file` holding that user's PASSWORD
+    (Subsonic derives a per-request token from it; the password is never sent).
+
+    **Use the account that actually listens.** Subsonic play annotations -- `played`
+    and `playCount` -- are PER USER. A freshly created service account reports no play
+    history at all, however much the library has been listened to: verified against
+    0.64.0, where a new user saw 0 of 5000 songs with a `played` timestamp and
+    getAlbumList2 type=frequent/recent returned nothing. So a dedicated read-only user
+    is exactly the wrong choice here.
+
+    If several people listen under separate accounts, configure this adapter once per
+    account with distinct `name` values. History is merged across players by maximum,
+    so everyone's listening counts.
+
+    Subsonic reports song `path` RELATIVE to the music folder, so `music_folder` must
+    be set to the absolute path the server serves from -- otherwise PAMTS cannot map a
+    song onto your tiers.
+
+    Locality unit is the album, taken in track order.
+    """
+    kind = "navidrome"
+    provides_history = True
+    caps = Caps(max_items=40, max_bytes=3 * pamts.GB)
+
+    API_VERSION = "1.16.1"
+
+    def available(self):
+        if not self.url:
+            logging.error(f"[{self.name}] no url configured")
+            return False
+        if not self.cfg.get("username"):
+            logging.error(f"[{self.name}] 'username' is required")
+            return False
+        if not self.cfg.get("music_folder"):
+            logging.error(f"[{self.name}] 'music_folder' is required: Subsonic reports "
+                          "song paths relative to it, so PAMTS cannot map them without it")
+            return False
+        try:
+            self._token = open(self.token_file).read().strip()
+        except OSError as e:
+            logging.error(f"[{self.name}] cannot read {self.token_file}: {e}")
+            return False
+        return bool(self._token)
+
+    def _get(self, endpoint, **params):
+        """Subsonic token auth: send salt + md5(password + salt), never the password."""
+        salt = secrets.token_hex(8)
+        params.update({
+            "u": self.cfg["username"],
+            "t": hashlib.md5((self._token + salt).encode()).hexdigest(),
+            "s": salt, "v": self.API_VERSION, "c": "pamts", "f": "json",
+        })
+        u = f"{self.url}/rest/{endpoint}?{urllib.parse.urlencode(params, doseq=True)}"
+        with urllib.request.urlopen(urllib.request.Request(u), timeout=60) as r:
+            body = json.loads(r.read().decode("utf-8", "replace"))
+        resp = body.get("subsonic-response", {})
+        if resp.get("status") != "ok":
+            err = resp.get("error", {})
+            raise OSError(f"subsonic error {err.get('code')}: {err.get('message')}")
+        return resp
+
+    @staticmethod
+    def _epoch(iso):
+        """Subsonic timestamps are ISO8601; 0 if absent or unparseable."""
+        if not iso:
+            return 0
+        try:
+            return int(datetime.datetime.fromisoformat(
+                str(iso).replace("Z", "+00:00")).timestamp())
+        except (ValueError, TypeError):
+            return 0
+
+    def _song_item(self, s):
+        rel_to_folder = s.get("path")
+        if not rel_to_folder:
+            return None
+        full = os.path.join(str(self.cfg["music_folder"]).rstrip("/"), rel_to_folder)
+        m = pamts.split_root(full)
+        if not m:
+            return None
+        rel, fast_root, slow_root = m
+        return {
+            "kind": "track",
+            "show": s.get("album"),
+            "show_key": s.get("albumId"),
+            "season": s.get("discNumber") or 1,
+            "episode": s.get("track") or 0,
+            "title": s.get("title"),
+            "rel": rel,
+            "fast": os.path.join(fast_root, rel),
+            "slow": os.path.join(slow_root, rel),
+            "size": int(s.get("size") or 0),
+            "last_viewed": self._epoch(s.get("played")),
+            "added": self._epoch(s.get("created")),
+            "_path": full,
+        }
+
+    def library_items(self):
+        if not self.available():
+            return None
+        out, offset, page = [], 0, 500
+        try:
+            while True:
+                r = self._get("search3", query="", songCount=page, songOffset=offset,
+                              artistCount=0, albumCount=0)
+                songs = (r.get("searchResult3") or {}).get("song") or []
+                for s in songs:
+                    it = self._song_item(s)
+                    if it:
+                        out.append(it)
+                if len(songs) < page:
+                    break
+                offset += page
+        except (urllib.error.URLError, OSError, ValueError, KeyError) as e:
+            logging.error(f"[{self.name}] library sweep failed: {e}")
+            return None
+        # Annotations are per user. Items but no plays at all almost always means we are
+        # authenticated as the wrong account, not that nothing was ever played -- and
+        # silently ranking on an empty history would be worse than saying so.
+        if out and not any(i["last_viewed"] for i in out):
+            logging.warning(
+                f"[{self.name}] {len(out)} item(s) but NONE has a play timestamp. "
+                f"Subsonic annotations are per-user: check that '{self.cfg.get('username')}' "
+                "is the account that actually listens, not a fresh service account.")
+        return out
+
+    def now_playing(self):
+        try:
+            r = self._get("getNowPlaying")
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            logging.error(f"[{self.name}] getNowPlaying failed: {e}")
+            return []
+        out = []
+        for s in (r.get("nowPlaying") or {}).get("entry") or []:
+            it = self._song_item(s)
+            if not it:
+                continue
+            # getNowPlaying reports how long ago the play STARTED, in whole minutes --
+            # coarse, so the remaining time is an estimate. It only feeds the time
+            # budget, which has a floor, so a rough number is acceptable.
+            dur = float(s.get("duration") or 0)
+            elapsed = float(s.get("minutesAgo") or 0) * 60.0
+            remaining = max(0.0, dur - elapsed) if dur else 0.0
+            out.append(PlayEvent(
+                source=self.name, kind="track", path=it["_path"],
+                remaining_s=remaining,
+                label=f"{s.get('artist')} - {s.get('title')}"
+                      + (f" [{remaining / 60:.0f} min left]" if remaining else ""),
+                group={"album_id": s.get("albumId"), "track": s.get("track") or 0}))
+        return out
+
+    def locality_group(self, event):
+        """The rest of the album, in track order."""
+        if event.kind != "track" or not event.group:
+            return []
+        album_id = event.group.get("album_id")
+        if not album_id:
+            return []
+        try:
+            r = self._get("getAlbum", id=album_id)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            logging.error(f"[{self.name}] getAlbum failed: {e}")
+            return []
+        cur = int(event.group.get("track") or 0)
+        out = []
+        for s in (r.get("album") or {}).get("song") or []:
+            it = self._song_item(s)
+            if not it:
+                continue
+            n = int(s.get("track") or 0)
+            if n <= cur:
+                continue
+            out.append(Candidate(path=it["_path"], label=f"track {n:02d}",
+                                 size=it["size"], order=n))
+        return out
+
+
 # The registry. Adding a player means adding one line here -- see docs/PLAYERS.md.
-PLAYERS = {
+ADAPTERS = {
     PlexPlayer.kind: PlexPlayer,
+    LmsPlayer.kind: LmsPlayer,
+    NavidromePlayer.kind: NavidromePlayer,
 }
 
 
 def build(cfg):
-    """Instantiate the configured player adapter."""
+    """Instantiate one configured player adapter."""
     kind = str(cfg.get("kind", "")).lower()
-    cls = PLAYERS.get(kind)
+    cls = ADAPTERS.get(kind)
     if cls is None:
         raise pamts.ConfigError(
-            f"unknown [player] kind {kind!r}; available: {', '.join(sorted(PLAYERS))}")
+            f"unknown player kind {kind!r}; available: {', '.join(sorted(ADAPTERS))}")
     return cls(cfg)
+
+
+def build_all(cfg_list):
+    """Instantiate every configured adapter, in order."""
+    return [build(c) for c in cfg_list]
+
+
+def sweep(players):
+    """Sweep every adapter that can supply history. -> (items, ok).
+
+    `items` is the merged library, DE-DUPLICATED by fast-tier path, with last_viewed
+    taken as the MAXIMUM across adapters. `ok` is True if at least one adapter that
+    claims to provide history actually did.
+
+    Merging by maximum is the point. A music library is commonly served by two or three
+    things at once, and an album played in one app looks untouched to the others. Ranking
+    on a single app's view would evict content that *was* played and simply was not seen
+    there.
+
+    De-duplicating by fast path matters too: different servers identify the same album
+    by different ids, so without it the same album would be pinned twice under two
+    different series keys and consume the pin budget twice.
+    """
+    merged, ok = {}, False
+    for p in players:
+        if not p.provides_history:
+            logging.info(f"[{p.name}] provides no play history via its API - ranking "
+                         "will rely on observed plays")
+            continue
+        if not p.available():
+            continue
+        items = p.library_items()
+        if items is None:
+            logging.warning(f"[{p.name}] history unavailable this run")
+            continue
+        ok = True
+        played = 0
+        for it in items:
+            key = it["fast"]
+            prev = merged.get(key)
+            if prev is None:
+                merged[key] = dict(it)
+            elif (it.get("last_viewed") or 0) > (prev.get("last_viewed") or 0):
+                prev["last_viewed"] = it["last_viewed"]
+            if it.get("last_viewed"):
+                played += 1
+        logging.info(f"[{p.name}] {len(items)} item(s), {played} played")
+    return list(merged.values()), ok

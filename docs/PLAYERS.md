@@ -3,8 +3,86 @@
 A player adapter is the only part of PAMTS that knows about a specific media server.
 Everything else — ranking, budgets, pinning, copying, locking — is generic.
 
-Plex is implemented in `pamts_players.py`. Adding another is one class and one line in
-the `PLAYERS` registry.
+Adding one is one class and one line in the `ADAPTERS` registry.
+
+## What ships
+
+| adapter | play history | now playing | locality unit | notes |
+|---|---|---|---|---|
+| `plex` | ✅ `lastViewedAt` | ✅ | season, crossing into the next | verified |
+| `lms` | ❌ **not exposed by its API** | ✅ | album | verified against 9.x |
+| `navidrome` | ✅ `played` — **per user** | ✅ | album | verified against 0.64.0 |
+
+Two of those need explaining, because both caught me out.
+
+### LMS exposes no play history at all
+
+Lyrion/Logitech Media Server keeps play counts and last-played times in a private
+`persist.db`, and **neither `titles` nor `songinfo` reports them** — verified against 9.x
+with the full documented tag set. There is no plugin CLI query for it either.
+
+So `LmsPlayer.provides_history = False`. It drives promotion perfectly well (it reports
+what is playing, with duration and elapsed time), and ranking comes from PAMTS's own
+**observed play history** — see below. That works, but it starts empty and fills in as
+PAMTS polls, so an LMS-only setup has no ranking data on day one. PAMTS says so rather
+than evicting blindly.
+
+`LmsPlayer.library_items()` returns `[]`, not `None`, precisely because this is a
+definite "I have no history to give" rather than a failure.
+
+One wrinkle worth knowing if you modify it: LMS's `status` response does not carry
+`album_id`, and `songinfo` does not reliably report a track number (the tag documented
+for `titles` is not honoured there). The adapter therefore finds the current position by
+matching the **track id** inside the album listing, using only fields both calls agree on.
+An earlier version trusted a tag that came back empty, silently defaulted the position to
+0, and offered the whole album including the track already playing.
+
+### Navidrome annotations are per-user
+
+Subsonic `played` / `playCount` are **per user**. A freshly created service account
+reports no history however much the library has been listened to — verified: a new user
+saw **0 of 5000** songs with a `played` timestamp, and `getAlbumList2` with
+`type=frequent` and `type=recent` both returned nothing.
+
+So point the adapter at **the account that actually listens**. A dedicated read-only user
+is the wrong instinct here. The adapter warns if it sees items but no plays at all, naming
+this as the likely cause.
+
+If several people listen under separate accounts, configure the adapter **once per
+account** with distinct `name` values. History is merged across players, so everyone's
+listening counts.
+
+Subsonic also reports song `path` **relative to the music folder**, so `music_folder` is
+required — it is the absolute base PAMTS prepends before mapping onto your tiers.
+
+## Several players at once
+
+`[[players]]` takes any number of adapters, and this is the normal case for music: a
+library commonly has two or three things serving it.
+
+Play history is merged with `sweep()`, taking the **most recent** play per file and
+de-duplicating by fast-tier path. Both halves matter:
+
+- merging by maximum — an album played in one app looks untouched to the others, so
+  ranking on a single app's view would evict content that *was* played
+- de-duplicating by path — different servers identify the same album by different ids, so
+  without it the same album is pinned twice under two keys and consumes the pin budget
+  twice
+
+## Observed play history
+
+PAMTS records what it sees playing, in its own state file, and merges that with whatever
+the players report. That is what makes a history-less adapter like LMS usable for ranking.
+
+It is scan-immune by construction: a library scan never appears as a *playing session*, so
+it can never write a record. Bounded by `[history] max_entries` and `max_age_days`.
+
+A 60-second poll can miss something very short, and "seen playing" is not quite "played to
+completion" — someone skipping through an album marks those tracks as touched. For tiering
+purposes that is the right answer anyway: a human was there.
+
+Disable with `[history] observe = false` if every one of your players reports real
+history.
 
 ## What an adapter must answer
 
@@ -14,6 +92,16 @@ the `PLAYERS` registry.
 | `library_items()` | tiering | every item, with last-played time — or `None` on failure |
 | `now_playing()` | promotion | `[PlayEvent]` for what is playing now |
 | `locality_group(event)` | promotion | `[Candidate]` likely to follow, in play order |
+
+And two class attributes declaring what it can actually do:
+
+| flag | meaning |
+|---|---|
+| `provides_history` | can `library_items()` return real play history? `False` is legitimate — see LMS below |
+| `provides_sessions` | can `now_playing()` report what is playing? |
+
+Declaring `provides_history = False` is not a failure mode. The engine skips that adapter
+when building the ranking and leans on observed plays instead.
 
 `simulate_recent(count)` is optional and returns `[]` by default. Implementing it makes
 `--simulate-recent` work for your player, which is the easiest way to validate a new
@@ -135,8 +223,10 @@ class MyPlayer(Player):
 Then register it:
 
 ```python
-PLAYERS = {
+ADAPTERS = {
     PlexPlayer.kind: PlexPlayer,
+    LmsPlayer.kind: LmsPlayer,
+    NavidromePlayer.kind: NavidromePlayer,
     MyPlayer.kind: MyPlayer,
 }
 ```
@@ -167,11 +257,15 @@ exercises `library_items()` and shows the pins it derives. Both change nothing.
 
 ## Music: a note
 
-Music is a natural fit — the locality unit is the album, and play counts are usually
-tracked — but it has a wrinkle worth planning for. Music is often served by *several*
-things at once (a music server, a media server, a mobile streaming app). If each consumer
-resolves paths differently, a per-client union filesystem has to be configured on every
-one of them, and any consumer you miss sees the split tiers.
+Music is a natural fit — the locality unit is the album — but two things need planning.
 
-Where that applies, putting the union on the *server* and exporting the merged view is
-usually the better arrangement.
+**Several consumers.** Music is often served by more than one thing at once. `[[players]]`
+handles the *history* side, but each consumer also has to see the unified path, so a
+per-client union filesystem must be configured on every one of them and any consumer you
+miss sees the split tiers. Where that applies, putting the union on the *server* and
+exporting the merged view is usually the better arrangement.
+
+**Different path shapes.** Each server reports paths its own way — LMS reports the
+filesystem path it scanned, Subsonic reports a path relative to its music folder. List a
+`[[roots]]` entry for whatever each one actually reports; they all resolve onto the same
+two tiers, and `sweep()` de-duplicates by the resolved fast path.

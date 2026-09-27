@@ -68,13 +68,29 @@ DEFAULTS = {
         "token_file": "",
         "verify_tls": True,
     },
+    "history": {
+        # PAMTS records what it observes playing, building its own play history.
+        #
+        # This exists because not every player exposes play history over its API --
+        # Lyrion/LMS, for instance, keeps play counts in a private database and its
+        # JSON-RPC API reports none of it. Such a player can still drive promotion
+        # (it reports what is playing), and with this it can also drive ranking,
+        # after a warm-up period.
+        #
+        # It is scan-immune by construction: a library scan never appears as a
+        # playing session, so it can never write a record here.
+        "observe": True,
+        "max_entries": 200000,      # cap, oldest dropped first
+        "max_age_days": 1825,       # ~5 years; older records are pruned
+    },
 }
 
 # Populated by configure(). Scripts read these; tests override them.
 PATHS = dict(DEFAULTS["paths"])
 TIER = dict(DEFAULTS["tier"])
 PROMOTE = dict(DEFAULTS["promote"])
-PLAYER = dict(DEFAULTS["player"])
+HISTORY = dict(DEFAULTS["history"])
+PLAYERS = []        # one config dict per configured player
 ROOTS = {}          # player path -> (fast tier path, slow tier path)
 JOBS = []           # tier and backup jobs
 
@@ -114,11 +130,39 @@ def configure(raw):
     configuration will move data to the wrong place, so it is far better to refuse to
     start than to guess.
     """
-    global PATHS, TIER, PROMOTE, PLAYER, ROOTS, JOBS
+    global PATHS, TIER, PROMOTE, HISTORY, PLAYERS, ROOTS, JOBS
     PATHS = _merge(DEFAULTS["paths"], raw.get("paths"))
     TIER = _merge(DEFAULTS["tier"], raw.get("tier"))
     PROMOTE = _merge(DEFAULTS["promote"], raw.get("promote"))
-    PLAYER = _merge(DEFAULTS["player"], raw.get("player"))
+    HISTORY = _merge(DEFAULTS["history"], raw.get("history"))
+
+    # Several players may serve the same files -- a music library is commonly served
+    # by two or three things at once. Play history is MERGED across them, because an
+    # album played in one app must not look untouched to the others; ranking on a
+    # single player's view would evict music that was played and simply not seen.
+    #
+    # [[players]] is the general form. A singular [player] is accepted as shorthand
+    # for one entry.
+    plist = raw.get("players")
+    if plist and raw.get("player"):
+        raise ConfigError("use either [player] or [[players]], not both")
+    if not plist:
+        plist = [raw.get("player") or {}]
+    PLAYERS = []
+    seen = set()
+    for i, p in enumerate(plist):
+        merged = _merge(DEFAULTS["player"], p)
+        kind = str(merged.get("kind", "")).lower()
+        if not merged.get("url"):
+            raise ConfigError(f"player #{i + 1} ({kind or '?'}) has no 'url'")
+        name = merged.get("name") or kind
+        if name in seen:
+            raise ConfigError(f"duplicate player name {name!r}; set a distinct 'name'")
+        seen.add(name)
+        merged["name"] = name
+        PLAYERS.append(merged)
+    if not PLAYERS:
+        raise ConfigError("at least one player must be configured")
 
     roots = raw.get("roots") or []
     if not roots:
@@ -175,10 +219,6 @@ def configure(raw):
     if not JOBS:
         raise ConfigError("no [[jobs]] configured; there is nothing for PAMTS to do")
 
-    if not PLAYER.get("url"):
-        raise ConfigError("[player] url is required (e.g. http://plex.lan:32400)")
-    if not PLAYER.get("token_file"):
-        raise ConfigError("[player] token_file is required")
     if not 0 < float(PROMOTE["headroom_fraction"]) <= 1:
         raise ConfigError("[promote] headroom_fraction must be between 0 and 1")
     if not 0 < float(PROMOTE["time_safety"]) <= 1:
@@ -380,6 +420,49 @@ def prune_state(state, now):
     state["promotions"] = {k: v for k, v in state.get("promotions", {}).items()
                            if isinstance(v, dict) and v.get("at", 0) >= cut}
     return before - len(state["promotions"])
+
+
+def observe_plays(state, paths, now):
+    """Record fast-tier paths seen playing, so PAMTS accumulates its own history.
+
+    The identity is always the FAST-tier path, whichever tier the file is actually on,
+    so a record survives the file moving between tiers.
+    """
+    if not HISTORY.get("observe", True):
+        return 0
+    obs = state.setdefault("observed", {})
+    added = 0
+    for p in paths:
+        if p and obs.get(p, 0) < now:
+            obs[p] = now
+            added += 1
+    return added
+
+
+def prune_observed(state, now):
+    """Keep the observed history bounded: drop ancient records, then cap the size."""
+    obs = state.get("observed") or {}
+    if not obs:
+        return 0
+    before = len(obs)
+    cut = now - int(HISTORY["max_age_days"]) * 86400
+    obs = {k: v for k, v in obs.items() if v >= cut}
+    cap = int(HISTORY["max_entries"])
+    if len(obs) > cap:
+        # Newest first, keep the cap. Oldest plays are the least useful to remember.
+        obs = dict(sorted(obs.items(), key=lambda kv: kv[1], reverse=True)[:cap])
+    state["observed"] = obs
+    return before - len(obs)
+
+
+def observed_history():
+    """{fast path: last-seen-playing epoch} from the state file, or {}."""
+    try:
+        with open(PATHS["state_file"]) as f:
+            obs = json.load(f).get("observed", {})
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in obs.items() if isinstance(v, (int, float))}
 
 
 def protected_now(now):

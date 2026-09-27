@@ -266,18 +266,37 @@ def do_tier(jobs, budget, dry_run, views=_FETCH, pins=None):
         logging.info(f"[tier] {len(protected)} item(s) protected by a recent promotion")
 
     if views is _FETCH:
-        player = pamts_players.build(pamts.PLAYER)
-        items = player.library_items()
-        if items is None:
+        players = pamts_players.build_all(pamts.PLAYERS)
+        items, hist_ok = pamts_players.sweep(players)
+        views = {it["fast"]: it["last_viewed"] for it in items if it.get("last_viewed")}
+
+        # PAMTS's own record of what it has seen playing. This is what lets a player
+        # with no history API (e.g. LMS) still drive ranking, and it is scan-immune by
+        # construction: a scan never appears as a playing session.
+        observed = pamts.observed_history()
+        newer = 0
+        for k, v in observed.items():
+            if v > views.get(k, 0):
+                views[k] = v
+                newer += 1
+        if observed:
+            logging.info(f"[tier] observed plays: {len(observed)} record(s), "
+                         f"{newer} newer than any player reported")
+
+        if not views and not hist_ok:
             # Refuse rather than fall back to atime. Being over budget is not an
             # emergency -- nothing is lost by leaving content on fast storage for
             # another cycle -- whereas evicting on a signal that library scans corrupt
             # causes needless spin-ups later.
-            logging.error("[tier] no play data from the player - REFUSING to evict. "
-                          "Ranking by atime is not an acceptable fallback: a library "
-                          "scan resets it on every file it reads.")
+            logging.error("[tier] no play data from any player, and no observed plays "
+                          "yet - REFUSING to evict. Ranking by atime is not an "
+                          "acceptable fallback: a library scan resets it on every file "
+                          "it reads.")
             return False
-        views = {it["fast"]: it["last_viewed"] for it in items if it["last_viewed"]}
+        if not hist_ok:
+            logging.warning("[tier] no player supplied play history; ranking on "
+                            "PAMTS's observed plays alone. This is expected for "
+                            "session-only players, and improves as history accumulates.")
         # Pin depth scales with headroom, so measure the footprint first.
         pre = sum(scan_dir(j["source"], views)["size"]
                   for j in jobs if os.path.isdir(j["source"]))

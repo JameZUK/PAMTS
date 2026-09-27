@@ -217,6 +217,70 @@ def main():
     check(pamts_players.PlexPlayer({"url": "", "token_file": "/t"})
           .available() is False, "a missing url reports unavailable")
 
+    print("\n=== LMS locality: position is found by track id, not a guessed tag")
+    lms = pamts_players.LmsPlayer({"name": "lms", "url": "http://unused"})
+    album = [
+        {"id": 11, "tracknum": "1", "filesize": "100",
+         "url": "file:///player/tv/Alb/01%20a.flac"},
+        {"id": 12, "tracknum": "2", "filesize": "200",
+         "url": "file:///player/tv/Alb/02%20b.flac"},
+        {"id": 13, "tracknum": "3", "filesize": "300",
+         "url": "file:///player/tv/Alb/03%20c.flac"},
+        # A remote stream in the middle must be ignored, not crash the walk.
+        {"id": 14, "tracknum": "4", "url": "http://example.com/live"},
+    ]
+
+    def fake_rpc(pid, cmd):
+        if cmd[0] == "songinfo":
+            return {"songinfo_loop": [{"album_id": "77"}]}
+        if cmd[0] == "titles":
+            return {"titles_loop": album}
+        return {}
+
+    lms._rpc = fake_rpc
+    ev = PlayEvent(source="lms", kind="track", path="/player/tv/Alb/02 b.flac",
+                   label="x", group={"track_id": 12})
+    got = lms.locality_group(ev)
+    check([c.label for c in got] == ["track 03"],
+          f"only tracks AFTER the playing one (got {[c.label for c in got]})")
+    check(got and got[0].path == "/player/tv/Alb/03 c.flac",
+          "percent-encoded file:// url decoded to a real path")
+    check(got and got[0].size == 300, f"filesize carried through (got {got[0].size if got else None})")
+    check(all("example.com" not in c.path for c in got), "remote stream skipped")
+
+    ev_first = PlayEvent(source="lms", kind="track", path="x", label="x",
+                         group={"track_id": 11})
+    check([c.label for c in lms.locality_group(ev_first)] == ["track 02", "track 03"],
+          "playing track 1 offers 2 and 3")
+    ev_last = PlayEvent(source="lms", kind="track", path="x", label="x",
+                        group={"track_id": 13})
+    check(lms.locality_group(ev_last) == [], "playing the last track offers nothing")
+    ev_unknown = PlayEvent(source="lms", kind="track", path="x", label="x",
+                           group={"track_id": 999})
+    check(len(lms.locality_group(ev_unknown)) == 3,
+          "an id not in the album falls back to the whole album, not nothing")
+    lms._rpc = lambda pid, cmd: {"songinfo_loop": [{}]}
+    check(lms.locality_group(ev) == [], "a track with no album has no locality group")
+
+    print("\n=== Navidrome: Subsonic path mapping needs music_folder")
+    nd = pamts_players.NavidromePlayer({
+        "name": "nd", "url": "http://unused", "username": "u",
+        "token_file": "/dev/null", "music_folder": "/player/tv"})
+    it = nd._song_item({"path": "Alb/01 a.flac", "size": 123, "album": "Alb",
+                        "albumId": "77", "track": 1, "title": "a",
+                        "played": "2026-01-02T03:04:05Z"})
+    check(it is not None and it["rel"] == "Alb/01 a.flac",
+          f"library-relative path resolved against music_folder (got {it})")
+    check(it and it["last_viewed"] > 0, "ISO8601 'played' parsed to an epoch")
+    outside = pamts_players.NavidromePlayer({
+        "name": "nd2", "url": "http://unused", "username": "u",
+        "token_file": "/dev/null", "music_folder": "/somewhere/else"})
+    check(outside._song_item({"path": "Alb/x.flac", "size": 1}) is None,
+          "a song whose music_folder is outside the configured roots is skipped")
+    check(nd._song_item({"size": 1}) is None, "a song with no path is skipped")
+    check(nd._epoch(None) == 0 and nd._epoch("not-a-date") == 0,
+          "unparseable timestamps become 0, not an exception")
+
     print("\n=== fake player drives the engine end to end")
     fp = FakePlayer(
         events=[PlayEvent(source="fake", kind="episode", label="Show S01E01",
