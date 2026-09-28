@@ -1,0 +1,48 @@
+# PAMTS access observer.
+#
+# Runs on the host that SERVES the media over NFS, not on the media server.
+# Needs CAP_BPF and CAP_PERFMON (or CAP_SYS_ADMIN) to load the collector; root in
+# a privileged container has them. It does NOT need tracefs or debugfs, because
+# attachment is by raw tracepoint name -- so enabling this requires no container
+# restart, which matters when restarting the file server disrupts every client.
+#
+# Edit --root to your export root(s), repeating the flag for more than one.
+# In logging mode nothing consumes the output: it only writes its own database
+# and serves its API, so it can be left to gather evidence before anything is
+# wired to it.
+
+[Unit]
+Description=PAMTS access observer
+Documentation=https://github.com/JameZUK/PAMTS/blob/main/docs/OBSERVER.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/pamts/observer/pamts-observerd.py \
+    --root /srv/media \
+    --db /var/lib/pamts/observer.db \
+    --source bpf \
+    --bpf-object /opt/pamts/observer/pamts_nfsd.bpf.o \
+    --listen 127.0.0.1:8621 \
+    --idle-gap 30 \
+    --checkpoint-after 60 \
+    --prune-every 3600
+Restart=always
+RestartSec=10
+
+# Be a polite guest on a file server: the index walk is the only heavy thing it
+# does, and it must never compete with serving.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+# A guard, not a target. If it ever leaks, it should die and restart rather than
+# put memory pressure on the machine everything else depends on.
+MemoryMax=1G
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

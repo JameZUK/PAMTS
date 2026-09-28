@@ -230,6 +230,64 @@ copied:
 
 `promoted 0B this pass` with nothing playing is correct and expected.
 
+## 9. Optional: the access observer
+
+Skip this unless one of these applies:
+
+- a server that serves your media **cannot give you play history** — a multi-user
+  Navidrome being the obvious case
+- you want one source of truth covering **every** client, including ones with no adapter
+  at all
+
+The [access observer](OBSERVER.md) taps the **file server** rather than the media server,
+and works out from the read pattern whether each session was a play, a scan or a copy. It
+needs `libbpf` on that host and `CAP_BPF`/`CAP_PERFMON`; a privileged container has them.
+No compiler and no `tracefs` mount on the server, and no restart.
+
+Build the collector on any machine with `clang` and `bpftool`, using the **target's** BTF:
+
+```sh
+ssh fileserver cat /sys/kernel/btf/vmlinux > vmlinux.btf
+make -C observer vmlinux.h BTF=$PWD/vmlinux.btf
+make -C observer
+```
+
+Copy `pamts_observer.py`, `observer/pamts_bpf.py`, `observer/pamts-observerd.py` and
+`observer/pamts_nfsd.bpf.o` to the file server, then:
+
+```sh
+sudo install -m 644 systemd/pamts-observer.service /etc/systemd/system/
+sudo systemctl edit --full pamts-observer.service    # set --root to your export root
+sudo systemctl enable --now pamts-observer.service
+sudo journalctl -u pamts-observer.service -f
+```
+
+**Run it in logging mode for a day or two before wiring anything to it.** Nothing consumes
+its output until you add the `[[players]]` stanza, so it costs nothing to watch first — and
+you want to see how your own traffic classifies, because the thresholds separating "paced"
+from "flat out" depend on your bandwidth and clients. You should see lines like:
+
+```
+PLAY   10.0.0.20   407.1MB cov=?      145s 2.8MB/s   reqs=3257  /srv/media/tv/...S02E04.mkv
+PLAY   10.0.0.20   136.1MB cov=?       47s 2.9MB/s   reqs=1091  /srv/media/tv/...S02E04.mkv  (refresh)
+PROBE  10.0.0.31     0.4MB cov=0.01     0s 1.7MB/s   reqs=5     /srv/media/music/...flac
+```
+
+Two lines for one viewing is correct: the first is the mid-flight checkpoint, reported so
+promotion does not have to wait for a 45-minute episode to finish, and the second refreshes
+it without counting the play twice. `PROBE` is a scan and must never reach history — if
+your scans are being labelled `PLAY`, tune before connecting it, not after.
+
+Check what it has concluded:
+
+```sh
+curl -s localhost:8621/stats | python3 -m json.tool
+curl -s localhost:8621/sessions | python3 -m json.tool     # what is playing now
+curl -s 'localhost:8621/history?since=0' | python3 -m json.tool
+```
+
+When you are satisfied, add the `observer` stanza from `examples/pamts.toml`.
+
 ---
 
 ## Tuning from here
@@ -253,5 +311,8 @@ Start with the defaults for a week, then read
 | nothing is ever evicted | you may be under `budget_gb`; check the reported footprint |
 | everything is pinned | `next_up_max_*` too high relative to `budget_gb` |
 | player shows missing media after a move | the union is not set up, or the player still points at a per-tier path (step 3/4) |
+| observer logs `<unresolved dev=... ino=...>` | that read was on a dataset outside `--root`; add it or ignore it |
+| observer labels your scans `PLAY` | raise `--checkpoint-after`, or see the thresholds in [OBSERVER.md](OBSERVER.md) |
+| observer will not load (`bpf_object__load failed`) | missing `CAP_BPF`/`CAP_PERFMON`, an unprivileged container, or a `vmlinux.h` from the wrong kernel |
 
 Every run logs why it kept each item. When in doubt, `--dry-run` and read it.

@@ -32,6 +32,28 @@ PAMTS therefore asks the **media player** what has been *played*. A view record 
 written when a human watches something and is untouched by scans. `atime` appears
 nowhere in this codebase, and `scan_dir()` deliberately does not even collect it.
 
+### One qualification, learned later
+
+"A scanner reading every file is identical to you watching something" is true of every
+mechanism above, but the reason is narrower than it first appears: those mechanisms
+**count** reads. They record *that* a file was read and discard everything about *how*.
+
+Characterise the reads instead and the two become easy to separate. A viewer walks forward
+through a file at roughly its bitrate for minutes. A tag reader takes the first 64 KB. A
+container probe takes the head and the tail and nothing between. Measured on real traffic,
+a 26 Mbps stream and 21 scans of the same library separated without ambiguity — the scans
+sat at **1–2% coverage across exactly two regions**, the stream at 3 MB/s sustained over
+ten minutes with 99% of its reads advancing.
+
+That is what the optional [access observer](OBSERVER.md) does, and it is why it is safe to
+let a filesystem-level signal near tiering decisions at all. It does not weaken the
+principle above — playback is still the only trigger — it just establishes that "was this
+played" is answerable from read *shape* and not only by asking a media server.
+
+It remains strictly optional. The ranking path still refuses rather than guesses, and the
+observer is one more adapter feeding the same merge, never a fallback that fires when
+something else fails.
+
 ### The corollary: refuse rather than guess
 
 If the player cannot be reached, eviction **refuses to run** and says so loudly. It does

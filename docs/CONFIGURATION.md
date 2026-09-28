@@ -44,6 +44,14 @@ data on day one, and PAMTS refuses to evict rather than guessing.
 however much the library has been listened to. Without `history_db`, point it at the
 account that actually listens. PAMTS warns if it sees items but no plays.
 
+**The observer is not a media server.** `kind = "observer"` reads the access observer
+daemon (see [OBSERVER.md](OBSERVER.md)), which watches what the file server actually
+serves. It reports demand for every client with no credentials, which is the only way to
+cover a server whose history is unreachable — but it gives *file-level* demand and never
+per-user history, and it only knows files that have been read, so its library view is
+partial by nature. Options: `url` (default `http://127.0.0.1:8621`), `timeout`,
+`demand_labels` (default `["PLAY", "FETCH"]`), `history_since`.
+
 ### `history_db`
 
 Neither music server's API can answer "what has *anyone* played" — LMS reports no play

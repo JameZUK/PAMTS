@@ -12,8 +12,9 @@ Adding one is one class and one line in the `ADAPTERS` registry.
 | `plex` | ✅ `lastViewedAt` | ✅ | season, crossing into the next | verified |
 | `lms` | ✅ **via the companion plugin** | ✅ | album | verified against 9.x |
 | `navidrome` | ✅ `played` — **per user** | ✅ | album | verified against 0.64.0 |
+| `observer` | ✅ every client, no credentials | ✅ | directory, across **both** tiers | see [OBSERVER.md](OBSERVER.md) |
 
-Two of those need explaining, because both caught me out.
+Three of those need explaining, because each caught me out.
 
 ### Getting history out of a music server
 
@@ -131,6 +132,42 @@ sessions before relying on it for that.
 
 Subsonic also reports song `path` **relative to the music folder**, so `music_folder` is
 required — it is the absolute base PAMTS prepends before mapping onto your tiers.
+
+### The observer sidesteps the whole problem
+
+Everything above is work to get around the fact that a player API answers *"what did this
+user play"* when tiering needs *"was this file wanted"*. The `observer` adapter asks the
+storage instead.
+
+It reads [`pamts-observerd`](OBSERVER.md), which watches the NFS server's own read events
+and classifies each session by **how** the file was read — paced and progressive is
+playback, a sip of header and tail is a scan, the whole file at wire speed is a copy. That
+gives history for every client at once, with no credentials, no per-user enumeration and no
+service account that sees nothing.
+
+```toml
+[[players]]
+kind = "observer"
+name = "storage"
+url  = "http://127.0.0.1:8621"
+# demand_labels = ["PLAY", "FETCH"]   # what counts as demand; the default
+```
+
+Three things to understand before relying on it:
+
+- **It cannot do per-user history.** Exports using `all_squash` erase user identity at the
+  server, so this is *file-level demand*. Right signal for tiering, no use for scrobbles.
+- **It only knows files that have been read**, so `library_items()` is a partial view. That
+  is safe, because eviction refuses to act without play data rather than reading absence as
+  "never played", and `sweep()` merges by maximum across adapters — so pair it with a
+  server adapter when you have one, and it fills the gaps.
+- **Co-tenanted services are indistinguishable.** Two music servers on one host share one
+  NFS mount. Harmless for tiering: a play is a play.
+
+Its locality unit is the **sibling files in the same directory, listed across both tiers**.
+Listing both matters more than it sounds: the next episode is normally the one already on
+slow storage, which is exactly the file promotion exists to fetch, so a single-tier listing
+would make the adapter useless while still looking like it worked.
 
 ## Two promotion triggers, and why the second exists
 

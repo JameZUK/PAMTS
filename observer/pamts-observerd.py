@@ -19,6 +19,7 @@ runs.
 """
 import argparse
 import json
+import logging
 import os
 import signal
 import sqlite3
@@ -82,8 +83,10 @@ class InodeIndex:
         self._lock = threading.Lock()
         self.files = 0
         self.builds = 0
+        self.last_build_s = 0.0
 
     def build(self):
+        t0 = time.monotonic()
         new = {}
         for root in self.roots:
             if not os.path.isdir(root):
@@ -109,6 +112,8 @@ class InodeIndex:
             self._built = time.monotonic()
             self.files = len(new)
             self.builds += 1
+            self.last_build_s = time.monotonic() - t0
+        logging.info("indexed %d files in %.1fs", len(new), self.last_build_s)
         return len(new)
 
     def lookup(self, dev, ino, allow_rebuild=True):
@@ -229,8 +234,9 @@ class Store:
 # ---------------------------------------------------------------------------
 
 class Daemon:
-    def __init__(self, store, index, tracker, cfg):
+    def __init__(self, store, index, tracker, cfg, log_sessions=True):
         self.store, self.index, self.tracker, self.cfg = store, index, tracker, cfg
+        self.log_sessions = log_sessions
         self.started = time.time()
         self.records = 0
         self.unresolved = 0
@@ -246,6 +252,15 @@ class Daemon:
                 self.unresolved += 1
         epoch = boot_epoch() + sig["t_last"]
         self.store.record(path, sig, label, epoch, count_it=first)
+        if self.log_sessions:
+            cov = "?" if sig["coverage"] is None else f"{sig['coverage']:.2f}"
+            rate = "-" if not sig["rate"] else f"{sig['rate'] / (1 << 20):.1f}MB/s"
+            logging.info(
+                "%-6s %-15s %8.1fMB cov=%-5s %5.0fs %-9s reqs=%-5d %s%s",
+                label, sig.get("client") or "?", sig["bytes"] / (1 << 20), cov,
+                sig["duration"], rate, sig["requests"],
+                path or f"<unresolved dev={sig['dev']} ino={sig['ino']}>",
+                "" if first else "  (refresh)")
 
     def stats(self):
         return {
@@ -258,6 +273,7 @@ class Daemon:
             "unresolved_paths": self.unresolved,
             "index_files": self.index.files,
             "index_builds": self.index.builds,
+            "index_build_s": round(self.index.last_build_s, 1),
             **self.store.counts(),
         }
 
@@ -348,19 +364,30 @@ def main(argv=None):
                          "(0 disables); promotion needs this, see docs")
     ap.add_argument("--duration", type=float, default=0.0,
                     help="stop after N seconds (0 = run until signalled)")
+    ap.add_argument("--quiet-sessions", action="store_true",
+                    help="do not log a line per classified session")
+    ap.add_argument("--prune-every", type=float, default=3600.0,
+                    help="seconds between session-table prunes (0 = only at exit); "
+                         "a long run must prune periodically or the table grows "
+                         "without bound")
+    ap.add_argument("--keep-sessions", type=int, default=200_000)
     args = ap.parse_args(argv)
 
     os.makedirs(os.path.dirname(args.db), exist_ok=True)
     cfg = {"idle_gap": args.idle_gap,
            "checkpoint_after": args.checkpoint_after}
 
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S")
     index = InodeIndex(args.root, max_age=args.index_max_age)
-    n = index.build()
-    print(f"indexed {n} files under {', '.join(index.roots)}", file=sys.stderr)
+    logging.info("indexing %s ...", ", ".join(index.roots))
+    index.build()
 
-    store = Store(args.db)
+    store = Store(args.db, keep_sessions=args.keep_sessions)
     tracker = obs.SessionTracker(cfg)
-    daemon = Daemon(store, index, tracker, cfg)
+    daemon = Daemon(store, index, tracker, cfg,
+                    log_sessions=not args.quiet_sessions)
     tracker.on_close = daemon.on_close
 
     httpd = None
@@ -369,7 +396,7 @@ def main(argv=None):
         httpd = ThreadingHTTPServer((host or "127.0.0.1", int(port)),
                                     make_handler(daemon))
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
-        print(f"serving on {args.listen}", file=sys.stderr)
+        logging.info("serving on %s", args.listen)
 
     # Sessions close on silence, so something must close them when no records
     # arrive at all -- otherwise the last play of the night is never reported.
@@ -379,11 +406,21 @@ def main(argv=None):
             tracker.tick(time.clock_gettime(time.CLOCK_MONOTONIC))
     threading.Thread(target=reaper, daemon=True).start()
 
+    if args.prune_every > 0:
+        def pruner():
+            while True:
+                time.sleep(args.prune_every)
+                try:
+                    store.prune()
+                except sqlite3.Error as e:
+                    logging.warning("prune failed: %s", e)
+        threading.Thread(target=pruner, daemon=True).start()
+
     collector = None
     if args.source == "bpf":
         from pamts_bpf import Collector                         # noqa: PLC0415
         collector = Collector(args.bpf_object)
-        print(f"attached: {', '.join(collector.attached)}", file=sys.stderr)
+        logging.info("attached: %s", ", ".join(collector.attached))
         src = collector.records()
     else:
         src = source_ndjson(sys.stdin)
@@ -418,7 +455,7 @@ def main(argv=None):
         store.prune()
         if httpd:
             threading.Thread(target=httpd.shutdown, daemon=True).start()
-    print(json.dumps(daemon.stats(), indent=2), file=sys.stderr)
+    logging.info("final: %s", json.dumps(daemon.stats()))
     return 0
 
 

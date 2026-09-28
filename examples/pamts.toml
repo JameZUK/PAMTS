@@ -65,6 +65,39 @@ token_file = "/etc/pamts/plex-token"
 # user -- which the API cannot do, because annotations are per-user. Read-only.
 # history_db = "/path/to/navidrome.db"
 
+# --- The access observer (docs/OBSERVER.md) ---
+# Not a media server. This reads the observer daemon, which watches what your FILE
+# SERVER actually serves and works out from the read pattern whether each session was
+# a play, a scan, or a copy.
+#
+# It is the answer when a server's history is unreachable -- a multi-user Navidrome
+# being the case in point -- because the filesystem has no per-user problem: it sees
+# every client equally, with no credentials and no account that reports nothing.
+#
+# THE TRADE-OFFS, all three of which matter:
+#   - FILE-LEVEL demand only. Exports using all_squash erase user identity at the
+#     server, so this cannot ever give per-user history. Fine for tiering, useless
+#     for scrobbles.
+#   - It only knows files that have been READ, so its library view is partial. Safe,
+#     because eviction refuses to act without play data rather than treating absence
+#     as "never played", and history is merged by MAXIMUM across players -- so pair
+#     it with a server adapter where you have one.
+#   - Two services on one host are indistinguishable; the NFS mount is per-host.
+#     Harmless: a play is a play.
+#
+# Locality is the sibling files in the same directory, listed across BOTH tiers,
+# because the next episode is normally the one already on slow storage.
+# [[players]]
+# name = "storage"
+# kind = "observer"
+# url = "http://127.0.0.1:8621"
+# timeout = 10
+# Which classifications count as demand. PLAY is paced progressive reading; FETCH is
+# a whole small file read faster than playback, which is genuinely ambiguous between
+# a buffering player and a fingerprinter -- sweeps are caught separately and labelled
+# BULK. PROBE (a scan) and COPY must never appear here.
+# demand_labels = ["PLAY", "FETCH"]
+
 # --------------------------------------------------------------------- history
 # PAMTS records what it observes playing, building its own play history.
 #

@@ -145,6 +145,7 @@ implies the rest of the album; a film implies nothing.
 | **Plex** | ✅ | ✅ | season, crossing into the next |
 | **LMS** / Lyrion | ✅ via the bundled plugin | ✅ | album |
 | **Navidrome** | ✅ but **per-user** | ✅ | album |
+| **Observer** | ✅ every client, no credentials | ✅ | directory, across both tiers |
 
 **Several players at once.** `[[players]]` takes any number, and history is merged across
 them taking the most recent play. This is the normal case for music, where two or three
@@ -167,6 +168,27 @@ Where no plugin exists, an optional read-only `history_db` covers the same groun
 a multi-user Navidrome it also supplies the play *trigger*. Details and trade-offs in
 [PLAYERS.md](docs/PLAYERS.md).
 
+### Or stop asking the servers entirely
+
+A player API tells you what *one player* knows. The filesystem sees every consumer
+equally. Where your media is served over NFS from one host, the optional
+**[access observer](docs/OBSERVER.md)** taps the file server itself and works out from the
+read pattern alone whether something was **played**, **scanned**, or **copied** — no
+credentials, no per-user enumeration, and no adapter per service. It is the only thing
+here that covers a server whose history is unreachable, such as a multi-user Navidrome.
+
+It classifies by how a file is read: a paced, progressive read is playback; a sip of the
+header and the tail is a scan; the whole file at wire speed is a copy. Calibrated on real
+traffic, a 26 Mbps stream and 21 scans separated cleanly, the scans sitting at 1–2%
+coverage across exactly two regions.
+
+What it cannot do is per-user history — `all_squash` erases user identity at the server.
+It gives *file-level demand*, which is the right signal for tiering and no substitute for
+scrobbles.
+
+Needs `libbpf` on the file server and a privileged container if containerised; the
+collector is built elsewhere, so no compiler is required on the server itself.
+
 Adding a player is one class and one registry line — see [PLAYERS.md](docs/PLAYERS.md),
 which also covers two gotchas worth reading before you configure music: LMS exposes no
 play history at all, and Navidrome's annotations are per-user so a fresh service account
@@ -182,6 +204,15 @@ reports nothing.
 
 No third-party Python packages.
 
+For the optional [access observer](docs/OBSERVER.md), on the **file server** only:
+
+- `libbpf.so.1` (usually already present; the loader is pure ctypes)
+- `CAP_BPF` + `CAP_PERFMON`, or `CAP_SYS_ADMIN` — a privileged container has these
+- an NFS server using the kernel's `nfsd`
+
+and on whichever machine builds the collector object, `clang` and `bpftool`. Neither is
+needed on the file server, and no `tracefs` mount or restart is required.
+
 ## Documentation
 
 | | |
@@ -190,17 +221,20 @@ No third-party Python packages.
 | [Configuration](docs/CONFIGURATION.md) | every option, and how to tune it |
 | [Design](docs/DESIGN.md) | why playback-only, why copy-not-move, why not atime |
 | [Players](docs/PLAYERS.md) | write an adapter for another media server |
+| [Observer](docs/OBSERVER.md) | the eBPF access tap: what it sees, and the traps |
 
 ## Testing
 
 ```sh
-python3 tests/test_tier.py
-python3 tests/test_promote.py
+python3 tests/test_tier.py            # eviction, backup guards
+python3 tests/test_promote.py         # promotion, sizing
+python3 tests/test_observer.py        # access signatures and classification
+python3 tests/test_observer_adapter.py
 ```
 
-231 checks. They use temporary directories and a fake player — they never contact a real
-media server and never touch real storage. `rsync` is required; the suites skip with a
-clear message if it is missing.
+330 checks. They use temporary directories and a fake player — they never contact a real
+media server, never touch real storage, and never load anything into the kernel. `rsync`
+is required by the first two; they skip with a clear message if it is missing.
 
 If you change ranking, eviction or the guards, run these first. Several of them exist
 because the behaviour they check was once wrong.
