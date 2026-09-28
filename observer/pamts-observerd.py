@@ -174,9 +174,19 @@ DEMAND = {"PLAY", "FETCH"}
 
 
 class Store:
-    def __init__(self, path, keep_sessions=200_000):
+    def __init__(self, path, keep_sessions=200_000, replay_gap=1800.0):
         self.path = path
         self.keep = keep_sessions
+        # A player does not read steadily while you watch: it reads far ahead,
+        # goes quiet while the buffer drains, then refills in a burst. Observed
+        # on real traffic, one 2160p episode produced gaps of ELEVEN MINUTES,
+        # splitting a single viewing into several sessions.
+        #
+        # Widening idle_gap enough to absorb that would make a pause
+        # indistinguishable from starting the next episode, so instead the same
+        # file seen again within replay_gap is treated as the same viewing:
+        # last_play advances, play_count does not.
+        self.replay_gap = replay_gap
         self._local = threading.local()
         with self._conn() as c:
             c.executescript(SCHEMA)
@@ -204,6 +214,12 @@ class Store:
                 # A session reported mid-flight and then again on close must not
                 # count as two plays, so the increment is carried by count_it.
                 inc = 1 if count_it else 0
+                if inc:
+                    prev = c.execute(
+                        "SELECT last_play FROM plays WHERE path = ?",
+                        (path,)).fetchone()
+                    if prev and (epoch_ts - prev[0]) < self.replay_gap:
+                        inc = 0          # same viewing, resumed after a buffer gap
                 c.execute(
                     "INSERT INTO plays(path,last_play,play_count,last_label,last_bytes,updated) "
                     "VALUES(?,?,?,?,?,?) "
@@ -382,6 +398,11 @@ def main(argv=None):
                          "a long run must prune periodically or the table grows "
                          "without bound")
     ap.add_argument("--keep-sessions", type=int, default=200_000)
+    ap.add_argument("--replay-gap", type=float, default=1800.0,
+                    help="seconds within which the same file counts as the SAME "
+                         "viewing rather than a new play; players read in bursts "
+                         "with long gaps, so without this one episode counts "
+                         "several times")
     ap.add_argument("--all-devices", action="store_true",
                     help="do not drop reads on devices outside --root; useful for "
                          "diagnosing why something is not being seen")
@@ -398,7 +419,8 @@ def main(argv=None):
     logging.info("indexing %s ...", ", ".join(index.roots))
     index.build()
 
-    store = Store(args.db, keep_sessions=args.keep_sessions)
+    store = Store(args.db, keep_sessions=args.keep_sessions,
+                  replay_gap=args.replay_gap)
     tracker = obs.SessionTracker(cfg)
     daemon = Daemon(store, index, tracker, cfg,
                     log_sessions=not args.quiet_sessions)

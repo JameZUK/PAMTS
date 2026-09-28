@@ -261,6 +261,41 @@ the play twice.
 `/sessions` answers "what is playing now"; `/history` answers "what has been
 played". Promotion should consult both.
 
+### Players read in bursts, and one viewing is not one session
+
+This is the finding that most changed the design, and it only appeared once the
+daemon was left running against real traffic.
+
+A media server does not read steadily while you watch. It reads far ahead, goes
+**silent** while the client drains its buffer, then refills in a burst faster than
+playback. Measured on one 2160p episode:
+
+```
+19:06  206 MB   60s  3.4 MB/s   checkpoint
+19:10  952 MB  294s  3.2 MB/s   closed
+19:11  199 MB   61s  3.3 MB/s   checkpoint
+19:28 3369 MB 1071s  3.1 MB/s   closed
+19:40  553 MB   58s  9.6 MB/s   checkpoint   <- after ELEVEN MINUTES of silence
+```
+
+Every row is the same file, one continuous viewing. With a 30-second `idle_gap`
+that became several sessions and **three plays**.
+
+Widening `idle_gap` enough to absorb an eleven-minute gap would make a pause
+indistinguishable from starting the next episode, so the fix is elsewhere:
+`replay_gap` (default 1800 s) treats the same file seen again within that window as
+the **same viewing**. `last_play` advances; `play_count` does not. A genuine rewatch
+the next day still counts.
+
+Two things follow from the same behaviour:
+
+- **Coverage is often unknown per session**, because a fragment rarely contains the
+  read that hits EOF. Do not rely on coverage being present; the classifier already
+  treats `None` as "unknown" rather than "zero".
+- **Rate is measured over the burst, not the viewing.** That 9.6 MB/s row is three
+  times the playback rate, and on a faster link a refill burst could approach the
+  COPY threshold. If plays start being labelled COPY, this is why.
+
 ### Reads on datasets you did not ask about
 
 The tap sees **every** NFS read the server handles, including exports that have

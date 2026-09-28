@@ -128,6 +128,34 @@ con = sqlite3.connect(db)
 b = con.execute("SELECT last_bytes FROM plays WHERE path='/m/long.mkv'").fetchone()[0]
 check("last_bytes takes the larger of the two", b == 400 << 20, str(b))
 
+# players read in bursts, so one viewing must not count several times
+print("\n  replay gap (buffered playback)")
+rs = d.Store(os.path.join(tmp, "r.db"), replay_gap=1800.0)
+P = "/m/ep.mkv"
+# the pattern measured on real traffic: checkpoint, close, checkpoint, close,
+# checkpoint -- with an ELEVEN MINUTE silent gap in the middle while the client
+# drained its buffer
+for ts, first in ((1000.0, True), (1234.0, False), (1297.0, True),
+                  (2368.0, False), (3044.0, True)):
+    rs.record(P, sig(), "PLAY", ts, count_it=first)
+row = rs.history()[0]
+check("a buffered episode counts as ONE play", row["play_count"] == 1,
+      str(row["play_count"]))
+check("but last_play still advances to the latest burst",
+      row["last_play"] == 3044.0, str(row["last_play"]))
+check("a genuine rewatch later still counts",
+      (rs.record(P, sig(), "PLAY", 3044.0 + 90000, count_it=True),
+       rs.history()[0]["play_count"])[1] == 2,
+      str(rs.history()[0]["play_count"]))
+rs.record("/m/other.mkv", sig(), "PLAY", 3100.0, count_it=True)
+check("other files are unaffected by the gap", len(rs.history()) == 2,
+      str(len(rs.history())))
+rs2 = d.Store(os.path.join(tmp, "r2.db"), replay_gap=0.0)
+rs2.record(P, sig(), "PLAY", 1000.0, count_it=True)
+rs2.record(P, sig(), "PLAY", 1001.0, count_it=True)
+check("replay_gap=0 disables the de-duplication",
+      rs2.history()[0]["play_count"] == 2, str(rs2.history()[0]["play_count"]))
+
 # history filtering
 check("since= filters history", len(store.history(since=2000.0)) == 1,
       str(len(store.history(since=2000.0))))
