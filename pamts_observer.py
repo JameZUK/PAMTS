@@ -57,6 +57,12 @@ DEFAULTS = {
     "copy_min_rate":      40 * MB,  # bytes/s: above this a human is not listening
     "min_monotonic":       0.80,
     "play_min_bytes":      1 * MB,   # below this there is nothing to pace
+    # A sequential read of THIS MUCH of one file is playback whatever fraction of
+    # the file it is, because nothing else reads hundreds of megabytes in order
+    # and then stops. Measured: a playback-start prefill burst of 207 MB in 10s
+    # at 20.7 MB/s fell through every class, because 14.3% coverage missed
+    # play_min_coverage and 10s missed play_long_duration.
+    "play_min_bytes_abs": 64 * MB,
     "play_min_duration":   5.0,      # floor before "progressive" means anything
     "play_long_duration":  30.0,     # long+progressive counts even if coverage unknown
     "fetch_max_filesize": 64 * MB,   # a whole file this small, read fast, is a fetch
@@ -339,7 +345,8 @@ def classify(sig, cfg=None):
             and sig["bytes"] >= c["play_min_bytes"]
             and sig["duration"] >= c["play_min_duration"]):
         if (cov is not None and cov >= c["play_min_coverage"]) or \
-           sig["duration"] >= c["play_long_duration"]:
+           sig["duration"] >= c["play_long_duration"] or \
+           sig["bytes"] >= c["play_min_bytes_abs"]:
             return "PLAY"
 
     if sig["regions"] > 2 and sig["monotonic"] < c["min_monotonic"]:

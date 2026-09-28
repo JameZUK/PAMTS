@@ -212,6 +212,32 @@ real_probe = {"fh": 0x56fac01f, "t_first": 0.0, "t_last": 0.3, "duration": 0.3,
 check("the real head/tail probe is PROBE", obs.classify(real_probe) == "PROBE",
       obs.classify(real_probe))
 
+# A playback-start prefill burst, measured live. It fell through every class:
+# 14.3% coverage missed play_min_coverage (0.15) and 10s missed
+# play_long_duration (30), so it scored UNKNOWN -- and now_playing() filters on
+# PLAY, so promotion ignored the exact moment an episode started.
+real_prefill = {"fh": 0x1234, "t_first": 0.0, "t_last": 10.0, "duration": 10.0,
+                "requests": 1663, "bytes": int(207.8 * MB),
+                "filesize": int(1453 * MB), "coverage": 0.143, "min_offset": 0,
+                "max_offset": 207 * MB, "span": 207 * MB, "monotonic": 1.00,
+                "regions": 1, "starts_at_zero": True, "short_reads": 0,
+                "errors": 0, "rate": 20.7 * MB, "frac_splice": 1.0,
+                "frac_vector": 0.0, "frac_direct": 0.0, "method": "splice"}
+check("a real playback-start prefill burst is PLAY",
+      obs.classify(real_prefill) == "PLAY", obs.classify(real_prefill))
+check("a large sequential read qualifies on bytes alone",
+      obs.classify(dict(real_prefill, coverage=0.02, duration=8.0)) == "PLAY",
+      obs.classify(dict(real_prefill, coverage=0.02, duration=8.0)))
+check("but the same volume read SCATTERED is not PLAY",
+      obs.classify(dict(real_prefill, monotonic=0.3, regions=40)) != "PLAY",
+      obs.classify(dict(real_prefill, monotonic=0.3, regions=40)))
+check("and a volume under the floor still needs coverage or duration",
+      obs.classify(dict(real_prefill, bytes=60 * MB, coverage=0.05,
+                        duration=6.0, rate=10 * MB)) != "PLAY")
+check("a whole file at wire speed is still COPY, not PLAY",
+      obs.classify(dict(real_prefill, bytes=8000 * MB, coverage=1.0,
+                        duration=40.0, rate=200 * MB)) == "COPY")
+
 real_music = dict(real_stream, fh=0xd1721f9f, duration=105.0, requests=57,
                   bytes=int(7.1 * MB), filesize=int(7.1 * MB), coverage=1.0,
                   monotonic=1.0, regions=1, rate=0.07 * MB)

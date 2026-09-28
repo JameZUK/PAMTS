@@ -296,6 +296,36 @@ Two things follow from the same behaviour:
   times the playback rate, and on a faster link a refill burst could approach the
   COPY threshold. If plays start being labelled COPY, this is why.
 
+### The start of playback does not look like playback
+
+A second finding from the same live run. When you press play, the server grabs a
+large chunk fast before settling to the playback rate. Measured:
+
+```
+21:21:07  207.8 MB  10s  20.7 MB/s  mono=1.00  cov=0.143   -> UNKNOWN
+```
+
+It missed `play_min_coverage` (0.15) by 0.007 and `play_long_duration` (30 s) by
+20 s, so it matched nothing. That is worse than a cosmetic mislabel, because
+`now_playing()` filters on `PLAY`: **promotion ignored the exact moment an episode
+started**, which is when fetching the next one matters most. It recovered at the
+60 s checkpoint, but on a faster link bursts get shorter and faster, and a viewing
+made entirely of short bursts would never enter history at all.
+
+So `play_min_bytes_abs` (default 64 MB) qualifies a session on volume alone: a
+*sequential* read of hundreds of megabytes of one file is playback whatever fraction
+of the file it represents, because nothing else reads that much in order and stops.
+The monotonic requirement still gates it — the same volume read scattered is `SEEK`,
+and a whole file at wire speed is still `COPY`.
+
+### Coverage can exceed 1.0
+
+Seeking and re-reads mean bytes read can exceed the file size, so treat coverage as
+"how much was read relative to the file", not a fraction bounded at 1. A measured
+episode reported `cov=1.011`. It is harmless for `PLAY`, but be aware that an
+inflated coverage combined with a fast burst is the route by which a genuine play
+could be labelled `COPY`.
+
 ### Reads on datasets you did not ask about
 
 The tap sees **every** NFS read the server handles, including exports that have
