@@ -1,0 +1,302 @@
+# The access observer
+
+A player adapter tells you what one *player* knows. That is per-user, per-service,
+and some services will not tell you at all. The filesystem sees every consumer
+equally, so if your media is served over NFS from a single host, one observer on
+that host is worth more than one adapter per service.
+
+This document is the design, and — more usefully — the list of things that are
+not obvious until you have measured them.
+
+## What it is for
+
+Two jobs, and they pull in opposite directions:
+
+- **promotion** wants to know "is this being played *now*", quickly
+- **eviction** wants to know "when was this last genuinely wanted"
+
+and the founding constraint of the whole system sits underneath both: **a library
+scan must never move data.** Any signal that cannot tell a scan from a play is
+worse than no signal, because it will cheerfully promote your entire library
+every time your media server re-indexes.
+
+## What it cannot do
+
+- **No per-user history.** Exports using `all_squash` erase user identity at the
+  server; every request arrives as the anonymous uid. You get *file-level
+  demand*. That is the right signal for tiering and a poor substitute for
+  scrobbles.
+- **No client attribution from ftrace alone.** The nfsd read tracepoints carry
+  `xid` and `fh_hash` but no client address, so two clients reading one file at
+  once merge into a single session. Recovering the client needs eBPF and
+  `svc_rqst`.
+- **Co-tenanted services are indistinguishable.** If two music servers run on
+  one host, the NFS mount is per-host, so even with the client address you cannot
+  say which of them read the file. This does not hurt tiering — a play is a play.
+- **Local readers are invisible**, because they never become NFS requests. This
+  is usually a *feature*: your own backup and maintenance jobs run on the storage
+  host and so cannot be mistaken for demand.
+
+## The read lifecycle
+
+Every nfsd read tracepoint carries the same four fields — `xid`, `fh_hash`,
+`offset`, `len` — which makes the whole request joinable on `xid`:
+
+```
+read_start(len = requested)
+    -> read_splice | read_vector | read_direct        (the method)
+    -> read_done(len = delivered)  |  read_err(status)
+```
+
+**Use both halves.** `read_done` is the authoritative byte count, and summing
+`len` across several tracepoints double-counts every single read — on a real
+capture there were exactly 15,716 `read_done` and 15,716 `read_splice` events,
+so naive summing reports precisely 2x the traffic and concludes that everything
+is playback. But *which* method fired is a feature worth keeping, not noise to
+discard, so the method events are retained and only `read_done` is counted.
+
+### EOF is where coverage comes from
+
+`read_done.len < read_start.len` means the client reached end of file, so
+`offset + len` reveals the **file size**. Coverage — bytes read divided by file
+size — is therefore computable **without ever resolving `fh_hash` to a path**,
+and coverage is the strongest play-versus-scan discriminator available.
+
+This matters because path resolution is the expensive part of this problem:
+`fh_hash` is a *hash* of the NFS filehandle, not an inode and not a name.
+Reproducing the kernel's internal hash to build a reverse table is fragile across
+kernel versions. Getting coverage for free sidesteps it for classification, and
+you only need real paths at the point where you actually act.
+
+`read_start` is not required: if only the method and completion tracepoints are
+enabled, the method event supplies the requested length and short reads are still
+detected.
+
+## Signature
+
+Per file, per session (sessions split on `idle_gap` seconds of silence):
+
+| feature | why |
+|---|---|
+| `bytes` | `read_done` only |
+| `filesize`, `coverage` | from EOF sightings; may be unknown |
+| `monotonic` | fraction of reads advancing; streaming walks forward |
+| `rate` | **`None`** when no time elapsed — see gotchas |
+| `duration`, `requests` | pacing |
+| `regions` | discontinuity count — see gotchas |
+| `frac_splice/vector/direct` | the method mix |
+| `short_reads`, `errors` | EOF and failures |
+
+## Classes
+
+Only **PLAY** should ever drive promotion.
+
+- **PROBE** — a sip of the head, sometimes head *and* tail. Tag reads, container
+  probes, thumbnailers. Never act on these.
+- **PLAY** — progressive, paced, and sustained long enough for the pacing to mean
+  something.
+- **COPY** — the whole file, flat out. A copy, an analysis pass, a fingerprinter.
+- **FETCH** — the whole file, fast, but small. See below; this class exists
+  because the honest answer is "cannot tell".
+- **BULK** — whole-file reads arriving in a crowd. Decided across files, not
+  within one.
+- **SEEK**, **ERROR**, **UNKNOWN**.
+
+### FETCH, and an ambiguity with no clean answer
+
+A player buffering a whole 5 MB track in 0.3 s and a fingerprinter reading that
+same track in full produce **identical** per-file signatures. Both are
+whole-file, both are fast. No amount of cleverness inside one file's read pattern
+separates them.
+
+What separates them is whether the *neighbours* were read too. A player reads one
+track then waits roughly its playing time; a sweep reads hundreds back to back.
+So the per-file classifier says `FETCH` and declines to guess, and `detect_bulk`
+decides across files. Policy then chooses whether a lone `FETCH` counts as
+demand — for tiering it reasonably does, since something read the file in full.
+
+This is the main reason the classifier must not be tuned on video alone. Video
+files are large enough that playback is always visibly paced; music files are
+small enough that they often are not.
+
+## Gotchas
+
+1. **`read_done` + `read_splice` double counting.** They are the same read. 1:1
+   on real traffic, so the error is exactly 2x and uniform, which makes it easy
+   to miss.
+2. **`xid` wraps.** It is a 32-bit RPC transaction id, so joins must be scoped to
+   a short time window. Joining globally fuses unrelated reads of different
+   offsets into one nonsensical session.
+3. **Never fabricate a rate.** With one read there is no elapsed time and so no
+   measurable rate. Substituting the byte count made a single 0.4 MB read score
+   as paced playback. `rate` is `None`, and `PLAY` requires a real duration and a
+   minimum byte count.
+4. **`regions` measures readahead, not seeking.** A real 26 Mbps video stream
+   scored **6,574 regions** at a 4 MB gap threshold, because clients read ahead in
+   interleaved bursts. Only trust it alongside a low `monotonic` score.
+5. **Calibrate on the traffic you have.** Thresholds separating "paced" from
+   "flat out" are bandwidth- and client-dependent. Capture first, classify
+   afterwards.
+6. **A scan that reads whole files is not a PROBE.** Loudness analysis and
+   acoustic fingerprinting read everything. `BULK` catches these, not `PROBE`.
+
+## Measured, on a 10-minute capture
+
+37 distinct files, 15,716 reads, zero lost events:
+
+| session | reads | bytes | coverage | duration | rate | label |
+|---|---|---|---|---|---|---|
+| video stream | 15,369 | 1,936 MB | 0.21 | 592 s | 3.27 MB/s | PLAY |
+| music track | 57 | 7.1 MB | 1.00 | 105 s | 0.07 MB/s | PLAY |
+| whole small file | 44 | 5.4 MB | 1.00 | 0.3 s | 17.1 MB/s | FETCH |
+| head/tail probes (x21) | 5 | 0.4 MB | 0.01–0.02 | 0.3 s | ~1.7 MB/s | PROBE |
+
+The 21 probes sat at 1–2% coverage across exactly **two regions** — head and
+tail — and are cleanly separated from the two plays. That separation is the whole
+premise, and it holds.
+
+## Capturing
+
+An isolated ftrace instance, so nothing global is disturbed and cleanup is a
+directory removal:
+
+```sh
+D=/sys/kernel/tracing; I=$D/instances/pamts
+mkdir -p $I
+echo 32768 > $I/buffer_size_kb
+echo 1 > $I/events/nfsd/nfsd_read_done/enable
+echo 1 > $I/events/nfsd/nfsd_read_splice/enable
+: > $I/trace
+# ... wait ...
+echo 0 > $I/events/nfsd/nfsd_read_done/enable
+echo 0 > $I/events/nfsd/nfsd_read_splice/enable
+cp $I/trace /tmp/capture.txt
+rmdir $I
+```
+
+Check the capture for lost events before trusting it. Then:
+
+```python
+import pamts_observer as obs
+for sig, label in obs.analyse(open("/tmp/capture.txt", errors="replace")):
+    print(label, sig["bytes"], sig["coverage"])
+```
+
+ftrace is the right tool for *calibration*: no compiler, no kernel module,
+reverted by removing a directory. It is the wrong tool for the permanent
+collector, because `fh_hash` is a hash and there is no client address. For that,
+use the eBPF collector.
+
+## The eBPF collector
+
+`observer/pamts_nfsd.bpf.c` attaches to the nfsd read tracepoints and reports
+what ftrace cannot: a real **inode**, the **device**, and the **client address**.
+
+### Build once, run anywhere
+
+Only the build host needs `clang` and `bpftool`. The host that RUNS the collector
+needs `libbpf.so.1` and nothing else, because `observer/pamts_bpf.py` loads the
+object through ctypes. That matters when the machine doing the serving is one you
+would rather not install a toolchain on.
+
+```sh
+ssh storage-host cat /sys/kernel/btf/vmlinux > vmlinux.btf
+make -C observer vmlinux.h BTF=$PWD/vmlinux.btf
+make -C observer
+# ship observer/pamts_nfsd.bpf.o plus the Python. No compiler on the target.
+```
+
+`vmlinux.h` must come from the **target** kernel's BTF, not the build host's.
+
+### Why raw tracepoints
+
+Attachment is by raw tracepoint *name*, which needs no `tracefs` or `debugfs`.
+Those are usually absent inside a container, and mounting them means editing the
+container config and restarting it — and restarting an NFS server takes down
+every guest that mounts it. Raw tracepoint attach avoids the problem entirely.
+
+It does need `CAP_BPF` and `CAP_PERFMON` (or `CAP_SYS_ADMIN`), which an
+unprivileged container does not hold in the initial user namespace. A privileged
+container does.
+
+### nfsd is a MODULE, and this is the trap
+
+`btf_trace_nfsd_read_done` and `struct svc_fh` are **not in vmlinux BTF**. They
+live in `/sys/kernel/btf/nfsd`, split BTF layered on vmlinux. Consequences:
+
+- looking for the tracepoint signatures in vmlinux BTF finds nothing, and it is
+  easy to conclude they do not exist and start guessing instead
+- `bpftool btf dump file nfsd` fails without `-B /sys/kernel/btf/vmlinux`
+- `struct svc_fh` cannot come from `vmlinux.h`, so the program declares only the
+  field it needs as a CO-RE *flavor* (`struct svc_fh___pamts`, the `___suffix`
+  being stripped when matching) and libbpf relocates it against the module BTF
+
+Verified TP_PROTO on the target kernel rather than assumed:
+
+| tracepoint | args (after the implicit ctx) |
+|---|---|
+| `read_start`, `read_done`, `read_splice`, `read_vector`, `read_direct` | `(struct svc_rqst *, struct svc_fh *, u64 offset, u32 len)` |
+| `read_err` | `(struct svc_rqst *, struct svc_fh *, loff_t offset, int status)` |
+
+As raw tracepoint arguments these are `ctx->args[0..3]`. BTF encodes a leading
+`void *` for the tracepoint typedef; raw_tp args do not include it.
+
+### Two more traps
+
+- **`rq_xid` is `__be32`.** The kernel's own tracepoints byte-swap before
+  printing, so the collector must too, or captures disagree with ftrace.
+- **Kernel `dev_t` is not Python's `st_dev`.** `super_block.s_dev` packs
+  `(major << 20) | minor`; glibc uses a different 64-bit layout. Comparing them
+  directly never matches, and every path lookup then fails while looking merely
+  like a cold index. `kdev()` in the daemon converts.
+
+### Reporting a play while it is still playing
+
+A session is only fully known once it ends, but a 45-minute episode reported only
+at the end is useless for promotion, which has to fetch the next item *during*
+playback. `checkpoint_after` (default 60 s) reports an in-progress session once it
+already classifies as PLAY; the final report then refreshes it without counting
+the play twice.
+
+`/sessions` answers "what is playing now"; `/history` answers "what has been
+played". Promotion should consult both.
+
+### Shutdown
+
+Do not rely on `KeyboardInterrupt` propagating out of a ctypes call blocked inside
+libbpf. In testing, SIGTERM killed the process while SIGINT left it running with
+the programs still attached. The collector has an explicit `stop()` which the
+daemon wires to SIGINT and SIGTERM, and `--duration` bounds a run without needing
+signals at all. BPF links are fd-backed, so they do detach when the process dies.
+
+## Measured live
+
+On a real NFS server: ~180,000 files indexed, 150-second run.
+
+```
+PLAY   10.0.0.20   407.1 MB  dur=145s  2.8 MB/s   reqs=3257  splice
+  .../Some Show (2024)/Season 2/Some Show - S02E04 ... .mkv
+PLAY   10.0.0.20   136.1 MB  dur= 47s  2.9 MB/s   reqs=1091  splice  <- checkpoint
+COPY   10.0.0.31     0.3 MB  dur=  0s  94.7 MB/s  reqs=3     splice
+```
+
+Two session rows for one viewing — the 47 s checkpoint and the 145 s final — with
+`play_count = 1`. The small COPYs came from a host reading a dataset that was not
+indexed, so their paths did not resolve and they never reached history: the right
+outcome, for both reasons independently.
+
+## Using it from PAMTS
+
+`ObserverPlayer` (kind `observer`) reads this daemon like any other player:
+
+```toml
+[[players]]
+kind = "observer"
+name = "storage"
+url  = "http://127.0.0.1:8621"
+```
+
+Only `PLAY` and `FETCH` count as demand (`demand_labels`). Its locality unit is
+**sibling files in the same directory**, listed across *both* tiers — the next
+episode is usually the one on the slow tier, which is exactly the file promotion
+exists to fetch. See `docs/PLAYERS.md`.

@@ -961,10 +961,227 @@ Verified against Navidrome 0.64.0.
 
 
 # The registry. Adding a player means adding one line here -- see docs/PLAYERS.md.
+
+class ObserverPlayer(Player):
+    """The access observer (observer/pamts-observerd.py), over its HTTP API.
+
+    This adapter is different in kind from the others: it does not talk to a media
+    server at all. It reads what the STORAGE saw. That makes it the only adapter
+    that works for a service with no usable API -- Navidrome's history is per-user
+    and needs every user's credentials, which is impractical, while the filesystem
+    sees every user's listening equally.
+
+    Consequences worth knowing:
+
+    - It reports FILE-LEVEL DEMAND, not per-user history. Exports using all_squash
+      erase user identity at the server. Right signal for tiering, no use for
+      anything user-facing.
+    - It only knows files that have been READ. It cannot enumerate a library, so
+      library_items() returns a partial view. That is safe here, because eviction
+      refuses to act without play data rather than treating absence as "never
+      played", and sweep() merges by maximum across adapters.
+    - Co-tenanted services are indistinguishable: if two music servers share a
+      host, the NFS mount is per-host. Harmless for tiering -- a play is a play.
+
+    Its real contribution beyond history is locality: the next items are the
+    SIBLING FILES IN THE SAME DIRECTORY, which works for a TV season and an album
+    alike without knowing anything about either.
+    """
+    kind = "observer"
+    provides_history = True
+    provides_sessions = True
+    # Deliberately conservative: without a server telling us what a "season" or an
+    # "album" is, locality is directory order, which can be a very large directory.
+    caps = Caps(max_items=24, max_bytes=40 * pamts.GB)
+
+    MEDIA_EXT = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".mov", ".wmv", ".flv",
+                 ".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".wma", ".aac")
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.url = str(cfg.get("url", "http://127.0.0.1:8621")).rstrip("/")
+        self.timeout = float(cfg.get("timeout", 10))
+        # Only these labels count as demand. PROBE and COPY must never promote --
+        # that is the founding constraint: a scan must not move data.
+        self.demand = set(cfg.get("demand_labels", ("PLAY", "FETCH")))
+
+    # -- transport ---------------------------------------------------------
+    def _get(self, path):
+        req = urllib.request.Request(self.url + path,
+                                     headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+
+    def available(self):
+        if not self.url:
+            logging.error(f"[{self.name}] no url configured")
+            return False
+        try:
+            self._get("/health")
+            return True
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            logging.error(f"[{self.name}] observer unreachable at {self.url}: {e}")
+            return False
+
+    # -- path helpers ------------------------------------------------------
+    def _item(self, path, last_viewed, kind_hint=None):
+        m = pamts.split_root(path)
+        if not m:
+            return None
+        rel, fast_root, slow_root = m
+        parent = os.path.dirname(rel)
+        return {
+            "kind": kind_hint or self._kind_for(path),
+            # The observer has no notion of a series, so the containing directory
+            # stands in for one. It is the right granularity for both a season
+            # folder and an album folder.
+            "show": os.path.basename(parent) or None,
+            "show_key": parent or None,
+            "season": None, "episode": None,
+            "title": os.path.basename(path), "rel": rel,
+            "fast": os.path.join(fast_root, rel),
+            "slow": os.path.join(slow_root, rel),
+            "size": 0,
+            "last_viewed": int(last_viewed or 0),
+            "added": 0,
+        }
+
+    def _kind_for(self, path):
+        low = path.lower()
+        if low.endswith((".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav",
+                         ".wma", ".aac")):
+            return "track"
+        return "episode"
+
+    def _siblings(self, path):
+        """Names in this file's directory, ACROSS BOTH TIERS, sorted.
+
+        Both tiers must be listed: the whole point of tiering is that the next
+        episode is probably on the slow one, so a single-tier listing would
+        usually fail to find exactly the item we want to promote.
+        """
+        m = pamts.split_root(path)
+        if not m:
+            return []
+        rel, fast_root, slow_root = m
+        parent = os.path.dirname(rel)
+        names = set()
+        for root in (fast_root, slow_root):
+            d = os.path.join(root, parent)
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        if e.is_file(follow_symlinks=False) and \
+                                e.name.lower().endswith(self.MEDIA_EXT):
+                            names.add(e.name)
+            except OSError:
+                continue
+        return sorted(names)
+
+    # -- Player interface --------------------------------------------------
+    def library_items(self):
+        since = float(self.cfg.get("history_since", 0))
+        try:
+            data = self._get(f"/history?since={since:.0f}")
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            logging.error(f"[{self.name}] history unavailable: {e}")
+            return None                  # None means "do not know", never "none"
+        out = []
+        for row in data.get("history", []):
+            if row.get("label") not in self.demand:
+                continue
+            it = self._item(row.get("path") or "", row.get("last_play"))
+            if it:
+                out.append(it)
+        logging.info(f"[{self.name}] {len(out)} item(s) with observed plays")
+        return out
+
+    def now_playing(self):
+        try:
+            data = self._get("/sessions")
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            logging.error(f"[{self.name}] sessions unavailable: {e}")
+            return []
+        out = []
+        for s in data.get("sessions", []):
+            if s.get("label") != "PLAY":
+                continue
+            path = s.get("path")
+            if not path or not pamts.split_root(path):
+                continue
+            out.append(PlayEvent(
+                source=self.name, kind=self._kind_for(path),
+                label=f"{os.path.basename(path)} ({s.get('client') or 'unknown'})",
+                path=path, group=os.path.dirname(path),
+                remaining_s=self._remaining(path, s)))
+        return out
+
+    def _remaining(self, path, session):
+        """Estimate seconds left, from bytes still unread over observed read rate.
+
+        The observer has no idea how long a file PLAYS for -- only how fast it is
+        being read. For paced playback the read rate tracks the bitrate closely
+        enough to schedule against, and 0 (unknown) is returned whenever it does
+        not, so the promotion engine simply applies no deadline.
+        """
+        rate = session.get("rate") or 0
+        read = session.get("bytes") or 0
+        if rate <= 0:
+            return 0.0
+        size = 0
+        m = pamts.split_root(path)
+        if m:
+            rel, fast_root, slow_root = m
+            for root in (fast_root, slow_root):
+                try:
+                    size = os.path.getsize(os.path.join(root, rel))
+                    break
+                except OSError:
+                    continue
+        if size <= read:
+            return 0.0
+        return max(0.0, (size - read) / rate)
+
+    def locality_group(self, event):
+        names = self._siblings(event.path)
+        if not names:
+            return []
+        cur = os.path.basename(event.path)
+        try:
+            i = names.index(cur)
+        except ValueError:
+            return []
+        out = []
+        for order, name in enumerate(names[i + 1:]):
+            out.append(Candidate(path=os.path.join(os.path.dirname(event.path), name),
+                                 label=name, size=0, order=order))
+        return out
+
+    def recent_plays(self, since):
+        """Recently played items, straight from the observer's own history."""
+        try:
+            data = self._get(f"/history?since={float(since):.0f}")
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            logging.error(f"[{self.name}] history unavailable: {e}")
+            return []
+        out = []
+        for row in data.get("history", []):
+            if row.get("label") not in self.demand:
+                continue
+            path = row.get("path")
+            if not path or not pamts.split_root(path):
+                continue
+            out.append(PlayEvent(source=self.name, kind=self._kind_for(path),
+                                 label=os.path.basename(path), path=path,
+                                 group=os.path.dirname(path), remaining_s=0.0))
+        return out
+
+
 ADAPTERS = {
     PlexPlayer.kind: PlexPlayer,
     LmsPlayer.kind: LmsPlayer,
     NavidromePlayer.kind: NavidromePlayer,
+    ObserverPlayer.kind: ObserverPlayer,
 }
 
 

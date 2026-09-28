@@ -8,3 +8,11 @@ pamts.toml
 *-token
 *.token
 state.json
+
+# Generated from the TARGET kernel's BTF and specific to it, so it must never be
+# committed: a stale vmlinux.h silently builds an object for the wrong kernel.
+observer/vmlinux.h
+*.btf
+
+# Compiled BPF output is a build artefact; build it with observer/Makefile.
+*.bpf.o
