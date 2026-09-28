@@ -84,10 +84,15 @@ class InodeIndex:
         self.files = 0
         self.builds = 0
         self.last_build_s = 0.0
+        # Kernel dev_t of every device the roots actually live on. Reads on any
+        # other device belong to a dataset we were not asked about, and dropping
+        # them early keeps both the work and the log about the media we manage.
+        self.devs = set()
 
     def build(self):
         t0 = time.monotonic()
         new = {}
+        devs = set()
         for root in self.roots:
             if not os.path.isdir(root):
                 continue
@@ -96,6 +101,7 @@ class InodeIndex:
                 d = stack.pop()
                 try:
                     dev = kdev(os.stat(d).st_dev)
+                    devs.add(dev)
                     entries = list(os.scandir(d))
                 except OSError:
                     continue
@@ -112,8 +118,11 @@ class InodeIndex:
             self._built = time.monotonic()
             self.files = len(new)
             self.builds += 1
+            self.devs = devs
             self.last_build_s = time.monotonic() - t0
-        logging.info("indexed %d files in %.1fs", len(new), self.last_build_s)
+        logging.info("indexed %d files in %.1fs across %d device(s): %s",
+                     len(new), self.last_build_s, len(devs),
+                     ",".join(str(d) for d in sorted(devs)))
         return len(new)
 
     def lookup(self, dev, ino, allow_rebuild=True):
@@ -240,6 +249,7 @@ class Daemon:
         self.started = time.time()
         self.records = 0
         self.unresolved = 0
+        self.foreign = 0
         self.labels = {}
 
     def on_close(self, key, sig, label, first=True):
@@ -271,6 +281,7 @@ class Daemon:
             "sessions_open": len(self.tracker._open),
             "labels": self.labels,
             "unresolved_paths": self.unresolved,
+            "foreign_device_records": self.foreign,
             "index_files": self.index.files,
             "index_builds": self.index.builds,
             "index_build_s": round(self.index.last_build_s, 1),
@@ -371,6 +382,9 @@ def main(argv=None):
                          "a long run must prune periodically or the table grows "
                          "without bound")
     ap.add_argument("--keep-sessions", type=int, default=200_000)
+    ap.add_argument("--all-devices", action="store_true",
+                    help="do not drop reads on devices outside --root; useful for "
+                         "diagnosing why something is not being seen")
     args = ap.parse_args(argv)
 
     os.makedirs(os.path.dirname(args.db), exist_ok=True)
@@ -443,6 +457,14 @@ def main(argv=None):
     try:
         for rec in src:
             daemon.records += 1
+            # Reads on a device none of our roots live on are someone else's
+            # dataset. Dropping them here rather than at path-resolution time
+            # keeps the log about our own media and avoids sessionising traffic
+            # we can never name.
+            if (args.all_devices is False and rec.dev is not None
+                    and index.devs and rec.dev not in index.devs):
+                daemon.foreign += 1
+                continue
             tracker.add(rec)
             if stopping.is_set():
                 break

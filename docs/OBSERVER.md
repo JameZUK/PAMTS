@@ -261,6 +261,18 @@ the play twice.
 `/sessions` answers "what is playing now"; `/history` answers "what has been
 played". Promotion should consult both.
 
+### Reads on datasets you did not ask about
+
+The tap sees **every** NFS read the server handles, including exports that have
+nothing to do with the media you are tiering. In a first live run, 11 of 12
+sessions were small whole-file reads of a different dataset: correctly classified
+`COPY` and correctly kept out of history, but they would swamp a day's log.
+
+So the daemon records which devices its `--root` paths actually live on and drops
+records from any other device before they become sessions. `foreign_device_records`
+in `/stats` counts them. `--all-devices` disables the filter, which is the thing to
+reach for when something you expect to see is not appearing.
+
 ### Shutdown
 
 Do not rely on `KeyboardInterrupt` propagating out of a ctypes call blocked inside
