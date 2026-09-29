@@ -36,12 +36,31 @@ have, and path resolution is the expensive part of this problem, so getting
 coverage for free matters.
 """
 import re
-from collections import defaultdict
+from collections import defaultdict, deque
 
 KB = 1024
 MB = 1024 ** 2
 
 METHODS = ("splice", "vector", "direct")
+
+# Only these are tierable. Artwork, playlists and sidecars are read constantly by
+# scanning media servers and are far too small to be worth moving between tiers --
+# and being tiny, a whole-file read of one looks exactly like a FETCH. Left
+# unfiltered, one library scan put 1,350 .jpg files into play history.
+MEDIA_EXT = (
+    ".mkv", ".mp4", ".avi", ".m4v", ".ts", ".mov", ".wmv", ".flv", ".mpg",
+    ".mpeg", ".m2ts", ".webm", ".iso",
+    ".flac", ".mp3", ".m4a", ".m4b", ".ogg", ".opus", ".wav", ".wma", ".aac",
+    ".alac", ".ape", ".dsf", ".dff", ".aiff", ".aif",
+)
+
+
+def is_media(path):
+    """Is this a file worth tiering at all?"""
+    if not path:
+        return False
+    dot = path.rfind(".")
+    return dot >= 0 and path[dot:].lower() in MEDIA_EXT
 
 # xid is a 32-bit RPC transaction id and WILL wrap on a long capture, so a
 # start is only ever matched to a completion seen within this many seconds.
@@ -458,6 +477,11 @@ class SessionTracker:
             self.cfg.update(cfg)
         self.on_close = on_close
         self.checkpoints = 0
+        # Recent (ts, file-key) per client, for the bulk guard. detect_bulk()
+        # works on a finished capture; a daemon never has one, so the same
+        # decision has to be made from a rolling window instead.
+        self._recent = defaultdict(deque)
+        self.bulk = 0
         self._open = {}          # key -> {"reqs": [...], "pending": {xid: Request}}
         self.closed = 0
         self.dropped = 0
@@ -554,6 +578,22 @@ class SessionTracker:
         sig["client"] = key[2] if len(key) > 2 else None
         return sig
 
+    def _note(self, sig):
+        """Record this file against its client, and say how many distinct files
+        that client has touched in the bulk window.
+
+        Counting DISTINCT FILES, not sessions, is the point: one viewer re-reading
+        one file in bursts must not look like a sweep, while a scanner walking a
+        library touches hundreds of different files in the same period.
+        """
+        window = self.cfg["bulk_window"]
+        now, client = sig["t_last"], sig.get("client")
+        q = self._recent[client]
+        q.append((now, (sig.get("dev"), sig.get("ino"), sig.get("fh"))))
+        while q and now - q[0][0] > window:
+            q.popleft()
+        return len({k for _, k in q})
+
     def _close(self, key):
         st = self._open.pop(key)
         reqs = st["reqs"] + list(st["pending"].values())
@@ -562,6 +602,15 @@ class SessionTracker:
             return None
         sig = self._sig(key, reqs)
         label = classify(sig, self.cfg)
+        distinct = self._note(sig)
+        sig["client_files_in_window"] = distinct
+        # A sweep is decided ACROSS files, never within one: a player reads a
+        # track then waits roughly its playing time, while a scanner reads the
+        # neighbours too. Only demand labels are downgraded -- relabelling a
+        # PROBE as BULK would lose information for no gain.
+        if label in ("PLAY", "FETCH") and distinct >= self.cfg["bulk_min_files"]:
+            label = "BULK"
+            self.bulk += 1
         self.closed += 1
         if self.on_close:
             # `first` is False when this session was already reported mid-flight,

@@ -44,6 +44,7 @@ import urllib.request
 from dataclasses import dataclass
 
 import pamts
+import pamts_observer
 
 
 @dataclass
@@ -994,8 +995,8 @@ class ObserverPlayer(Player):
     # "album" is, locality is directory order, which can be a very large directory.
     caps = Caps(max_items=24, max_bytes=40 * pamts.GB)
 
-    MEDIA_EXT = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".mov", ".wmv", ".flv",
-                 ".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".wma", ".aac")
+    # Shared with the observer daemon so both agree on what is tierable.
+    MEDIA_EXT = pamts_observer.MEDIA_EXT
 
     def __init__(self, cfg):
         super().__init__(cfg)
@@ -1046,12 +1047,11 @@ class ObserverPlayer(Player):
             "added": 0,
         }
 
+    AUDIO_EXT = (".flac", ".mp3", ".m4a", ".m4b", ".ogg", ".opus", ".wav",
+                 ".wma", ".aac", ".alac", ".ape", ".dsf", ".dff", ".aiff", ".aif")
+
     def _kind_for(self, path):
-        low = path.lower()
-        if low.endswith((".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav",
-                         ".wma", ".aac")):
-            return "track"
-        return "episode"
+        return "track" if path.lower().endswith(self.AUDIO_EXT) else "episode"
 
     def _siblings(self, path):
         """Names in this file's directory, ACROSS BOTH TIERS, sorted.

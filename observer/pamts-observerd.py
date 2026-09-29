@@ -210,7 +210,10 @@ class Store:
                 (epoch_ts, path, sig.get("dev"), sig.get("ino"), sig.get("client"),
                  label, sig["bytes"], sig["coverage"], sig["duration"], sig["rate"],
                  sig["requests"], sig["monotonic"], sig["method"]))
-            if path and label in DEMAND:
+            # The media check lives HERE rather than in the caller, so no code
+            # path can record artwork as demand by forgetting to filter. One live
+            # scan put 1,350 .jpg files into play history exactly that way.
+            if path and label in DEMAND and obs.is_media(path):
                 # A session reported mid-flight and then again on close must not
                 # count as two plays, so the increment is carried by count_it.
                 inc = 1 if count_it else 0
@@ -228,7 +231,8 @@ class Store:
                     "  play_count=play_count+?, last_label=excluded.last_label, "
                     "  last_bytes=MAX(last_bytes,excluded.last_bytes), "
                     "  updated=excluded.updated",
-                    (path, epoch_ts, inc, label, sig["bytes"], time.time(), inc))
+                    (path, epoch_ts, inc, label, sig["bytes"],
+                     time.time(), inc))
 
     def history(self, since=0.0, limit=100_000):
         c = self._conn()
@@ -266,6 +270,7 @@ class Daemon:
         self.records = 0
         self.unresolved = 0
         self.foreign = 0
+        self.non_media = 0
         self.labels = {}
 
     def on_close(self, key, sig, label, first=True):
@@ -277,6 +282,12 @@ class Daemon:
             if path is None:
                 self.unresolved += 1
         epoch = boot_epoch() + sig["t_last"]
+        # Artwork, playlists and sidecars are not tierable. They are read
+        # constantly by scanning servers and, being tiny, a whole-file read of one
+        # is indistinguishable from a FETCH -- one scan put 1,350 .jpg files into
+        # play history. The session is still logged, so nothing is hidden.
+        if path is not None and not obs.is_media(path):
+            self.non_media += 1
         self.store.record(path, sig, label, epoch, count_it=first)
         if self.log_sessions:
             cov = "?" if sig["coverage"] is None else f"{sig['coverage']:.2f}"
@@ -298,6 +309,8 @@ class Daemon:
             "labels": self.labels,
             "unresolved_paths": self.unresolved,
             "foreign_device_records": self.foreign,
+            "non_media_sessions": self.non_media,
+            "bulk_suppressed": self.tracker.bulk,
             "index_files": self.index.files,
             "index_builds": self.index.builds,
             "index_build_s": round(self.index.last_build_s, 1),

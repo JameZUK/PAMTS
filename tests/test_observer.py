@@ -311,6 +311,111 @@ for kind, ln in (("read_start", 131072), ("read_splice", 131072), ("read_done", 
 t.flush()
 check("an online head/tail scan is PROBE, not PLAY", ev == ["PROBE"], str(ev))
 
+# --- the founding constraint, against patterns measured on a real server ------
+print("\nsweeps must never reach play history")
+
+
+def sess(t, ino, client, nbytes, dur, nreq, filesize, hit_eof=True):
+    """Records for one session. hit_eof emits a SHORT final read, which is what
+    reveals the file size and hence coverage. Omit it and the classifier sees
+    coverage=None and behaves quite differently -- an earlier version of this
+    test emitted no EOF and so never reproduced the labels it claimed to test."""
+    recs, per = [], max(1, nbytes // max(1, nreq))
+    for i in range(nreq):
+        ts = t + (i * dur / max(1, nreq))
+        for k in ("read_start", "read_splice", "read_done"):
+            recs.append(obs.Record(ts=ts, kind=k, xid=(ino << 9 | i) & 0xffffffff,
+                                   offset=i * per, length=per, ino=ino, dev=45,
+                                   client=client))
+    if hit_eof:
+        ts = t + dur
+        for k, ln in (("read_start", per), ("read_splice", per),
+                      ("read_done", max(1, per // 4))):
+            recs.append(obs.Record(ts=ts, kind=k, xid=(ino << 9 | 511) & 0xffffffff,
+                                   offset=filesize - per, length=ln, ino=ino,
+                                   dev=45, client=client))
+    return recs
+
+
+def labels_for(records, cfg=None):
+    out = []
+    tr = obs.SessionTracker(cfg or {"idle_gap": 30.0, "checkpoint_after": 0},
+                            on_close=lambda k, s, l, f: out.append(l))
+    for r in sorted(records, key=lambda r: r.ts):
+        tr.add(r)
+    tr.flush()
+    return out, tr
+
+
+# 1,350 .jpg files reached play history on a live run: tiny whole-file reads look
+# exactly like a FETCH, and FETCH counts as demand.
+art = []
+for i in range(80):
+    art += sess(4000.0 + i * 0.5, 9000 + i, "10.0.0.11", 40 * 1024, 0.05, 1, 40 * 1024)
+unguarded, _ = labels_for(art, {"idle_gap": 30.0, "checkpoint_after": 0,
+                                "bulk_min_files": 10 ** 9})
+check("tiny whole-file reads DO score FETCH (the pattern that leaked)",
+      unguarded.count("FETCH") == 80, str(unguarded.count("FETCH")))
+guarded, tr = labels_for(art)
+check("the bulk guard suppresses most of a storm", tr.bulk >= 50, str(tr.bulk))
+check("but a rolling window cannot catch the first few",
+      guarded.count("FETCH") > 0,
+      "documented limitation: the extension filter is what fully handles artwork")
+check("is_media rejects artwork and playlists",
+      not obs.is_media("/m/cover.jpg") and not obs.is_media("/m/x.m3u")
+      and not obs.is_media("/m/f.png"))
+check("is_media accepts video and audio",
+      obs.is_media("/m/a.mkv") and obs.is_media("/m/b.flac")
+      and obs.is_media("/m/c.m4b"))
+check("is_media is case-insensitive", obs.is_media("/m/A.MKV"))
+check("is_media handles an extensionless path", not obs.is_media("/m/noext"))
+
+# Measured: ten tracks read simultaneously, 1.4 MB each over 27s, from one client.
+# Nobody plays ten tracks at once; it is an analysis pass.
+yard = []
+for i in range(10):
+    yard += sess(1003.0, 6000 + i, "10.0.0.102", int(1.4 * MB), 27.0, 12, int(7 * MB))
+alone, _ = labels_for(yard)
+check("ten simultaneous partial reads score PLAY unguarded",
+      alone.count("PLAY") == 10, str(alone.count("PLAY")))
+mixed = yard + [r for i in range(60)
+                for r in sess(1000.0 + i * 0.1, 5000 + i, "10.0.0.102",
+                              400 * 1024, 0.3, 3, 40 * MB)]
+inwave, tr = labels_for(mixed)
+check("inside a scan wave they are suppressed as BULK",
+      inwave.count("BULK") == 10 and inwave.count("PLAY") == 0,
+      f"bulk={inwave.count('BULK')} play={inwave.count('PLAY')}")
+check("the scan itself is still PROBE, not BULK",
+      inwave.count("PROBE") == 60, str(inwave.count("PROBE")))
+
+print("")
+print("and legitimate use must survive the guard")
+ep = []
+for b in range(6):
+    ep += sess(2000.0 + b * 200, 7777, "10.0.0.20", 300 * MB, 60.0, 2400,
+               9000 * MB, hit_eof=False)
+out, tr = labels_for(ep)
+check("one episode across six buffer bursts is one PLAY",
+      out == ["PLAY"], str(out))
+check("a single viewer is never bulk", tr.bulk == 0)
+
+alb = []
+for i in range(10):
+    alb += sess(3000.0 + i * 240, 8000 + i, "10.0.0.11", int(35 * MB), 230.0,
+                280, int(35 * MB))
+out, tr = labels_for(alb)
+check("an album played track by track is ten PLAYs",
+      out.count("PLAY") == 10, str(out.count("PLAY")))
+check("playing an album is not a sweep", tr.bulk == 0, str(tr.bulk))
+
+# distinct FILES, not sessions: one file re-read in bursts must not look bulky
+many = []
+for b in range(40):
+    many += sess(5000.0 + b * 2, 4242, "10.0.0.20", 80 * MB, 1.0, 640,
+                 9000 * MB, hit_eof=False)
+_, tr = labels_for(many, {"idle_gap": 1.5, "checkpoint_after": 0})
+check("40 bursts on ONE file are not a sweep", tr.bulk == 0, str(tr.bulk))
+
 print()
 if fails:
     print(f"{len(fails)} FAILED: {', '.join(fails)}")

@@ -94,6 +94,9 @@ def sig(**kw):
     return base
 
 
+check("non-media paths never reach history even when labelled PLAY",
+      (store.record("/m/cover.jpg", sig(), "PLAY", 999.0),
+       store.history() == [])[1], "artwork must not count as demand")
 check("DEMAND is exactly PLAY and FETCH", d.DEMAND == {"PLAY", "FETCH"}, str(d.DEMAND))
 
 store.record("/m/a.mkv", sig(), "PLAY", 1000.0)
@@ -107,14 +110,14 @@ check("FETCH reaches history", "/m/e.mkv" in paths)
 check("PROBE never reaches history", "/m/b.mkv" not in paths)
 check("COPY never reaches history", "/m/c.mkv" not in paths)
 check("BULK never reaches history", "/m/d.mkv" not in paths)
-check("every session is still logged", store.counts()["sessions"] == 5,
+check("every session is still logged", store.counts()["sessions"] == 6,
       str(store.counts()))
 
 # an unresolved path is logged but cannot be history
 store.record(None, sig(), "PLAY", 1005.0)
 check("an unresolved PLAY adds no history row", len(store.history()) == 2,
       str(len(store.history())))
-check("but its session is recorded", store.counts()["sessions"] == 6)
+check("but its session is recorded", store.counts()["sessions"] == 7)
 
 # checkpoint then final must count once
 store.record("/m/long.mkv", sig(bytes=100 << 20), "PLAY", 2000.0, count_it=True)

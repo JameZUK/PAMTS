@@ -326,6 +326,51 @@ episode reported `cov=1.011`. It is harmless for `PLAY`, but be aware that an
 inflated coverage combined with a fast burst is the route by which a genuine play
 could be labelled `COPY`.
 
+### A library scan put 1,350 JPEGs into play history
+
+The single most important thing an overnight run revealed, and the closest this
+came to violating its own founding constraint.
+
+In fourteen hours the observer classified 91,725 sessions. **70,756 were `PROBE`
+and correctly excluded** — the classifier did its main job well. But the `plays`
+table ended up with **1,490 rows, of which 1,350 were `.jpg`**, 66 `.m3u` and 32
+`.png`. Only about 39 were media.
+
+Two independent causes, both now fixed:
+
+**1. `detect_bulk` was never wired into the streaming path.** It only ran in
+`analyse()`, the offline batch helper. The daemon calls `classify()` directly, so
+the guard written specifically to catch sweeps was inert. `SessionTracker` now
+applies the same decision from a rolling window, counting **distinct files per
+client** — distinct files, not sessions, so one viewer re-reading one file in
+bursts never looks like a sweep.
+
+**2. Artwork and playlists were treated as tierable.** A 40 KB cover read whole at
+1 MB/s is, by every measure the classifier has, a `FETCH` — and `FETCH` counts as
+demand. `is_media()` now restricts play history to media extensions, and the check
+lives inside `Store.record` rather than in its caller, so no code path can bypass
+it by forgetting.
+
+**A limitation to know about.** A rolling window cannot recognise a sweep until
+enough of it has arrived, so the first `bulk_min_files` files still record as
+demand. For artwork that no longer matters — the extension filter catches all of
+it — but a music scan that reads whole tracks can still leak its first two dozen.
+Recording demand only after the window has closed would remove that entirely, at
+the cost of history lagging by `bulk_window`; promotion reads `/sessions`, not
+`/history`, so that latency would be harmless.
+
+### Ten tracks at once is not listening
+
+Measured at 04:46:01: ten tracks from one album, each read 1.4 MB over exactly 27
+seconds, all beginning in the same second, from one client. Each scored `PLAY` —
+coverage 0.18–0.37 and monotonic 0.91 satisfy every per-file test.
+
+Nothing about one file's read pattern can reject this. It is only recognisable
+against its neighbours, which is the bulk guard's job, and it is why that guard
+counts **all** of a client's recent sessions rather than only whole-file ones. Seen
+in isolation, ten files is under the default threshold and still classifies as
+`PLAY`; seen inside the scan wave it actually occurred in, all ten are suppressed.
+
 ### Reads on datasets you did not ask about
 
 The tap sees **every** NFS read the server handles, including exports that have
