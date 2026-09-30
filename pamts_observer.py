@@ -36,6 +36,7 @@ have, and path resolution is the expensive part of this problem, so getting
 coverage for free matters.
 """
 import re
+import threading
 from collections import defaultdict, deque
 
 KB = 1024
@@ -482,12 +483,28 @@ class SessionTracker:
         # decision has to be made from a rolling window instead.
         self._recent = defaultdict(deque)
         self.bulk = 0
+        # A daemon closes sessions from TWO threads: the ingest loop via add(),
+        # and a timer via tick() -- because a session ends by going quiet, which
+        # no arriving record can signal. Both mutate _open, which crashed under a
+        # library scan with "dictionary changed size during iteration" and with a
+        # KeyError when both raced to close the same session.
+        #
+        # The lock is held only while mutating. on_close() is dispatched OUTSIDE
+        # it, because it writes to SQLite and may rebuild the path index, and
+        # stalling ingest for that long would overflow the kernel ring buffer.
+        self._lock = threading.RLock()
         self._open = {}          # key -> {"reqs": [...], "pending": {xid: Request}}
         self.closed = 0
         self.dropped = 0
 
     # -- ingest ------------------------------------------------------------
     def add(self, rec):
+        with self._lock:
+            self._ingest(rec)
+        # sweep outside the ingest critical section; it dispatches callbacks
+        self._sweep(rec.ts)
+
+    def _ingest(self, rec):
         key = rec.key
         st = self._open.get(key)
         if st is None:
@@ -532,44 +549,60 @@ class SessionTracker:
             st["reqs"].append(cur)
             del pend[rec.xid]
 
-        # An idle sweep driven by the record clock, so replaying a capture
-        # behaves the same as live traffic.
-        self._sweep(rec.ts)
 
     # -- closing -----------------------------------------------------------
     def _sweep(self, now):
-        # Close idle sessions FIRST. Otherwise a session that has already gone
-        # quiet gets checkpointed and then immediately closed, writing the same
-        # play twice for no benefit.
-        gap = self.cfg["idle_gap"]
-        for key in [k for k, st in self._open.items() if now - st["last"] > gap]:
-            self._close(key)
+        """Close what has gone quiet and checkpoint what is still going.
 
-        after = self.cfg.get("checkpoint_after") or 0
-        if not after:
-            return
-        for key, st in list(self._open.items()):
-            if st["checkpointed"] or now - st["first"] < after:
-                continue
-            reqs = st["reqs"] + list(st["pending"].values())
-            if not reqs:
-                continue
-            sig = self._sig(key, reqs)
-            if classify(sig, self.cfg) == "PLAY":
-                st["checkpointed"] = True
-                self.checkpoints += 1
-                if self.on_close:
-                    # The checkpoint IS the first report of this session, so it
-                    # carries the increment; the later close must not.
-                    self.on_close(key, sig, "PLAY", True)
+        Everything that touches shared state happens under the lock; the
+        callbacks are fired afterwards, so a slow consumer cannot block ingest.
+        """
+        pending = []
+        with self._lock:
+            # Close idle sessions FIRST. Otherwise a session that has already
+            # gone quiet gets checkpointed and then immediately closed, writing
+            # the same play twice for no benefit.
+            gap = self.cfg["idle_gap"]
+            for key in [k for k, st in list(self._open.items())
+                        if now - st["last"] > gap]:
+                got = self._pop(key)
+                if got:
+                    pending.append(got)
+
+            after = self.cfg.get("checkpoint_after") or 0
+            if after:
+                for key, st in list(self._open.items()):
+                    if st["checkpointed"] or now - st["first"] < after:
+                        continue
+                    reqs = st["reqs"] + list(st["pending"].values())
+                    if not reqs:
+                        continue
+                    sig = self._sig(key, reqs)
+                    if classify(sig, self.cfg) == "PLAY":
+                        st["checkpointed"] = True
+                        self.checkpoints += 1
+                        # The checkpoint IS the first report of this session, so
+                        # it carries the increment; the later close must not.
+                        pending.append((key, sig, "PLAY", True))
+
+        for key, sig, label, first in pending:
+            if self.on_close:
+                self.on_close(key, sig, label, first)
 
     def tick(self, now):
         """Close sessions that have gone quiet. Safe to call as often as you like."""
         self._sweep(now)
 
     def flush(self):
-        for key in list(self._open):
-            self._close(key)
+        pending = []
+        with self._lock:
+            for key in list(self._open):
+                got = self._pop(key)
+                if got:
+                    pending.append(got)
+        for key, sig, label, first in pending:
+            if self.on_close:
+                self.on_close(key, sig, label, first)
 
     def _sig(self, key, reqs):
         sig = signature(reqs, self.cfg)
@@ -594,8 +627,12 @@ class SessionTracker:
             q.popleft()
         return len({k for _, k in q})
 
-    def _close(self, key):
-        st = self._open.pop(key)
+    def _pop(self, key):
+        """Remove a session and return (key, sig, label, first). Caller holds the
+        lock and is responsible for dispatching the callback."""
+        st = self._open.pop(key, None)
+        if st is None:
+            return None                  # another thread closed it first
         reqs = st["reqs"] + list(st["pending"].values())
         if not reqs:
             self.dropped += 1
@@ -612,18 +649,18 @@ class SessionTracker:
             label = "BULK"
             self.bulk += 1
         self.closed += 1
-        if self.on_close:
-            # `first` is False when this session was already reported mid-flight,
-            # so the consumer can refresh it without counting the play twice.
-            self.on_close(key, sig, label, not st["checkpointed"])
-        return sig, label
+        # `first` is False when this session was already reported mid-flight, so
+        # the consumer can refresh it without counting the play twice.
+        return key, sig, label, not st["checkpointed"]
 
     @property
     def open_sessions(self):
         """Sessions in flight, for a "what is playing right now" endpoint."""
         out = []
-        for key, st in self._open.items():
-            reqs = st["reqs"] + list(st["pending"].values())
+        with self._lock:
+            snapshot = [(k, st["reqs"] + list(st["pending"].values()))
+                        for k, st in self._open.items()]
+        for key, reqs in snapshot:
             if not reqs:
                 continue
             sig = self._sig(key, reqs)

@@ -450,9 +450,15 @@ def main(argv=None):
     # Sessions close on silence, so something must close them when no records
     # arrive at all -- otherwise the last play of the night is never reported.
     def reaper():
+        # If this thread dies, sessions stop being closed and the daemon goes
+        # quietly deaf -- which is exactly what happened when an unhandled
+        # KeyError killed it. Never let one bad tick end the loop.
         while True:
             time.sleep(min(5.0, args.idle_gap / 2))
-            tracker.tick(time.clock_gettime(time.CLOCK_MONOTONIC))
+            try:
+                tracker.tick(time.clock_gettime(time.CLOCK_MONOTONIC))
+            except Exception:                                   # noqa: BLE001
+                logging.exception("reaper tick failed; continuing")
     threading.Thread(target=reaper, daemon=True).start()
 
     if args.prune_every > 0:

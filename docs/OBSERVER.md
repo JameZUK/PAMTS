@@ -383,6 +383,33 @@ records from any other device before they become sessions. `foreign_device_recor
 in `/stats` counts them. `--all-devices` disables the filter, which is the thing to
 reach for when something you expect to see is not appearing.
 
+### The tracker is used from two threads
+
+A session ends by going **quiet**, which no arriving record can signal, so a daemon
+needs a timer to close them. That means `SessionTracker` is driven from two
+threads: the ingest loop through `add()`, and the timer through `tick()`. Both
+sweep the open-session map.
+
+Unlocked, that survived days of light traffic and then crash-looped five times
+under a library scan:
+
+```
+RuntimeError: dictionary changed size during iteration
+KeyError: (45, 153743, '172.16.32.102')     # both threads closed the same session
+```
+
+The lock is held only while mutating. `on_close()` is dispatched **outside** it,
+because it writes to SQLite and may rebuild the path index, and stalling ingest
+for that long would overflow the kernel ring buffer.
+
+The reaper also catches and logs its own exceptions rather than dying: when its
+thread died, the daemon stopped closing sessions and went quietly deaf, which
+looks exactly like an idle estate from the outside.
+
+The regression test needs thousands of open sessions and `setswitchinterval(1e-6)`
+to reproduce this. A gentler version passed happily against the unlocked code and
+proved nothing.
+
 ### Shutdown
 
 Do not rely on `KeyboardInterrupt` propagating out of a ctypes call blocked inside

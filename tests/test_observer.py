@@ -389,6 +389,67 @@ check("the scan itself is still PROBE, not BULK",
       inwave.count("PROBE") == 60, str(inwave.count("PROBE")))
 
 print("")
+print("thread safety (a daemon closes sessions from two threads)")
+import sys as _sys                                              # noqa: E402
+import threading as _th                                         # noqa: E402
+
+# A live daemon crashed here under a library scan: the ingest loop and the idle
+# timer both sweep _open, giving "dictionary changed size during iteration" and a
+# KeyError when both raced to close the same session.
+#
+# Reproducing it needs MANY open sessions, so the sweep's comprehension is long
+# enough to be preempted, and an aggressive switch interval. A gentler version of
+# this test passed happily against the unlocked code and proved nothing.
+_errors = []
+_old_switch = _sys.getswitchinterval()
+_sys.setswitchinterval(1e-6)
+_tr = obs.SessionTracker({"idle_gap": 5.0, "checkpoint_after": 0},
+                         on_close=lambda k, s, l, f: None)
+for _i in range(6000):                       # a big population of open sessions
+    _tr.add(obs.Record(ts=1000.0, kind="read_done", xid=_i & 0xffff, offset=0,
+                       length=4096, ino=90000 + _i, dev=45, client="10.0.0.1"))
+_stop = _th.Event()
+
+
+def _churn():
+    try:
+        i = 0
+        while not _stop.is_set():
+            i += 1
+            _tr.add(obs.Record(ts=1000.0 + (i % 3) * 0.001, kind="read_done",
+                               xid=i & 0xffff, offset=0, length=4096,
+                               ino=500000 + i, dev=45, client="10.0.0.2"))
+    except Exception as e:                                      # noqa: BLE001
+        _errors.append(("churn", repr(e)))
+
+
+def _reap():
+    try:
+        t = 1000.0
+        while not _stop.is_set():
+            t += 0.5
+            _tr.tick(t)                      # ages sessions out under the churn
+    except Exception as e:                                      # noqa: BLE001
+        _errors.append(("reaper", repr(e)))
+
+
+_threads = [_th.Thread(target=_churn), _th.Thread(target=_reap),
+            _th.Thread(target=_reap)]
+for _t in _threads:
+    _t.start()
+_time_mod = __import__("time")
+_time_mod.sleep(1.5)
+_stop.set()
+for _t in _threads:
+    _t.join(timeout=10)
+_sys.setswitchinterval(_old_switch)
+check("concurrent add() and tick() do not race", not _errors, str(_errors[:2]))
+_tr.flush()
+check("everything is closed after flush", len(_tr._open) == 0, str(len(_tr._open)))
+check("open_sessions is safe to read concurrently",
+      isinstance(_tr.open_sessions, list))
+
+print("")
 print("and legitimate use must survive the guard")
 ep = []
 for b in range(6):
