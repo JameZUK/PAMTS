@@ -613,19 +613,36 @@ class SessionTracker:
 
     def _note(self, sig):
         """Record this file against its client, and say how many distinct files
-        that client has touched in the bulk window.
+        that client touched in the window BEFORE it.
 
         Counting DISTINCT FILES, not sessions, is the point: one viewer re-reading
         one file in bursts must not look like a sweep, while a scanner walking a
         library touches hundreds of different files in the same period.
+
+        History is kept for twice the window, so the same session can later be
+        judged against what arrived AFTER it too -- see files_in_window().
         """
         window = self.cfg["bulk_window"]
         now, client = sig["t_last"], sig.get("client")
         q = self._recent[client]
         q.append((now, (sig.get("dev"), sig.get("ino"), sig.get("fh"))))
-        while q and now - q[0][0] > window:
+        while q and now - q[0][0] > 2 * window:
             q.popleft()
-        return len({k for _, k in q})
+        return len({k for t, k in q if now - t <= window})
+
+    def files_in_window(self, client, ts, half=None):
+        """Distinct files this client touched within +/- half of `ts`.
+
+        A rolling window can only ever look backwards, so the first files of a
+        sweep are indistinguishable from a genuine play -- there is nothing yet to
+        compare them against. Judging a session once the window has passed sees
+        the sweep from both sides and removes that blind spot entirely.
+        """
+        if half is None:
+            half = self.cfg["bulk_window"]
+        with self._lock:
+            q = list(self._recent.get(client, ()))
+        return len({k for t, k in q if abs(t - ts) <= half})
 
     def _pop(self, key):
         """Remove a session and return (key, sig, label, first). Caller holds the

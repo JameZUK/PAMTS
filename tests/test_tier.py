@@ -16,22 +16,18 @@ import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import pamts                                                    # noqa: E402
+from _harness import check, summary, skip                       # noqa: E402
 
 spec = importlib.util.spec_from_file_location("pamts_tier", ROOT / "pamts-tier.py")
 tier = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(tier)
 
 GB = 1024 ** 3
-fails = []
 captured = []          # every rsync argv the module builds
 
 
-def check(name, cond, detail=""):
-    print(f"  {'PASS' if cond else 'FAIL'}  {name}"
-          + (f"  -- {detail}" if detail and not cond else ""))
-    if not cond:
-        fails.append(name)
 
 
 _real = tier.run_rsync
@@ -873,6 +869,4 @@ check("half-full is in between",
 check("over budget still pins one", pamts.pin_depth(B * 2, B) == 1,
       str(pamts.pin_depth(B * 2, B)))
 
-print()
-print(f"{'ALL TESTS PASSED' if not fails else 'FAILURES: ' + ', '.join(fails)}")
-sys.exit(1 if fails else 0)
+summary()

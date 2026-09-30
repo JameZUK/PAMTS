@@ -12,12 +12,9 @@ import json, os, sys, tempfile, threading, shutil
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-import pamts, pamts_players as pp
-
-fails = []
-def check(name, cond, detail=""):
-    print(("  ok   " if cond else "  FAIL ") + name + (f" -- {detail}" if not cond and detail else ""))
-    if not cond: fails.append(name)
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import pamts, pamts_players as pp                               # noqa: E402
+from _harness import check, summary                             # noqa: E402
 
 tmp = tempfile.mkdtemp()
 fast = os.path.join(tmp, "cache"); slow = os.path.join(tmp, "store")
@@ -107,6 +104,4 @@ check("library_items returns None (not []) on failure", bad.library_items() is N
 check("now_playing returns [] on failure", bad.now_playing() == [])
 
 srv.shutdown(); shutil.rmtree(tmp, ignore_errors=True)
-print()
-if fails: print(f"{len(fails)} FAILED: {', '.join(fails)}"); sys.exit(1)
-print("all adapter checks passed")
+summary()

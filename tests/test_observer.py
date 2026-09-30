@@ -15,18 +15,12 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _harness import check, summary, skip                       # noqa: E402
+
 import pamts_observer as obs                                    # noqa: E402
 
 MB = obs.MB
-fails = []
-
-
-def check(name, cond, detail=""):
-    if cond:
-        print(f"  ok   {name}")
-    else:
-        print(f"  FAIL {name}" + (f" -- {detail}" if detail else ""))
-        fails.append(name)
 
 
 def line(ts, tp, xid, fh, offset, length=None, status=None):
@@ -476,9 +470,4 @@ for b in range(40):
                  9000 * MB, hit_eof=False)
 _, tr = labels_for(many, {"idle_gap": 1.5, "checkpoint_after": 0})
 check("40 bursts on ONE file are not a sweep", tr.bulk == 0, str(tr.bulk))
-
-print()
-if fails:
-    print(f"{len(fails)} FAILED: {', '.join(fails)}")
-    sys.exit(1)
-print("all checks passed")
+summary()

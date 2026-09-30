@@ -17,19 +17,15 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _harness import check, summary, skip                       # noqa: E402
+
+import pamts_observer as obs                                    # noqa: E402
 spec = importlib.util.spec_from_file_location(
     "observerd", ROOT / "observer" / "pamts-observerd.py")
 d = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(d)
 
-fails = []
-
-
-def check(name, cond, detail=""):
-    print(("  ok   " if cond else "  FAIL ") + name +
-          (f" -- {detail}" if not cond and detail else ""))
-    if not cond:
-        fails.append(name)
 
 
 # --- device encoding ---------------------------------------------------------
@@ -171,6 +167,96 @@ small.prune()
 check("prune bounds the sessions table", small.counts()["sessions"] == 3,
       str(small.counts()["sessions"]))
 
+# --- deferred demand ---------------------------------------------------------
+print("\ndeferring the demand decision until a sweep is visible")
+
+# Measured on a live server: two album tracks recorded as plays at 02:00, because
+# a rolling window can only look BACKWARDS and they arrived near the start of a
+# scan. That same client touched 55 distinct files within +/-120s of them.
+dtmp = tempfile.mkdtemp()
+dstore = d.Store(os.path.join(dtmp, "d.db"))
+
+
+class _Idx:
+    files = builds = 0
+    last_build_s = 0.0
+    devs = {45}
+
+    def lookup(self, dev, ino, allow_rebuild=True):
+        return "/m/track%d.flac" % ino
+
+
+dtracker = obs.SessionTracker({"bulk_window": 120.0, "bulk_min_files": 25})
+dd = d.Daemon(dstore, _Idx(), dtracker, {"bulk_window": 120.0,
+                                         "bulk_min_files": 25},
+              log_sessions=False, defer=True)
+
+
+def dsig(ino, ts, client="10.0.0.11"):
+    return {"bytes": 4 << 20, "coverage": 1.0, "duration": 2.0, "rate": 2 << 20,
+            "requests": 32, "monotonic": 1.0, "method": "splice", "dev": 45,
+            "ino": ino, "client": client, "t_first": ts, "t_last": ts}
+
+
+dd.on_close((45, 7, "10.0.0.11"), dsig(7, 1000.0), "FETCH", True)
+check("a demand decision is held, not written", dstore.history() == [] and
+      len(dd._pending) == 1, str(len(dd._pending)))
+check("but the session is logged immediately",
+      dstore.counts()["sessions"] == 1, str(dstore.counts()["sessions"]))
+
+# the sweep arrives AFTER it, which a backwards-only window could never see
+for i in range(40):
+    dtracker._note(dsig(100 + i, 1010.0 + i))
+dd.flush_pending(1000.0 + 130, force=False)
+check("once the sweep is visible the play is suppressed",
+      dstore.history() == [], str(dstore.history()))
+check("and it is counted as suppressed", dd.deferred_suppressed == 1,
+      str(dd.deferred_suppressed))
+check("the session row is corrected to BULK",
+      sqlite3.connect(os.path.join(dtmp, "d.db")).execute(
+          "SELECT label FROM sessions").fetchone()[0] == "BULK")
+
+# an isolated play must still be written
+dd2 = d.Daemon(d.Store(os.path.join(dtmp, "e.db")), _Idx(),
+               obs.SessionTracker({"bulk_window": 120.0, "bulk_min_files": 25}),
+               {"bulk_window": 120.0, "bulk_min_files": 25},
+               log_sessions=False, defer=True)
+dd2.on_close((45, 9, "10.0.0.20"), dsig(9, 2000.0, "10.0.0.20"), "PLAY", True)
+dd2.flush_pending(2000.0 + 130)
+check("an isolated play is written after the hold",
+      len(dd2.store.history()) == 1, str(len(dd2.store.history())))
+check("and counted as written", dd2.deferred_written == 1)
+check("nothing is left pending", not dd2._pending)
+
+# shutdown must judge held decisions, never drop them
+dd3 = d.Daemon(d.Store(os.path.join(dtmp, "f.db")), _Idx(),
+               obs.SessionTracker({"bulk_window": 120.0, "bulk_min_files": 25}),
+               {"bulk_window": 120.0, "bulk_min_files": 25},
+               log_sessions=False, defer=True)
+dd3.on_close((45, 11, "10.0.0.20"), dsig(11, 3000.0, "10.0.0.20"), "PLAY", True)
+check("still pending before shutdown", len(dd3._pending) == 1)
+dd3.flush_pending(3000.0, force=True)
+check("force releases held decisions at shutdown",
+      len(dd3.store.history()) == 1 and not dd3._pending,
+      str(len(dd3.store.history())))
+
+# --defer off writes straight through
+dd4 = d.Daemon(d.Store(os.path.join(dtmp, "g.db")), _Idx(),
+               obs.SessionTracker(), {}, log_sessions=False, defer=False)
+dd4.on_close((45, 13, "c"), dsig(13, 4000.0, "c"), "PLAY", True)
+check("defer=False writes immediately", len(dd4.store.history()) == 1)
+
+# non-media is never queued at all
+dd5 = d.Daemon(d.Store(os.path.join(dtmp, "h.db")), type("I", (), {
+    "files": 0, "builds": 0, "last_build_s": 0.0, "devs": {45},
+    "lookup": lambda self, dev, ino, allow_rebuild=True: "/m/cover.jpg"})(),
+    obs.SessionTracker(), {}, log_sessions=False, defer=True)
+dd5.on_close((45, 15, "c"), dsig(15, 5000.0, "c"), "FETCH", True)
+check("artwork is never even queued", not dd5._pending and dd5.non_media == 1)
+
+shutil_mod = __import__("shutil")
+shutil_mod.rmtree(dtmp, ignore_errors=True)
+
 # --- clocks ------------------------------------------------------------------
 print("\nclocks")
 be = d.boot_epoch()
@@ -181,9 +267,4 @@ check("boot_epoch is positive and not absurd", 0 < be < time.time())
 
 import shutil                                                   # noqa: E402
 shutil.rmtree(tmp, ignore_errors=True)
-
-print()
-if fails:
-    print(f"{len(fails)} FAILED: {', '.join(fails)}")
-    sys.exit(1)
-print("all checks passed")
+summary()

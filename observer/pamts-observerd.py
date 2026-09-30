@@ -200,16 +200,33 @@ class Store:
             self._local.c = c
         return c
 
-    def record(self, path, sig, label, epoch_ts, count_it=True):
+    def record_session(self, path, sig, label, epoch_ts):
+        """Log the session. Always happens, immediately, whatever the verdict."""
         c = self._conn()
         with c:
-            c.execute(
+            cur = c.execute(
                 "INSERT INTO sessions(ts,path,dev,ino,client,label,bytes,coverage,"
                 "duration,rate,requests,monotonic,method) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (epoch_ts, path, sig.get("dev"), sig.get("ino"), sig.get("client"),
                  label, sig["bytes"], sig["coverage"], sig["duration"], sig["rate"],
                  sig["requests"], sig["monotonic"], sig["method"]))
+            return cur.lastrowid
+
+    def relabel_session(self, rowid, label):
+        """Correct a session's label once a later verdict overrides it, so the
+        log never disagrees with what actually reached play history."""
+        if rowid is None:
+            return
+        c = self._conn()
+        with c:
+            c.execute("UPDATE sessions SET label = ? WHERE rowid = ?", (label, rowid))
+
+    def record_play(self, path, sig, label, epoch_ts, count_it=True):
+        """Advance play history. Separated from session logging so the decision
+        can be deferred until a sweep would have become visible."""
+        c = self._conn()
+        with c:
             # The media check lives HERE rather than in the caller, so no code
             # path can record artwork as demand by forgetting to filter. One live
             # scan put 1,350 .jpg files into play history exactly that way.
@@ -233,6 +250,12 @@ class Store:
                     "  updated=excluded.updated",
                     (path, epoch_ts, inc, label, sig["bytes"],
                      time.time(), inc))
+
+    def record(self, path, sig, label, epoch_ts, count_it=True):
+        """Log the session and advance history in one step, with no deferral.
+        The daemon uses the split pair instead; this stays for simple callers."""
+        self.record_session(path, sig, label, epoch_ts)
+        self.record_play(path, sig, label, epoch_ts, count_it)
 
     def history(self, since=0.0, limit=100_000):
         c = self._conn()
@@ -263,9 +286,22 @@ class Store:
 # ---------------------------------------------------------------------------
 
 class Daemon:
-    def __init__(self, store, index, tracker, cfg, log_sessions=True):
+    def __init__(self, store, index, tracker, cfg, log_sessions=True,
+                 defer=True):
         self.store, self.index, self.tracker, self.cfg = store, index, tracker, cfg
         self.log_sessions = log_sessions
+        # A rolling window can only look backwards, so the first files of a sweep
+        # have nothing to be compared against and record as demand -- two tracks
+        # of an album leaked into history that way. Holding the decision until the
+        # window has passed lets the sweep be seen from both sides.
+        #
+        # This costs nothing that matters: promotion reads /sessions for what is
+        # playing NOW, and only /history lags, by bulk_window.
+        self.defer = defer
+        self._pending = []
+        self._plock = threading.Lock()
+        self.deferred_suppressed = 0
+        self.deferred_written = 0
         self.started = time.time()
         self.records = 0
         self.unresolved = 0
@@ -288,7 +324,21 @@ class Daemon:
         # play history. The session is still logged, so nothing is hidden.
         if path is not None and not obs.is_media(path):
             self.non_media += 1
-        self.store.record(path, sig, label, epoch, count_it=first)
+        rowid = self.store.record_session(path, sig, label, epoch)
+
+        is_demand = bool(path) and label in DEMAND and obs.is_media(path)
+        if not is_demand:
+            return
+        if not self.defer:
+            self.store.record_play(path, sig, label, epoch, count_it=first)
+            self.deferred_written += 1
+            return
+        with self._plock:
+            self._pending.append({
+                "path": path, "sig": sig, "label": label, "epoch": epoch,
+                "first": first, "rowid": rowid,
+                "client": sig.get("client"), "ts": sig["t_last"],
+            })
         if self.log_sessions:
             cov = "?" if sig["coverage"] is None else f"{sig['coverage']:.2f}"
             rate = "-" if not sig["rate"] else f"{sig['rate'] / (1 << 20):.1f}MB/s"
@@ -298,6 +348,33 @@ class Daemon:
                 sig["duration"], rate, sig["requests"],
                 path or f"<unresolved dev={sig['dev']} ino={sig['ino']}>",
                 "" if first else "  (refresh)")
+
+    def flush_pending(self, now_mono, force=False):
+        """Release held demand decisions once they can be judged fairly.
+
+        Re-counts the client's distinct files SYMMETRICALLY around the session, so
+        a sweep is recognised whether the session fell at its start, middle or end.
+        """
+        window = self.cfg.get("bulk_window", obs.DEFAULTS["bulk_window"])
+        minf = self.cfg.get("bulk_min_files", obs.DEFAULTS["bulk_min_files"])
+        ready, keep = [], []
+        with self._plock:
+            for e in self._pending:
+                (ready if force or now_mono - e["ts"] >= window else keep).append(e)
+            self._pending = keep
+        for e in ready:
+            n = self.tracker.files_in_window(e["client"], e["ts"], window)
+            if n >= minf:
+                self.deferred_suppressed += 1
+                # keep the log honest about what actually happened
+                self.store.relabel_session(e["rowid"], "BULK")
+                if self.log_sessions:
+                    logging.info("BULK   %-15s suppressed on review (%d files in "
+                                 "window) %s", e["client"] or "?", n, e["path"])
+                continue
+            self.store.record_play(e["path"], e["sig"], e["label"], e["epoch"],
+                                   count_it=e["first"])
+            self.deferred_written += 1
 
     def stats(self):
         return {
@@ -311,6 +388,9 @@ class Daemon:
             "foreign_device_records": self.foreign,
             "non_media_sessions": self.non_media,
             "bulk_suppressed": self.tracker.bulk,
+            "deferred_pending": len(self._pending),
+            "deferred_suppressed": self.deferred_suppressed,
+            "deferred_written": self.deferred_written,
             "index_files": self.index.files,
             "index_builds": self.index.builds,
             "index_build_s": round(self.index.last_build_s, 1),
@@ -411,11 +491,19 @@ def main(argv=None):
                          "a long run must prune periodically or the table grows "
                          "without bound")
     ap.add_argument("--keep-sessions", type=int, default=200_000)
+    ap.add_argument("--bulk-window", type=float,
+                    default=obs.DEFAULTS["bulk_window"])
+    ap.add_argument("--bulk-min-files", type=int,
+                    default=obs.DEFAULTS["bulk_min_files"])
     ap.add_argument("--replay-gap", type=float, default=1800.0,
                     help="seconds within which the same file counts as the SAME "
                          "viewing rather than a new play; players read in bursts "
                          "with long gaps, so without this one episode counts "
                          "several times")
+    ap.add_argument("--no-defer", action="store_true",
+                    help="write play history immediately instead of holding it for "
+                         "bulk_window; faster to observe, but the first files of a "
+                         "sweep will be recorded as plays")
     ap.add_argument("--all-devices", action="store_true",
                     help="do not drop reads on devices outside --root; useful for "
                          "diagnosing why something is not being seen")
@@ -423,7 +511,9 @@ def main(argv=None):
 
     os.makedirs(os.path.dirname(args.db), exist_ok=True)
     cfg = {"idle_gap": args.idle_gap,
-           "checkpoint_after": args.checkpoint_after}
+           "checkpoint_after": args.checkpoint_after,
+           "bulk_window": args.bulk_window,
+           "bulk_min_files": args.bulk_min_files}
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
@@ -436,7 +526,8 @@ def main(argv=None):
                   replay_gap=args.replay_gap)
     tracker = obs.SessionTracker(cfg)
     daemon = Daemon(store, index, tracker, cfg,
-                    log_sessions=not args.quiet_sessions)
+                    log_sessions=not args.quiet_sessions,
+                    defer=not args.no_defer)
     tracker.on_close = daemon.on_close
 
     httpd = None
@@ -456,7 +547,9 @@ def main(argv=None):
         while True:
             time.sleep(min(5.0, args.idle_gap / 2))
             try:
-                tracker.tick(time.clock_gettime(time.CLOCK_MONOTONIC))
+                now = time.clock_gettime(time.CLOCK_MONOTONIC)
+                tracker.tick(now)
+                daemon.flush_pending(now)
             except Exception:                                   # noqa: BLE001
                 logging.exception("reaper tick failed; continuing")
     threading.Thread(target=reaper, daemon=True).start()
@@ -515,6 +608,9 @@ def main(argv=None):
             collector.stop()
     finally:
         tracker.flush()
+        # Held decisions must still be judged, not silently dropped: the window
+        # history is retained long enough to rule on them at shutdown.
+        daemon.flush_pending(time.clock_gettime(time.CLOCK_MONOTONIC), force=True)
         store.prune()
         if httpd:
             threading.Thread(target=httpd.shutdown, daemon=True).start()

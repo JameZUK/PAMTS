@@ -351,13 +351,22 @@ demand. `is_media()` now restricts play history to media extensions, and the che
 lives inside `Store.record` rather than in its caller, so no code path can bypass
 it by forgetting.
 
-**A limitation to know about.** A rolling window cannot recognise a sweep until
-enough of it has arrived, so the first `bulk_min_files` files still record as
-demand. For artwork that no longer matters — the extension filter catches all of
-it — but a music scan that reads whole tracks can still leak its first two dozen.
-Recording demand only after the window has closed would remove that entirely, at
-the cost of history lagging by `bulk_window`; promotion reads `/sessions`, not
-`/history`, so that latency would be harmless.
+**The demand decision is deferred, and this is why.** A rolling window can only
+look *backwards*, so the first files of a sweep have nothing to be compared
+against and score as genuine demand. That is not hypothetical: two tracks of one
+album reached play history at 02:00 because they arrived near the *start* of a
+scan.
+
+So a demand verdict is held for `bulk_window` and then judged against the client's
+distinct files **symmetrically**, within ±`bulk_window` of the session. Seen from
+both sides, the sweep is unmistakable — those two tracks had **55 distinct files**
+around them — and the session row is relabelled `BULK` so the log never disagrees
+with history.
+
+This costs nothing that matters. The session is logged immediately, so nothing is
+hidden; only `/history` lags, by one window. Promotion reads `/sessions` for what
+is playing *now*, which is unaffected. `--no-defer` restores the old behaviour for
+anyone who wants history written immediately and will accept the leak.
 
 ### Ten tracks at once is not listening
 

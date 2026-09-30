@@ -14,6 +14,7 @@ import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import pamts                                                     # noqa: E402
 import pamts_players                                             # noqa: E402
 from pamts_players import Candidate, Caps, PlayEvent             # noqa: E402
@@ -28,13 +29,20 @@ if shutil.which("rsync") is None:
     sys.exit(77)
 
 GB = 1024 ** 3
-fails = []
+
+
+from _harness import check as _check, summary                  # noqa: E402
 
 
 def check(cond, msg):
-    print(("  PASS  " if cond else "  FAIL  ") + msg)
-    if not cond:
-        fails.append(msg)
+    """This suite has always taken (cond, msg), the opposite of every other one.
+
+    Rather than rewrite ~100 call sites and risk transcribing one wrongly, the
+    order is adapted here and the shared harness does the asserting -- so output
+    and counting are identical everywhere, and the harness still rejects a call
+    whose arguments are the wrong way round.
+    """
+    return _check(msg, cond)
 
 
 def mkfile(path, size):
@@ -499,10 +507,7 @@ def main():
               for i in (5, 6)), "both files landed on fast storage")
 
     shutil.rmtree(tmp, ignore_errors=True)
-    print(f"\n=== {len(fails)} failure(s)")
-    for f in fails:
-        print(f"    {f}")
-    return 1 if fails else 0
+    summary()                      # exits; SystemExit propagates out of main()
 
 
 if __name__ == "__main__":
