@@ -240,9 +240,16 @@ class Store:
                         (path,)).fetchone()
                     if prev and (epoch_ts - prev[0]) < self.replay_gap:
                         inc = 0          # same viewing, resumed after a buffer gap
+                # An INSERT means this is the first time the file has reached play
+                # history, so it counts -- whatever count_it said. Otherwise a session
+                # whose mid-flight report was suppressed but whose final report was
+                # admitted creates a row with play_count = 0, which is not a state that
+                # can mean anything. Observed on a real run: a FLAC listened to for
+                # 212s was suppressed at its 61s checkpoint because a scan overlapped,
+                # then admitted on close, and landed as count 0.
                 c.execute(
                     "INSERT INTO plays(path,last_play,play_count,last_label,last_bytes,updated) "
-                    "VALUES(?,?,?,?,?,?) "
+                    "VALUES(?,?,MAX(?,1),?,?,?) "
                     "ON CONFLICT(path) DO UPDATE SET "
                     "  last_play=MAX(last_play,excluded.last_play), "
                     "  play_count=play_count+?, last_label=excluded.last_label, "

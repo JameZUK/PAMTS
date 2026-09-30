@@ -380,6 +380,31 @@ counts **all** of a client's recent sessions rather than only whole-file ones. S
 in isolation, ten files is under the default threshold and still classifies as
 `PLAY`; seen inside the scan wave it actually occurred in, all ten are suppressed.
 
+### Listening during a scan, and why suppression must not be sticky
+
+The bulk guard judges a session against its neighbours, so a genuine play that
+happens to overlap a library scan can be suppressed. Observed on a real run:
+
+```
+10:44:39  BULK    9.23 MB   61s   <- the checkpoint, suppressed on review
+10:47:10  PLAY   24.59 MB  212s   <- the close, admitted
+```
+
+Same session, opposite verdicts. The close is right: 24.59 MB over 212 s is about
+930 kbps, which is real-time FLAC playback. The checkpoint was suppressed only
+because a scan was running at the same moment.
+
+The tempting fix — remember the suppression and apply it to the close — is **wrong**.
+It would permanently discard a real play for the crime of coinciding with a scan. The
+final report has strictly more evidence than a 61-second checkpoint, so letting it
+override is the correct behaviour.
+
+What that exposed instead was a genuine bug: the close carried `count_it=False`
+(because the session had been checkpointed), so the only write to `plays` inserted a
+row with **`play_count = 0`** — a state that cannot mean anything. An INSERT now
+always counts at least one, because a row existing *is* the record that a play
+happened.
+
 ### Reads on datasets you did not ask about
 
 The tap sees **every** NFS read the server handles, including exports that have

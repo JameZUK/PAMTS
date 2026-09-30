@@ -155,6 +155,22 @@ rs2.record(P, sig(), "PLAY", 1001.0, count_it=True)
 check("replay_gap=0 disables the de-duplication",
       rs2.history()[0]["play_count"] == 2, str(rs2.history()[0]["play_count"]))
 
+# a row that exists must mean a play happened
+print("\n  no impossible play_count")
+zs = d.Store(os.path.join(tmp, "z.db"))
+# The real sequence that produced count=0: a FLAC listened to for 212s was
+# suppressed at its 61s checkpoint because a scan overlapped, then admitted on
+# close -- so the only write carried count_it=False.
+zs.record("/m/t.flac", sig(), "PLAY", 1000.0, count_it=False)
+check("a close-only write still counts once",
+      zs.history()[0]["play_count"] == 1, str(zs.history()[0]["play_count"]))
+zs.record("/m/u.flac", sig(), "PLAY", 2000.0, count_it=True)
+zs.record("/m/u.flac", sig(), "PLAY", 2100.0, count_it=False)
+check("a checkpoint plus close still counts once",
+      [r for r in zs.history() if r["path"] == "/m/u.flac"][0]["play_count"] == 1)
+check("no row can have play_count below 1",
+      all(r["play_count"] >= 1 for r in zs.history()))
+
 # history filtering
 check("since= filters history", len(store.history(since=2000.0)) == 1,
       str(len(store.history(since=2000.0))))
