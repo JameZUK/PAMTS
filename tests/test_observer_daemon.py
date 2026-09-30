@@ -14,6 +14,7 @@ import pathlib
 import sqlite3
 import sys
 import tempfile
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -69,9 +70,23 @@ st2 = os.stat(f2)
 check("a new file misses a fresh index",
       idx.lookup(d.kdev(st2.st_dev), st2.st_ino, allow_rebuild=False) is None)
 idx.max_age = 0.0                        # pretend it is stale
-check("a new file is found after rebuild",
-      idx.lookup(d.kdev(st2.st_dev), st2.st_ino) == f2)
-check("rebuilding happened", idx.builds == 2, f"{idx.builds}")
+# The rebuild is ASYNC: it must not run inline, because lookup() is called from
+# the ingest path and a rebuild measured 87.9s under pool contention -- stalling
+# there stops draining the kernel ring buffer and silently loses events. So the
+# miss stays a miss until the rebuild lands.
+check("a stale miss does not block the caller",
+      idx.lookup(d.kdev(st2.st_dev), st2.st_ino) is None)
+for _ in range(200):                     # let the background rebuild finish
+    if idx.builds >= 2:
+        break
+    time.sleep(0.02)
+check("the rebuild happened in the background", idx.builds == 2, f"{idx.builds}")
+check("and the new file resolves afterwards",
+      idx.lookup(d.kdev(st2.st_dev), st2.st_ino, allow_rebuild=False) == f2)
+check("a rebuild already running is not started twice",
+      (idx.__dict__.update({"_rebuilding": True}),
+       idx.rebuild_async())[1] is False)
+idx._rebuilding = False
 
 check("a missing root is tolerated",
       d.InodeIndex([os.path.join(tmp, "does-not-exist")]).build() == 0)

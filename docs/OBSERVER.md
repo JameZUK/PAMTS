@@ -444,6 +444,30 @@ The regression test needs thousands of open sessions and `setswitchinterval(1e-6
 to reproduce this. A gentler version passed happily against the unlocked code and
 proved nothing.
 
+### Knowing whether you lost events
+
+A full ring buffer drops silently. Without a counter, "nothing is happening" and
+"we stopped keeping up" look identical — and userspace *can* stall: the path index
+rebuild is normally under a second but was measured at **87.9 s** under pool
+contention, and it used to run inline on the ingest path, which is what drains the
+ring buffer.
+
+Two changes:
+
+- the BPF side counts `emitted` and `dropped`, both exposed as `kernel_emitted` /
+  `kernel_dropped` in `/stats`. **`kernel_emitted` should equal `records`**; a gap
+  is loss between kernel and userspace, and a rising `kernel_dropped` means the
+  consumer cannot keep up.
+- the index rebuild runs in a **background thread**. A stale miss stays a miss until
+  it lands, which is much better than stalling ingest for a minute and a half.
+
+Verified by reading 42 MB over NFS from another host: `emitted=123, dropped=0,
+records=123`.
+
+Reads from the storage host itself are **local**, never NFS requests, and so are
+invisible here — which is why a machine's own backup jobs cannot be mistaken for
+demand. Confirmed against a real nightly run: zero sessions from it.
+
 ### Shutdown
 
 Do not rely on `KeyboardInterrupt` propagating out of a ctypes call blocked inside

@@ -67,6 +67,27 @@ struct {
 	__uint(max_entries, 1 << 24);		/* 16 MB */
 } events SEC(".maps");
 
+/* A full ring buffer drops events silently, which makes "nothing was captured"
+ * and "we stopped capturing" indistinguishable -- and userspace CAN stall: its
+ * path-index rebuild took 87.9s once, under pool contention. Count both sides so
+ * loss is visible rather than inferred.
+ */
+enum { ST_EMITTED = 0, ST_DROPPED = 1, ST_NR = 2 };
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, ST_NR);
+	__type(key, __u32);
+	__type(value, __u64);
+} stats SEC(".maps");
+
+static __always_inline void bump(__u32 idx)
+{
+	__u64 *v = bpf_map_lookup_elem(&stats, &idx);
+	if (v)
+		__sync_fetch_and_add(v, 1);
+}
+
 /* Observed rate on a live server was ~26 events/s, so no in-kernel filtering is
  * justified yet -- userspace drops what it does not care about. If volume ever
  * matters, filter on dev here rather than widening this program's job.
@@ -85,8 +106,10 @@ emit(struct svc_rqst *rqstp, struct svc_fh___pamts *fhp,
 	__be32 xid = 0;
 
 	e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-	if (!e)
-		return 0;			/* buffer full: drop, never block */
+	if (!e) {
+		bump(ST_DROPPED);	/* buffer full: drop, never block */
+		return 0;
+	}
 
 	__builtin_memset(e, 0, sizeof(*e));
 	e->ts     = bpf_ktime_get_ns();
@@ -132,6 +155,7 @@ emit(struct svc_rqst *rqstp, struct svc_fh___pamts *fhp,
 	}
 
 	bpf_ringbuf_submit(e, 0);
+	bump(ST_EMITTED);
 	return 0;
 }
 

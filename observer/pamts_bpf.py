@@ -107,6 +107,9 @@ class Collector:
         L.bpf_object__find_map_by_name.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         L.bpf_map__fd.restype = ctypes.c_int
         L.bpf_map__fd.argtypes = [ctypes.c_void_p]
+        L.bpf_map_lookup_elem.restype = ctypes.c_int
+        L.bpf_map_lookup_elem.argtypes = [ctypes.c_int, ctypes.c_void_p,
+                                          ctypes.c_void_p]
         L.ring_buffer__new.restype = ctypes.c_void_p
         L.ring_buffer__new.argtypes = [ctypes.c_int, SAMPLE_FN,
                                        ctypes.c_void_p, ctypes.c_void_p]
@@ -153,10 +156,33 @@ class Collector:
         if fd < 0:
             raise BpfError(f"bpf_map__fd returned {fd}")
 
+        m = self.lib.bpf_object__find_map_by_name(self.obj, b"stats")
+        self._stats_fd = self.lib.bpf_map__fd(m) if m else -1
+
         self._cb = SAMPLE_FN(self._on_sample)
         self.rb = self.lib.ring_buffer__new(fd, self._cb, None, None)
         if not self.rb:
             raise BpfError(f"ring_buffer__new failed (errno {ctypes.get_errno()})")
+
+    ST_EMITTED, ST_DROPPED = 0, 1
+
+    def counters(self):
+        """Events the kernel side emitted and dropped.
+
+        A full ring buffer drops silently, so without this "nothing is happening"
+        and "we stopped keeping up" look identical. Userspace can stall: a path
+        index rebuild once took 87.9s under pool contention.
+        """
+        out = {"emitted": None, "dropped": None}
+        if getattr(self, "_stats_fd", -1) < 0:
+            return out
+        for name, idx in (("emitted", self.ST_EMITTED), ("dropped", self.ST_DROPPED)):
+            k = ctypes.c_uint32(idx)
+            v = ctypes.c_uint64(0)
+            if self.lib.bpf_map_lookup_elem(self._stats_fd, ctypes.byref(k),
+                                            ctypes.byref(v)) == 0:
+                out[name] = v.value
+        return out
 
     # -- data path ---------------------------------------------------------
     def _on_sample(self, ctx, data, size):

@@ -84,6 +84,7 @@ class InodeIndex:
         self.files = 0
         self.builds = 0
         self.last_build_s = 0.0
+        self._rebuilding = False
         # Kernel dev_t of every device the roots actually live on. Reads on any
         # other device belong to a dataset we were not asked about, and dropping
         # them early keeps both the work and the log about the media we manage.
@@ -134,11 +135,32 @@ class InodeIndex:
         # A miss on a stale index means a new file, which is exactly the case
         # that matters for freshly downloaded media -- so rebuild, but rate
         # limited, or a scan of unknown files would rebuild continuously.
+        #
+        # The rebuild runs in a BACKGROUND thread. It is normally under a second,
+        # but was measured at 87.9s under pool contention, and this is called from
+        # the ingest path -- stalling there stops draining the kernel ring buffer
+        # and silently loses events. A miss now simply stays a miss until the
+        # rebuild lands.
         if allow_rebuild and age > self.max_age:
-            self.build()
-            with self._lock:
-                return self._map.get((dev, ino))
+            self.rebuild_async()
         return None
+
+    def rebuild_async(self):
+        with self._lock:
+            if self._rebuilding:
+                return False
+            self._rebuilding = True
+            self._built = time.monotonic()   # suppress a stampede of retries
+        def run():
+            try:
+                self.build()
+            except Exception:                                   # noqa: BLE001
+                logging.exception("index rebuild failed")
+            finally:
+                with self._lock:
+                    self._rebuilding = False
+        threading.Thread(target=run, daemon=True).start()
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -294,9 +316,10 @@ class Store:
 
 class Daemon:
     def __init__(self, store, index, tracker, cfg, log_sessions=True,
-                 defer=True):
+                 defer=True, collector=None):
         self.store, self.index, self.tracker, self.cfg = store, index, tracker, cfg
         self.log_sessions = log_sessions
+        self.collector = collector
         # A rolling window can only look backwards, so the first files of a sweep
         # have nothing to be compared against and record as demand -- two tracks
         # of an album leaked into history that way. Holding the decision until the
@@ -384,7 +407,10 @@ class Daemon:
             self.deferred_written += 1
 
     def stats(self):
+        drops = self.collector.counters() if self.collector else {}
         return {
+            "kernel_emitted": drops.get("emitted"),
+            "kernel_dropped": drops.get("dropped"),
             "uptime_s": round(time.time() - self.started, 1),
             "records": self.records,
             "sessions_closed": self.tracker.closed,
@@ -576,6 +602,9 @@ def main(argv=None):
         from pamts_bpf import Collector                         # noqa: PLC0415
         collector = Collector(args.bpf_object)
         logging.info("attached: %s", ", ".join(collector.attached))
+        # The Daemon is built before the collector exists, so hand it over now:
+        # its /stats needs the kernel-side emitted/dropped counters.
+        daemon.collector = collector
         src = collector.records()
     else:
         src = source_ndjson(sys.stdin)
