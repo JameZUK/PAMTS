@@ -20,6 +20,42 @@ scan must never move data.** Any signal that cannot tell a scan from a play is
 worse than no signal, because it will cheerfully promote your entire library
 every time your media server re-indexes.
 
+## It only sees the tier it is installed on. This matters more than it sounds.
+
+**An observer on your fast tier is blind to every read served by the slow one.** If a
+library is genuinely *tiered* — part on fast storage, part on slow — then playing
+something from the slow part never touches the fast server and the tap cannot see it.
+
+Measured on a real estate, where the observer runs on the fast NFS server:
+
+| library | on fast | on slow | invisible to the tap |
+|---|---|---|---|
+| tv | 105 files | 7,653 files | **98%** |
+| movies | 3 files | 2,432 files | **99%** |
+| music | 135,814 files | *replica* | **0%** |
+
+Music is invisible-free because it is **replicated, not tiered**: every file lives on
+the fast tier and the copy on slow storage is a backup. Reads always hit the fast
+server. Video is the opposite — almost all of it is cold, so almost every viewing is
+unseen.
+
+This is not a bug to fix, it is where the tool fits:
+
+- **A replicated library** (all on fast, backed up to slow) — the tap sees everything.
+  This is where it belongs, and where player APIs are usually weakest.
+- **A tiered library** (split across both) — use the media server's API. It sees plays
+  regardless of which tier served them, and usually knows the user and the remaining
+  runtime too, which a tap never can.
+
+Do not try to solve it by tapping the slow server as well. On a real estate that
+server turned out to be **TrueNAS CORE — FreeBSD** — no eBPF, no `nfsd` tracepoints,
+nothing to attach to. And tapping the *union* instead only moves the problem: the
+union lives on the consumer, which may be an unprivileged container where `bpf()`
+returns `EPERM` outright.
+
+**So when a tap reports nothing playing, that means nothing it can see is playing.**
+Check the player adapter before concluding the estate is idle.
+
 ## What it cannot do
 
 - **No per-user history.** Exports using `all_squash` erase user identity at the
