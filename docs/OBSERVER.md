@@ -405,6 +405,43 @@ row with **`play_count = 0`** — a state that cannot mean anything. An INSERT n
 always counts at least one, because a row existing *is* the record that a play
 happened.
 
+### A freshly downloaded file gets read immediately, and it is not playback
+
+A media server analyses new arrivals — thumbnails, loudness, container probing.
+Plex's `GenerateBIFBehavior=asap` reads the **whole file**. So minutes after a
+download lands, the tap sees a large sequential read of it, which looks superficially
+like someone settling in to watch.
+
+Measured, on an 8.6 GB episode that arrived at 00:00 and was analysed from 03:10:
+
+```
+1476 MB in 15s at  96.9 MB/s     ← whole-file analysis
+ 534 MB in 14s at  37.9 MB/s     ← scored PLAY before max_play_rate
+ 165 MB in  2s at  98.0 MB/s     ← scored UNKNOWN: no EOF seen, so COPY could not apply
+```
+
+Two defects, both now fixed:
+
+- **`COPY` required a known file size.** With no EOF sighting, coverage is `None`, so
+  a whole-file read at 97 MB/s fell through to `UNKNOWN`. That was most of the UNKNOWN
+  population — over five thousand sessions in one hour.
+- **The copy threshold was too permissive.** 534 MB in fourteen seconds scored `PLAY`
+  because 37.9 MB/s sat just under a 40 MB/s floor.
+
+`max_play_rate` (default 30 MB/s) now settles it before coverage is consulted: read in
+order, above that rate, it is not playback. The measured spread makes the boundary
+comfortable rather than lucky:
+
+| what | rate |
+|---|---|
+| music FLAC | 0.2 MB/s |
+| 2160p video | 2.8–3.4 MB/s |
+| buffer refill | 9.6 MB/s |
+| playback prefill | 20.7 MB/s |
+| **analysis / copy** | **37.9–110 MB/s** |
+
+Every one of those is a regression fixture, so the boundary cannot drift back.
+
 ### Reads on datasets you did not ask about
 
 The tap sees **every** NFS read the server handles, including exports that have

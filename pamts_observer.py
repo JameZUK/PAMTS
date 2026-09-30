@@ -75,6 +75,14 @@ DEFAULTS = {
     "play_min_coverage":   0.15,
     "copy_min_coverage":   0.85,
     "copy_min_rate":      40 * MB,  # bytes/s: above this a human is not listening
+    # Above this, sustained and in order, it cannot be playback whatever else is
+    # known -- so COPY no longer needs the file size. Measured on a real server:
+    # music plays at 0.2 MB/s, 2160p video at 2.8-3.4, a buffer refill at 9.6, a
+    # playback-start prefill at 20.7 -- and a media server analysing a freshly
+    # downloaded file at 37.9 to 110. A whole 8.6 GB episode read at 97 MB/s was
+    # scoring UNKNOWN purely because no EOF had been seen, and a 534 MB read at
+    # 37.9 MB/s scored PLAY, two megabytes a second under the old threshold.
+    "max_play_rate":      30 * MB,
     "min_monotonic":       0.80,
     "play_min_bytes":      1 * MB,   # below this there is nothing to pace
     # A sequential read of THIS MUCH of one file is playback whatever fraction of
@@ -343,6 +351,14 @@ def classify(sig, cfg=None):
 
     whole = cov is not None and cov >= c["copy_min_coverage"]
     fast = rate is None or rate >= c["copy_min_rate"]
+
+    # Too fast to be playback, and read in order: a copy or an analysis pass. This
+    # is deliberately checked BEFORE coverage-based rules, because the expensive
+    # mistake was requiring a known file size before COPY could be considered.
+    if (rate is not None and rate >= c["max_play_rate"]
+            and sig["monotonic"] >= c["min_monotonic"]
+            and sig["bytes"] >= c["play_min_bytes"]):
+        return "COPY"
 
     # Header/tail sip: tag read, container probe, thumbnailer.
     small = (cov is not None and cov <= c["probe_max_coverage"]) or \

@@ -232,6 +232,42 @@ check("a whole file at wire speed is still COPY, not PLAY",
       obs.classify(dict(real_prefill, bytes=8000 * MB, coverage=1.0,
                         duration=40.0, rate=200 * MB)) == "COPY")
 
+# Every row below is a real session measured on a live server. The rate spread is
+# the whole point: nothing that is actually playback needs 30 MB/s sustained, and a
+# media server analysing a freshly downloaded file runs at 38-110.
+def measured(b, dur, rate, cov=None, mono=1.0):
+    return {"fh": 0, "t_first": 0.0, "t_last": dur, "duration": dur,
+            "requests": max(1, int(b / 131072)), "bytes": int(b),
+            "filesize": None if cov is None else int(b / cov), "coverage": cov,
+            "min_offset": 0, "max_offset": int(b), "span": int(b),
+            "monotonic": mono, "regions": 1, "starts_at_zero": True,
+            "short_reads": 0, "errors": 0, "rate": rate, "frac_splice": 1.0,
+            "frac_vector": 0.0, "frac_direct": 0.0, "method": "splice"}
+
+
+for _name, _sig, _want in (
+        ("music FLAC at 0.2 MB/s", measured(21.4 * MB, 137, 0.2 * MB, 1.0), "PLAY"),
+        ("2160p video at 3.1 MB/s", measured(3432 * MB, 1119, 3.1 * MB, 0.35), "PLAY"),
+        ("a buffer refill at 9.6 MB/s", measured(553 * MB, 58, 9.6 * MB, 0.056), "PLAY"),
+        ("a playback prefill at 20.7 MB/s", measured(207.8 * MB, 10, 20.7 * MB, 0.143), "PLAY"),
+        # this one scored PLAY before max_play_rate: 534 MB in 14 SECONDS
+        ("an analysis pass at 37.9 MB/s", measured(534.8 * MB, 14, 37.9 * MB), "COPY"),
+        # these scored UNKNOWN before, purely because no EOF had been seen
+        ("a whole episode at 96.9 MB/s", measured(1476 * MB, 15, 96.9 * MB), "COPY"),
+        ("an analysis chunk at 98 MB/s", measured(165 * MB, 2, 98 * MB), "COPY"),
+        ("a whole file at 109.8 MB/s", measured(1051 * MB, 10, 109.8 * MB, 1.0), "COPY")):
+    check(f"measured: {_name} is {_want}", obs.classify(_sig) == _want,
+          obs.classify(_sig))
+
+check("COPY no longer needs a known file size",
+      obs.classify(measured(800 * MB, 8, 100 * MB)) == "COPY")
+check("but a fast SCATTERED read is not a copy",
+      obs.classify(measured(800 * MB, 8, 100 * MB, mono=0.2)) != "COPY")
+check("and the ceiling sits above every measured playback rate",
+      obs.DEFAULTS["max_play_rate"] > 20.7 * MB
+      and obs.DEFAULTS["max_play_rate"] < 37.9 * MB,
+      f"{obs.DEFAULTS['max_play_rate'] / MB:.0f} MB/s")
+
 real_music = dict(real_stream, fh=0xd1721f9f, duration=105.0, requests=57,
                   bytes=int(7.1 * MB), filesize=int(7.1 * MB), coverage=1.0,
                   monotonic=1.0, regions=1, rate=0.07 * MB)
