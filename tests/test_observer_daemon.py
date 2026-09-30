@@ -39,6 +39,15 @@ check("kdev differs from raw st_dev for a real major",
       "if these agree the test is not proving anything")
 check("minor-only devices still round-trip", d.kdev(os.makedev(0, 29)) == 29)
 
+# --- SQLite cannot hold an unsigned 64-bit inode -----------------------------
+print("\nunsigned 64-bit inodes (mergerfs unions)")
+BIG = 18139166551967294708          # a real union inode, ~2x SQLite's signed max
+check("s64 wraps a value above the signed maximum", d.s64(BIG) < 0, str(d.s64(BIG)))
+check("the mapping is a bijection", d.s64(BIG) + (1 << 64) == BIG)
+check("ordinary inodes are untouched", d.s64(581121) == 581121)
+check("None survives", d.s64(None) is None)
+check("distinct inodes stay distinct", d.s64(BIG) != d.s64(BIG - 1))
+
 # --- inode index -------------------------------------------------------------
 print("\ninode -> path index")
 tmp = tempfile.mkdtemp()
@@ -108,6 +117,13 @@ def sig(**kw):
 check("non-media paths never reach history even when labelled PLAY",
       (store.record("/m/cover.jpg", sig(), "PLAY", 999.0),
        store.history() == [])[1], "artwork must not count as demand")
+# A file read through a mergerfs union killed the daemon on every session before
+# s64: OverflowError, "Python int too large to convert to SQLite INTEGER".
+_bsig = sig(ino=18139166551967294708, dev=109)
+store.record_session("/m/union.mkv", _bsig, "PLAY", 1500.0)
+check("a union inode inserts without overflowing",
+      store.counts()["sessions"] >= 1)
+
 check("DEMAND is exactly PLAY and FETCH", d.DEMAND == {"PLAY", "FETCH"}, str(d.DEMAND))
 
 store.record("/m/a.mkv", sig(), "PLAY", 1000.0)
@@ -121,14 +137,14 @@ check("FETCH reaches history", "/m/e.mkv" in paths)
 check("PROBE never reaches history", "/m/b.mkv" not in paths)
 check("COPY never reaches history", "/m/c.mkv" not in paths)
 check("BULK never reaches history", "/m/d.mkv" not in paths)
-check("every session is still logged", store.counts()["sessions"] == 6,
+check("every session is still logged", store.counts()["sessions"] == 7,
       str(store.counts()))
 
 # an unresolved path is logged but cannot be history
 store.record(None, sig(), "PLAY", 1005.0)
 check("an unresolved PLAY adds no history row", len(store.history()) == 2,
       str(len(store.history())))
-check("but its session is recorded", store.counts()["sessions"] == 7)
+check("but its session is recorded", store.counts()["sessions"] == 8)
 
 # checkpoint then final must count once
 store.record("/m/long.mkv", sig(bytes=100 << 20), "PLAY", 2000.0, count_it=True)

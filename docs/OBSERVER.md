@@ -535,6 +535,27 @@ genuine was lost.
 Arrivals are still tracked, for visibility and so that age-on-tier can come from
 observation rather than mtime. They simply do not decide what a read *was*.
 
+### Union inodes are unsigned 64-bit and will overflow your database
+
+If you index a **mergerfs union** rather than a plain filesystem, be ready for this.
+mergerfs synthesises inodes as unsigned 64-bit hashes. One real file came back as
+
+```
+18139166551967294708        # roughly 2x SQLite's signed INTEGER maximum
+```
+
+SQLite's `INTEGER` is *signed* 64-bit, so inserting that raises `OverflowError` and
+kills the daemon — on **every** session for a file read through a union, i.e. all
+cold-tier traffic. It crashed once in production and would have crash-looped.
+
+`s64()` wraps into the signed range on the way in. The mapping is a bijection, so
+values stay distinct and round-trip; they are only diagnostics anyway, since path
+resolution goes through the in-memory index rather than the database.
+
+The same file is inode `581121` on the cold branch and `18139166551967294708` through
+the union, so **a union must be indexed in its own right** — indexing the branches is
+not a substitute.
+
 ### Reads on datasets you did not ask about
 
 The tap sees **every** NFS read the server handles, including exports that have

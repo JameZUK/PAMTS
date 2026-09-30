@@ -51,6 +51,22 @@ def boot_epoch():
 # inode -> path
 # ---------------------------------------------------------------------------
 
+def s64(n):
+    """Wrap an unsigned 64-bit value into SQLite's signed 64-bit INTEGER range.
+
+    mergerfs synthesises union inodes as unsigned 64-bit hashes -- one real file
+    came back as 18139166551967294708, about twice SQLite's signed maximum -- and
+    inserting that raises OverflowError, killing the daemon on every session for a
+    file read through a union. The mapping is a bijection, so values still
+    round-trip and remain distinct; they are only ever used for diagnostics here,
+    since path resolution goes through the in-memory index.
+    """
+    if n is None:
+        return None
+    n &= (1 << 64) - 1
+    return n - (1 << 64) if n >= (1 << 63) else n
+
+
 def kdev(st_dev):
     """Python's st_dev -> the kernel's dev_t encoding.
 
@@ -230,9 +246,10 @@ class Store:
                 "INSERT INTO sessions(ts,path,dev,ino,client,label,bytes,coverage,"
                 "duration,rate,requests,monotonic,method) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (epoch_ts, path, sig.get("dev"), sig.get("ino"), sig.get("client"),
-                 label, sig["bytes"], sig["coverage"], sig["duration"], sig["rate"],
-                 sig["requests"], sig["monotonic"], sig["method"]))
+                (epoch_ts, path, s64(sig.get("dev")), s64(sig.get("ino")),
+                 sig.get("client"), label, sig["bytes"], sig["coverage"],
+                 sig["duration"], sig["rate"], sig["requests"], sig["monotonic"],
+                 sig["method"]))
             return cur.lastrowid
 
     def relabel_session(self, rowid, label):
