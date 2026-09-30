@@ -496,7 +496,7 @@ has flushed, which is as close to "finished" as NFS offers without waiting for
 silence.
 
 ```
-ARRIVE 172.16.32.62  60.0MB in 1s  /srv/media/tv/Some Show/S01E01.mkv
+ARRIVE 10.0.0.20  60.0MB in 1s  /srv/media/tv/Some Show/S01E01.mkv
 ```
 
 A brand new file is exactly what the path index does not know about yet, so the first
