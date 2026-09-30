@@ -16,3 +16,7 @@ observer/vmlinux.h
 
 # Compiled BPF output is a build artefact; build it with observer/Makefile.
 *.bpf.o
+
+# Local working notes. This project is public; anything naming a real host,
+# address or library belongs in a private repo, not here.
+*.local.md
