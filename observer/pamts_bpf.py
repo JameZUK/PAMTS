@@ -24,7 +24,9 @@ EVENT = struct.Struct("<QQQqIIIi16sB7x")
 assert EVENT.size == 72, EVENT.size
 
 KINDS = {0: "read_start", 1: "read_splice", 2: "read_vector",
-         3: "read_direct", 4: "read_done", 5: "read_err"}
+         3: "read_direct", 4: "read_done", 5: "read_err",
+         6: "write_start", 7: "write_done", 8: "write_err", 9: "commit_done"}
+WRITE_KINDS = frozenset(("write_start", "write_done", "write_err", "commit_done"))
 
 AF_INET, AF_INET6 = 2, 10
 
@@ -203,7 +205,7 @@ class Collector:
             "xid": xid,
             "offset": offset,
             "len": None if length < 0 else length,
-            "status": status if kind == 5 else None,
+            "status": status if kind in (5, 8) else None,
             "ino": ino,
             "dev": dev,
             "client": _fmt_addr(af, addr),

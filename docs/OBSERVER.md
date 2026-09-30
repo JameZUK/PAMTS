@@ -442,6 +442,50 @@ comfortable rather than lucky:
 
 Every one of those is a regression fixture, so the boundary cannot drift back.
 
+## Arrivals
+
+The tap originally watched reads only, on the reasoning that a write says nothing
+about whether anything was *wanted*. That was right about demand and wrong about
+everything else: a download was invisible, "when did this land" had to be inferred
+from mtime, and — worst — a media server reading a file it had just ingested was
+indistinguishable from someone watching it.
+
+The write tracepoints carry **exactly the same arguments** as the read ones, so the
+same emit path serves both. Four more programs: `nfsd_write_start`,
+`nfsd_write_done`, `nfsd_write_err`, `nfsd_commit_done`.
+
+A write never creates a read-session. It records an **arrival**: first and last write
+time, bytes, and which client. `nfsd_commit_done` marks it reportable — the client
+has flushed, which is as close to "finished" as NFS offers without waiting for
+silence.
+
+```
+ARRIVE 172.16.32.62  60.0MB in 1s  /srv/media/tv/Some Show/S01E01.mkv
+```
+
+A brand new file is exactly what the path index does not know about yet, so the first
+arrival usually logs `<new, dev=…, ino=…>` and schedules a rebuild.
+
+### IMPORT: reading what you just ingested is not watching it
+
+A read of a file written within `import_window` (default 900 s) is labelled `IMPORT`
+and never counts as demand.
+
+This catches what the rate ceiling cannot. `max_play_rate` rejects an analysis pass
+that runs at 38–110 MB/s, but a *slow* ingest read — audio analysis, a careful
+container probe — happens at playback-like rates and is otherwise a perfect
+impersonation of listening. Knowing the file arrived four minutes ago settles it
+where the read pattern alone cannot.
+
+The two signals are complementary and neither subsumes the other:
+
+| | caught by |
+|---|---|
+| whole file at 97 MB/s, hours after arrival | `max_play_rate` |
+| whole file at 2 MB/s, minutes after arrival | `import_window` |
+| many files at once, mid-scan | `detect_bulk` |
+| header and tail only | `PROBE` |
+
 ### Reads on datasets you did not ask about
 
 The tap sees **every** NFS read the server handles, including exports that have

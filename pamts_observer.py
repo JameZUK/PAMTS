@@ -102,7 +102,15 @@ DEFAULTS = {
     # only reported when it ENDS is useless for promotion, which needs to fetch
     # the next item during playback, not after it.
     "checkpoint_after":   60.0,
+    # A media server reads a file it has just ingested -- thumbnails, loudness,
+    # container probing. That read can look like playback, so a read of a file
+    # written this recently is labelled IMPORT rather than counted as demand.
+    "import_window":     900.0,
+    # How long an arrival is remembered at all.
+    "write_ttl":        7200.0,
 }
+
+WRITE_KINDS = frozenset(("write_start", "write_done", "write_err", "commit_done"))
 
 LINE = re.compile(
     r"(?P<ts>\d+\.\d+):\s+nfsd_(?P<tp>read_\w+):\s+(?P<rest>.*)$"
@@ -499,6 +507,13 @@ class SessionTracker:
         # decision has to be made from a rolling window instead.
         self._recent = defaultdict(deque)
         self.bulk = 0
+        # (dev, ino) -> arrival record. A download is otherwise invisible: the tap
+        # only ever saw reads, so "when did this land" had to come from mtime.
+        self._writes = {}
+        self.imports = 0
+        self.arrivals = 0
+        self.bytes_written = 0
+        self.on_arrival = None
         # A daemon closes sessions from TWO threads: the ingest loop via add(),
         # and a timer via tick() -- because a session ends by going quiet, which
         # no arriving record can signal. Both mutate _open, which crashed under a
@@ -515,10 +530,51 @@ class SessionTracker:
 
     # -- ingest ------------------------------------------------------------
     def add(self, rec):
+        if rec.kind in WRITE_KINDS:
+            self._ingest_write(rec)
+            return
         with self._lock:
             self._ingest(rec)
         # sweep outside the ingest critical section; it dispatches callbacks
         self._sweep(rec.ts)
+
+    def _ingest_write(self, rec):
+        """Record an arrival. Writes do not make read-sessions: nothing about a
+        write says anything was wanted, which is the only question this asks."""
+        key = (rec.dev, rec.ino)
+        if rec.ino is None:
+            return
+        done = []
+        with self._lock:
+            w = self._writes.get(key)
+            if w is None:
+                w = {"first": rec.ts, "bytes": 0, "client": rec.client,
+                     "reported": False}
+                self._writes[key] = w
+                self.arrivals += 1
+            w["last"] = rec.ts
+            if rec.kind == "write_done" and rec.length:
+                w["bytes"] += rec.length
+                self.bytes_written += rec.length
+            # commit means the client has flushed: as close to "finished" as NFS
+            # offers without waiting for silence.
+            if rec.kind == "commit_done" and not w["reported"]:
+                w["reported"] = True
+                done.append((key, dict(w)))
+            ttl = self.cfg["write_ttl"]
+            for k in [k for k, v in self._writes.items() if rec.ts - v["last"] > ttl]:
+                del self._writes[k]
+        for key, w in done:
+            if self.on_arrival:
+                self.on_arrival(key, w)
+
+    def recent_write(self, dev, ino, within=None):
+        """When was this file last written, if recently? -> ts or None."""
+        if within is None:
+            within = self.cfg["import_window"]
+        with self._lock:
+            w = self._writes.get((dev, ino))
+        return w["last"] if w else None
 
     def _ingest(self, rec):
         key = rec.key
@@ -681,6 +737,14 @@ class SessionTracker:
         if label in ("PLAY", "FETCH") and distinct >= self.cfg["bulk_min_files"]:
             label = "BULK"
             self.bulk += 1
+        # A file read while it is still being written, or just after, is being
+        # ingested by whatever consumes it -- not watched. Measured: an episode
+        # landed at 00:00 and was read whole from 03:10 at 97 MB/s.
+        elif label in ("PLAY", "FETCH"):
+            w = self.recent_write(sig.get("dev"), sig.get("ino"))
+            if w is not None and sig["t_last"] - w <= self.cfg["import_window"]:
+                label = "IMPORT"
+                self.imports += 1
         self.closed += 1
         # `first` is False when this session was already reported mid-flight, so
         # the consumer can refresh it without counting the play twice.

@@ -43,6 +43,15 @@ enum pamts_kind {
 	PAMTS_DIRECT = 3,
 	PAMTS_DONE   = 4,
 	PAMTS_ERR    = 5,
+	/* Writes. The write tracepoints carry exactly the same arguments as the
+	 * read ones, so emit() serves both unchanged. Arrivals matter for two
+	 * reasons: a download is otherwise invisible here, and a media server
+	 * reading a file it has just ingested is importing, not playing.
+	 */
+	PAMTS_W_START  = 6,
+	PAMTS_W_DONE   = 7,
+	PAMTS_W_ERR    = 8,
+	PAMTS_W_COMMIT = 9,
 };
 
 /* Layout is fixed and must match EVENT in pamts_bpf.py: "<QQQqIIIi16sB7x".
@@ -168,6 +177,19 @@ emit(struct svc_rqst *rqstp, struct svc_fh___pamts *fhp,
 			    (__u64)ctx->args[2],                               \
 			    (__s64)(__u32)ctx->args[3], kind, 0);              \
 	}
+
+READ_TP(pamts_write_start, "nfsd_write_start", PAMTS_W_START)
+READ_TP(pamts_write_done,  "nfsd_write_done",  PAMTS_W_DONE)
+READ_TP(pamts_commit_done, "nfsd_commit_done", PAMTS_W_COMMIT)
+
+SEC("raw_tp/nfsd_write_err")
+int pamts_write_err(struct bpf_raw_tracepoint_args *ctx)
+{
+	return emit((struct svc_rqst *)ctx->args[0],
+		    (struct svc_fh___pamts *)ctx->args[1],
+		    (__u64)ctx->args[2], -1, PAMTS_W_ERR,
+		    (__s32)ctx->args[3]);
+}
 
 READ_TP(pamts_read_start,  "nfsd_read_start",  PAMTS_START)
 READ_TP(pamts_read_splice, "nfsd_read_splice", PAMTS_SPLICE)

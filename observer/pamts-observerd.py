@@ -192,6 +192,8 @@ CREATE INDEX IF NOT EXISTS sessions_ts ON sessions(ts);
 # the whole file, which is demand, and the bulk guard has already stripped sweeps
 # out by relabelling them BULK. PROBE and COPY must never count -- that is the
 # founding constraint of the whole system.
+# IMPORT is deliberately absent: a file read because it has just arrived was not
+# wanted by anyone, it was ingested.
 DEMAND = {"PLAY", "FETCH"}
 
 
@@ -337,6 +339,8 @@ class Daemon:
         self.unresolved = 0
         self.foreign = 0
         self.non_media = 0
+        self.arrivals = 0
+        self.bytes_in = 0
         self.labels = {}
 
     def on_close(self, key, sig, label, first=True):
@@ -378,6 +382,26 @@ class Daemon:
                 sig["duration"], rate, sig["requests"],
                 path or f"<unresolved dev={sig['dev']} ino={sig['ino']}>",
                 "" if first else "  (refresh)")
+
+    def on_arrival(self, key, w):
+        """A file finished being written. This is the only signal that content
+        ARRIVED; before write tracking, a download was invisible here and "when
+        did this land" had to be inferred from mtime.
+        """
+        dev, ino = key
+        path = self.index.lookup(dev, ino)
+        if path is None:
+            # A brand new file is exactly what the index does not know about yet.
+            # The rebuild is asynchronous, so name it on the next arrival instead
+            # of blocking ingest for it.
+            self.index.rebuild_async()
+        self.arrivals += 1
+        self.bytes_in += w.get("bytes", 0)
+        if self.log_sessions:
+            logging.info("ARRIVE %-15s %8.1fMB in %4.0fs  %s",
+                         w.get("client") or "?", w.get("bytes", 0) / (1 << 20),
+                         w.get("last", 0) - w.get("first", 0),
+                         path or f"<new, dev={dev} ino={ino}>")
 
     def flush_pending(self, now_mono, force=False):
         """Release held demand decisions once they can be judged fairly.
@@ -421,6 +445,9 @@ class Daemon:
             "foreign_device_records": self.foreign,
             "non_media_sessions": self.non_media,
             "bulk_suppressed": self.tracker.bulk,
+            "arrivals": self.arrivals,
+            "bytes_written": self.tracker.bytes_written,
+            "imports_vetoed": self.tracker.imports,
             "deferred_pending": len(self._pending),
             "deferred_suppressed": self.deferred_suppressed,
             "deferred_written": self.deferred_written,
@@ -562,6 +589,7 @@ def main(argv=None):
                     log_sessions=not args.quiet_sessions,
                     defer=not args.no_defer)
     tracker.on_close = daemon.on_close
+    tracker.on_arrival = daemon.on_arrival
 
     httpd = None
     if not args.no_http:

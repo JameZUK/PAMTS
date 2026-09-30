@@ -480,6 +480,65 @@ check("open_sessions is safe to read concurrently",
       isinstance(_tr.open_sessions, list))
 
 print("")
+print("arrivals: seeing downloads, and not mistaking ingest for viewing")
+
+_seen, _arr = [], []
+_t = obs.SessionTracker({"idle_gap": 30.0, "checkpoint_after": 0},
+                        on_close=lambda k, s, l, f: _seen.append(l))
+_t.on_arrival = lambda k, w: _arr.append((k, w["bytes"]))
+for _i in range(200):
+    _t.add(obs.Record(ts=1000.0 + _i * 0.05, kind="write_done", xid=_i,
+                      offset=_i * MB, length=MB, ino=7, dev=45, client="10.0.0.9"))
+check("a write creates no read-session", not _t._open and not _seen)
+check("bytes written are accounted", _t.bytes_written == 200 * MB,
+      str(_t.bytes_written))
+check("an arrival is not reported before commit", not _arr)
+_t.add(obs.Record(ts=1010.0, kind="commit_done", xid=999, offset=0, length=0,
+                  ino=7, dev=45, client="10.0.0.9"))
+check("commit reports the arrival", len(_arr) == 1 and _arr[0][1] == 200 * MB,
+      str(_arr))
+check("the arrival is not reported twice",
+      (_t.add(obs.Record(ts=1011.0, kind="commit_done", xid=998, offset=0,
+                         length=0, ino=7, dev=45, client="10.0.0.9")),
+       len(_arr))[1] == 1)
+check("the write is remembered", _t.recent_write(45, 7) is not None)
+
+# A media server reads what it has just ingested. Crucially this is at a
+# PLAYBACK-LIKE rate, so the max_play_rate ceiling would NOT catch it -- only
+# knowing the file just arrived does.
+for _i in range(200):
+    for _k in ("read_start", "read_splice", "read_done"):
+        _t.add(obs.Record(ts=1300.0 + _i * 1.5, kind=_k, xid=0x500 + _i,
+                          offset=_i * MB, length=MB, ino=7, dev=45,
+                          client="10.0.0.20"))
+_t.flush()
+check("reading a just-arrived file is IMPORT, not PLAY", _seen == ["IMPORT"],
+      str(_seen))
+check("and it is counted", _t.imports == 1)
+
+# the identical read on a file with no recent write is a genuine play
+_seen2 = []
+_t2 = obs.SessionTracker({"idle_gap": 30.0, "checkpoint_after": 0},
+                         on_close=lambda k, s, l, f: _seen2.append(l))
+for _i in range(200):
+    for _k in ("read_start", "read_splice", "read_done"):
+        _t2.add(obs.Record(ts=1300.0 + _i * 1.5, kind=_k, xid=0x600 + _i,
+                           offset=_i * MB, length=MB, ino=8, dev=45,
+                           client="10.0.0.20"))
+_t2.flush()
+check("the same read without a recent write is PLAY", _seen2 == ["PLAY"],
+      str(_seen2))
+
+# an old arrival must stop vetoing, or nothing on the tier is ever playable
+_t3 = obs.SessionTracker({"idle_gap": 30.0, "checkpoint_after": 0,
+                          "import_window": 900.0})
+_t3.add(obs.Record(ts=1000.0, kind="write_done", xid=1, offset=0, length=MB,
+                   ino=9, dev=45, client="c"))
+check("a write far in the past does not veto",
+      _t3.recent_write(45, 9) is not None
+      and (20000.0 - _t3.recent_write(45, 9)) > 900.0)
+
+print("")
 print("and legitimate use must survive the guard")
 ep = []
 for b in range(6):
