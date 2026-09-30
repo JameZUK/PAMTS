@@ -48,12 +48,11 @@ METHODS = ("splice", "vector", "direct")
 # scanning media servers and are far too small to be worth moving between tiers --
 # and being tiny, a whole-file read of one looks exactly like a FETCH. Left
 # unfiltered, one library scan put 1,350 .jpg files into play history.
-MEDIA_EXT = (
-    ".mkv", ".mp4", ".avi", ".m4v", ".ts", ".mov", ".wmv", ".flv", ".mpg",
-    ".mpeg", ".m2ts", ".webm", ".iso",
-    ".flac", ".mp3", ".m4a", ".m4b", ".ogg", ".opus", ".wav", ".wma", ".aac",
-    ".alac", ".ape", ".dsf", ".dff", ".aiff", ".aif",
-)
+VIDEO_EXT = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".mov", ".wmv", ".flv",
+             ".mpg", ".mpeg", ".m2ts", ".webm", ".iso")
+AUDIO_EXT = (".flac", ".mp3", ".m4a", ".m4b", ".ogg", ".opus", ".wav", ".wma",
+             ".aac", ".alac", ".ape", ".dsf", ".dff", ".aiff", ".aif")
+MEDIA_EXT = VIDEO_EXT + AUDIO_EXT
 
 
 def is_media(path):
@@ -83,6 +82,22 @@ DEFAULTS = {
     # scoring UNKNOWN purely because no EOF had been seen, and a 534 MB read at
     # 37.9 MB/s scored PLAY, two megabytes a second under the old threshold.
     "max_play_rate":      30 * MB,
+    # Per media type, because one ceiling cannot serve both. Measured over 172
+    # genuine audio plays and 5 video ones on a live server:
+    #
+    #   audio PLAY   max 0.41 MB/s   (p95 0.37)
+    #   audio COPY   min 26.2        median 43.2
+    #   audio BULK   median 10.8     -- an audio scan sails under a 30 MB/s ceiling
+    #   video PLAY   up to ~20.7     (a playback-start prefill burst)
+    #   video COPY   min 51.5        median 110
+    #
+    # So audio gets a ceiling five times its observed maximum and still sits far
+    # below anything that was not playback. Timing cannot do this job: a scan is
+    # not tied to when a file arrived -- one episode landed at 00:00 and was
+    # analysed at 03:10 -- and anchoring on arrival would also discard the normal
+    # case of downloading something and watching it twenty minutes later.
+    "max_play_rate_audio":  2 * MB,
+    "max_play_rate_video": 30 * MB,
     "min_monotonic":       0.80,
     "play_min_bytes":      1 * MB,   # below this there is nothing to pace
     # A sequential read of THIS MUCH of one file is playback whatever fraction of
@@ -102,10 +117,6 @@ DEFAULTS = {
     # only reported when it ENDS is useless for promotion, which needs to fetch
     # the next item during playback, not after it.
     "checkpoint_after":   60.0,
-    # A media server reads a file it has just ingested -- thumbnails, loudness,
-    # container probing. That read can look like playback, so a read of a file
-    # written this recently is labelled IMPORT rather than counted as demand.
-    "import_window":     900.0,
     # How long an arrival is remembered at all.
     "write_ttl":        7200.0,
 }
@@ -332,7 +343,22 @@ def signature(session, cfg=None):
     }
 
 
-def classify(sig, cfg=None):
+def media_kind(path):
+    """-> "audio" | "video" | None. Drives the playback-rate ceiling."""
+    if not path:
+        return None
+    dot = path.rfind(".")
+    if dot < 0:
+        return None
+    ext = path[dot:].lower()
+    if ext in AUDIO_EXT:
+        return "audio"
+    if ext in VIDEO_EXT:
+        return "video"
+    return None
+
+
+def classify(sig, cfg=None, media=None):
     """Label one signature. Only PLAY should ever drive promotion.
 
     PROBE exists because a library scan must never move data -- the founding
@@ -363,7 +389,8 @@ def classify(sig, cfg=None):
     # Too fast to be playback, and read in order: a copy or an analysis pass. This
     # is deliberately checked BEFORE coverage-based rules, because the expensive
     # mistake was requiring a known file size before COPY could be considered.
-    if (rate is not None and rate >= c["max_play_rate"]
+    ceiling = c.get(f"max_play_rate_{media}") or c["max_play_rate"]
+    if (rate is not None and rate >= ceiling
             and sig["monotonic"] >= c["min_monotonic"]
             and sig["bytes"] >= c["play_min_bytes"]):
         return "COPY"
@@ -510,10 +537,12 @@ class SessionTracker:
         # (dev, ino) -> arrival record. A download is otherwise invisible: the tap
         # only ever saw reads, so "when did this land" had to come from mtime.
         self._writes = {}
-        self.imports = 0
         self.arrivals = 0
         self.bytes_written = 0
         self.on_arrival = None
+        # Optional (dev, ino) -> "audio"/"video"/None. The tracker has no paths,
+        # but the rate ceiling depends on what kind of thing is being read.
+        self.media_of = None
         # A daemon closes sessions from TWO threads: the ingest loop via add(),
         # and a timer via tick() -- because a session ends by going quiet, which
         # no arriving record can signal. Both mutate _open, which crashed under a
@@ -568,10 +597,16 @@ class SessionTracker:
             if self.on_arrival:
                 self.on_arrival(key, w)
 
-    def recent_write(self, dev, ino, within=None):
-        """When was this file last written, if recently? -> ts or None."""
-        if within is None:
-            within = self.cfg["import_window"]
+    def recent_write(self, dev, ino):
+        """When was this file last written? -> ts, or None if not seen recently.
+
+        Arrival is NOT used to classify a read. It was, briefly, and that was wrong
+        in both directions: a scan is not tied to when a file landed (one episode
+        arrived at 00:00 and was analysed at 03:10), and anchoring on arrival would
+        discard the ordinary case of downloading something and watching it twenty
+        minutes later. Read RATE decides that; this exists so the arrival itself is
+        visible, and so age-on-tier can come from observation rather than mtime.
+        """
         with self._lock:
             w = self._writes.get((dev, ino))
         return w["last"] if w else None
@@ -727,7 +762,14 @@ class SessionTracker:
             self.dropped += 1
             return None
         sig = self._sig(key, reqs)
-        label = classify(sig, self.cfg)
+        media = None
+        if self.media_of:
+            try:
+                media = self.media_of(sig.get("dev"), sig.get("ino"))
+            except Exception:                                   # noqa: BLE001
+                media = None
+        sig["media"] = media
+        label = classify(sig, self.cfg, media)
         distinct = self._note(sig)
         sig["client_files_in_window"] = distinct
         # A sweep is decided ACROSS files, never within one: a player reads a
@@ -737,14 +779,7 @@ class SessionTracker:
         if label in ("PLAY", "FETCH") and distinct >= self.cfg["bulk_min_files"]:
             label = "BULK"
             self.bulk += 1
-        # A file read while it is still being written, or just after, is being
-        # ingested by whatever consumes it -- not watched. Measured: an episode
-        # landed at 00:00 and was read whole from 03:10 at 97 MB/s.
-        elif label in ("PLAY", "FETCH"):
-            w = self.recent_write(sig.get("dev"), sig.get("ino"))
-            if w is not None and sig["t_last"] - w <= self.cfg["import_window"]:
-                label = "IMPORT"
-                self.imports += 1
+
         self.closed += 1
         # `first` is False when this session was already reported mid-flight, so
         # the consumer can refresh it without counting the play twice.

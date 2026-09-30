@@ -263,6 +263,31 @@ check("COPY no longer needs a known file size",
       obs.classify(measured(800 * MB, 8, 100 * MB)) == "COPY")
 check("but a fast SCATTERED read is not a copy",
       obs.classify(measured(800 * MB, 8, 100 * MB, mono=0.2)) != "COPY")
+# Measured over 53,927 real sessions: audio PLAY never exceeded 0.41 MB/s (n=172,
+# p95 0.37) while audio COPY started at 26.2 and audio being scanned sat at a
+# median of 10.8 -- which a single 30 MB/s ceiling misses entirely.
+_aud = measured(24.6 * MB, 60, 0.41 * MB, 1.0)
+check("real audio playback stays PLAY under the audio ceiling",
+      obs.classify(_aud, None, "audio") == "PLAY", obs.classify(_aud, None, "audio"))
+_scan = measured(12 * MB, 1, 10.8 * MB, 1.0)
+check("an audio scan at 10.8 MB/s is COPY once media type is known",
+      obs.classify(_scan, None, "audio") == "COPY", obs.classify(_scan, None, "audio"))
+check("...and the SAME session slips through without the type hint",
+      obs.classify(_scan) != "COPY", obs.classify(_scan))
+_prefill = measured(207.8 * MB, 10, 20.7 * MB, 0.143)
+check("a video prefill burst is still PLAY under the video ceiling",
+      obs.classify(_prefill, None, "video") == "PLAY",
+      obs.classify(_prefill, None, "video"))
+check("audio ceiling sits well above observed audio playback",
+      obs.DEFAULTS["max_play_rate_audio"] > 0.41 * MB * 4)
+check("video ceiling sits above a video prefill burst",
+      obs.DEFAULTS["max_play_rate_video"] > 20.7 * MB)
+check("media_kind maps extensions",
+      obs.media_kind("/m/a.flac") == "audio" and obs.media_kind("/m/b.mkv") == "video"
+      and obs.media_kind("/m/c.jpg") is None)
+check("arrival tracking survives, but no longer vetoes a play",
+      "import_window" not in obs.DEFAULTS)
+
 check("and the ceiling sits above every measured playback rate",
       obs.DEFAULTS["max_play_rate"] > 20.7 * MB
       and obs.DEFAULTS["max_play_rate"] < 37.9 * MB,
@@ -503,40 +528,20 @@ check("the arrival is not reported twice",
        len(_arr))[1] == 1)
 check("the write is remembered", _t.recent_write(45, 7) is not None)
 
-# A media server reads what it has just ingested. Crucially this is at a
-# PLAYBACK-LIKE rate, so the max_play_rate ceiling would NOT catch it -- only
-# knowing the file just arrived does.
+# Arrival is recorded for visibility, but must NOT change how a read is judged:
+# anchoring on it would discard the ordinary case of downloading something and
+# watching it soon after.
 for _i in range(200):
     for _k in ("read_start", "read_splice", "read_done"):
         _t.add(obs.Record(ts=1300.0 + _i * 1.5, kind=_k, xid=0x500 + _i,
                           offset=_i * MB, length=MB, ino=7, dev=45,
                           client="10.0.0.20"))
 _t.flush()
-check("reading a just-arrived file is IMPORT, not PLAY", _seen == ["IMPORT"],
+check("a paced read of a just-arrived file is still PLAY", _seen == ["PLAY"],
       str(_seen))
-check("and it is counted", _t.imports == 1)
-
-# the identical read on a file with no recent write is a genuine play
-_seen2 = []
-_t2 = obs.SessionTracker({"idle_gap": 30.0, "checkpoint_after": 0},
-                         on_close=lambda k, s, l, f: _seen2.append(l))
-for _i in range(200):
-    for _k in ("read_start", "read_splice", "read_done"):
-        _t2.add(obs.Record(ts=1300.0 + _i * 1.5, kind=_k, xid=0x600 + _i,
-                           offset=_i * MB, length=MB, ino=8, dev=45,
-                           client="10.0.0.20"))
-_t2.flush()
-check("the same read without a recent write is PLAY", _seen2 == ["PLAY"],
-      str(_seen2))
-
-# an old arrival must stop vetoing, or nothing on the tier is ever playable
-_t3 = obs.SessionTracker({"idle_gap": 30.0, "checkpoint_after": 0,
-                          "import_window": 900.0})
-_t3.add(obs.Record(ts=1000.0, kind="write_done", xid=1, offset=0, length=MB,
-                   ino=9, dev=45, client="c"))
-check("a write far in the past does not veto",
-      _t3.recent_write(45, 9) is not None
-      and (20000.0 - _t3.recent_write(45, 9)) > 900.0)
+check("arrival time is available to callers", _t.recent_write(45, 7) == 1011.0,
+      str(_t.recent_write(45, 7)))
+check("an unwritten file has no arrival", _t.recent_write(45, 4242) is None)
 
 print("")
 print("and legitimate use must survive the guard")

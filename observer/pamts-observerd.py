@@ -192,8 +192,6 @@ CREATE INDEX IF NOT EXISTS sessions_ts ON sessions(ts);
 # the whole file, which is demand, and the bulk guard has already stripped sweeps
 # out by relabelling them BULK. PROBE and COPY must never count -- that is the
 # founding constraint of the whole system.
-# IMPORT is deliberately absent: a file read because it has just arrived was not
-# wanted by anyone, it was ingested.
 DEMAND = {"PLAY", "FETCH"}
 
 
@@ -447,7 +445,6 @@ class Daemon:
             "bulk_suppressed": self.tracker.bulk,
             "arrivals": self.arrivals,
             "bytes_written": self.tracker.bytes_written,
-            "imports_vetoed": self.tracker.imports,
             "deferred_pending": len(self._pending),
             "deferred_suppressed": self.deferred_suppressed,
             "deferred_written": self.deferred_written,
@@ -590,6 +587,11 @@ def main(argv=None):
                     defer=not args.no_defer)
     tracker.on_close = daemon.on_close
     tracker.on_arrival = daemon.on_arrival
+    # The tracker has inodes, not paths, but the playback-rate ceiling depends on
+    # whether this is audio or video -- genuine audio never exceeds 0.41 MB/s
+    # while a video prefill burst reaches 20.7, so one ceiling cannot serve both.
+    tracker.media_of = lambda dev, ino: obs.media_kind(
+        index.lookup(dev, ino, allow_rebuild=False))
 
     httpd = None
     if not args.no_http:

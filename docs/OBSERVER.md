@@ -466,25 +466,38 @@ ARRIVE 172.16.32.62  60.0MB in 1s  /srv/media/tv/Some Show/S01E01.mkv
 A brand new file is exactly what the path index does not know about yet, so the first
 arrival usually logs `<new, dev=…, ino=…>` and schedules a rebuild.
 
-### IMPORT: reading what you just ingested is not watching it
+### Arrival does NOT classify a read. Rate does.
 
-A read of a file written within `import_window` (default 900 s) is labelled `IMPORT`
-and never counts as demand.
+An earlier version labelled a read of a recently-written file as an import. That was
+wrong in both directions and is worth recording so it is not reinvented:
 
-This catches what the rate ceiling cannot. `max_play_rate` rejects an analysis pass
-that runs at 38–110 MB/s, but a *slow* ingest read — audio analysis, a careful
-container probe — happens at playback-like rates and is otherwise a perfect
-impersonation of listening. Knowing the file arrived four minutes ago settles it
-where the read pattern alone cannot.
+- **A scan is not tied to when a file arrived.** One episode landed at 00:00 and was
+  analysed at **03:10** — three hours later, so any plausible window misses it.
+- **Downloading something and watching it soon after is completely normal**, and is
+  the behaviour this whole system is built around. Anchoring on arrival throws that
+  play away.
 
-The two signals are complementary and neither subsumes the other:
+The discriminator is **read rate, per media type** — and the measurement over 53,927
+real sessions is unambiguous:
 
-| | caught by |
-|---|---|
-| whole file at 97 MB/s, hours after arrival | `max_play_rate` |
-| whole file at 2 MB/s, minutes after arrival | `import_window` |
-| many files at once, mid-scan | `detect_bulk` |
-| header and tail only | `PROBE` |
+| media | PLAY | not playback |
+|---|---|---|
+| audio | max **0.41** MB/s (n=172, p95 0.37) | COPY from **26.2**, scans median **10.8** |
+| video | up to **20.7** MB/s (prefill burst) | COPY from **51.5**, median 110 |
+
+One ceiling cannot serve both: a 30 MB/s limit lets an audio scan at 10.8 MB/s pass
+as a play. So `max_play_rate_audio` is 2 MB/s — five times the observed maximum and
+still far below anything that was not playback — and `max_play_rate_video` is 30.
+
+The tracker has inodes, not paths, so the daemon supplies a `media_of` resolver
+backed by the path index.
+
+Replaying every stored session through this changed **one** of 177 PLAY labels: the
+534 MB-in-14-seconds analysis pass that had been miscounted as a viewing. Nothing
+genuine was lost.
+
+Arrivals are still tracked, for visibility and so that age-on-tier can come from
+observation rather than mtime. They simply do not decide what a read *was*.
 
 ### Reads on datasets you did not ask about
 
