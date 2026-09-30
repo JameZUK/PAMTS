@@ -404,7 +404,7 @@ under a library scan:
 
 ```
 RuntimeError: dictionary changed size during iteration
-KeyError: (45, 153743, '172.16.32.102')     # both threads closed the same session
+KeyError: (45, 153743, '10.0.0.102')     # both threads closed the same session
 ```
 
 The lock is held only while mutating. `on_close()` is dispatched **outside** it,
