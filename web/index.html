@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PAMTS</title>
+<style>
+:root{
+  --bg:#f7f7f8; --panel:#fff; --ink:#16181d; --dim:#6b7280; --line:#e3e5e9;
+  --accent:#2563eb; --ok:#15803d; --warn:#b45309; --bad:#b91c1c;
+  --play:#15803d; --probe:#6b7280; --copy:#b45309; --bulk:#7c3aed;
+  --fetch:#0369a1; --unknown:#9ca3af; --seek:#0f766e; --error:#b91c1c;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#101216; --panel:#181b21; --ink:#e8eaed; --dim:#9aa1ad; --line:#282c35;
+    --accent:#60a5fa; --ok:#4ade80; --warn:#fbbf24; --bad:#f87171;
+    --play:#4ade80; --probe:#9aa1ad; --copy:#fbbf24; --bulk:#c084fc;
+    --fetch:#38bdf8; --unknown:#6b7280; --seek:#2dd4bf; --error:#f87171;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
+  padding:16px;border-bottom:1px solid var(--line)}
+h1{font-size:17px;margin:0;letter-spacing:-.01em}
+h1 span{color:var(--dim);font-weight:400}
+nav{margin-left:auto;display:flex;gap:4px}
+nav button{background:none;border:1px solid var(--line);color:var(--ink);
+  padding:5px 12px;border-radius:6px;cursor:pointer;font:inherit}
+nav button[aria-current="true"]{background:var(--accent);border-color:var(--accent);color:#fff}
+main{padding:16px;max-width:1100px;margin:0 auto}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;
+  color:var(--dim);margin:0 0 10px;font-weight:600}
+.big{font-size:26px;font-weight:600;letter-spacing:-.02em}
+.sub{color:var(--dim);font-size:12px}
+.row{display:flex;justify-content:space-between;gap:10px;padding:3px 0}
+.row span:last-child{font-variant-numeric:tabular-nums}
+.bar{height:7px;background:var(--line);border-radius:4px;overflow:hidden;margin:8px 0 4px}
+.bar>i{display:block;height:100%;background:var(--accent)}
+.bar>i.warn{background:var(--warn)} .bar>i.bad{background:var(--bad)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;color:var(--dim);font-weight:600;font-size:11px;
+  text-transform:uppercase;letter-spacing:.05em;padding:6px 8px;
+  border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel)}
+td{padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.tag{display:inline-block;padding:1px 7px;border-radius:20px;font-size:11px;
+  font-weight:600;border:1px solid currentColor}
+.path{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;
+  word-break:break-all;color:var(--dim)}
+.path b{color:var(--ink);font-weight:500}
+.err{color:var(--error);font-size:12px}
+.muted{color:var(--dim)}
+details.raw{margin-top:8px}
+details.raw summary{cursor:pointer;color:var(--dim);font-size:12px}
+details.raw pre{overflow:auto;background:var(--bg);padding:8px;border-radius:6px;
+  font-size:11px;max-height:260px}
+.hide{display:none}
+footer{padding:10px 16px;color:var(--dim);font-size:12px;border-top:1px solid var(--line)}
+</style>
+</head>
+<body>
+<header>
+  <h1>PAMTS <span id="sub">dashboard</span></h1>
+  <nav>
+    <button id="tab-now" aria-current="true">Now</button>
+    <button id="tab-history">History</button>
+  </nav>
+</header>
+
+<main>
+  <section id="view-now">
+    <div class="grid" id="cards"></div>
+    <div class="card" style="margin-top:12px">
+      <h2>Reading right now</h2>
+      <div id="live"></div>
+    </div>
+  </section>
+
+  <section id="view-history" class="hide">
+    <div class="card">
+      <h2>Classified sessions <span class="sub" id="hist-note"></span></h2>
+      <div style="overflow:auto;max-height:70vh">
+        <table id="sessions"><thead><tr>
+          <th>Time</th><th>Verdict</th><th>Client</th><th class="n">Size</th>
+          <th class="n">Cov</th><th class="n">Rate</th><th>File</th>
+        </tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer id="foot">loading…</footer>
+
+<script>
+// The page renders whatever /api/state returns. Known sources get a shaped card;
+// anything unrecognised is shown as raw JSON so a newly registered source is
+// visible immediately, without touching this file.
+const $ = s => document.querySelector(s);
+const fmtB = n => {
+  if (n == null) return "–";
+  const u = ["B","K","M","G","T"]; let i = 0, v = Number(n);
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v.toFixed(0) : v.toFixed(1)) + u[i];
+};
+const fmtT = ts => ts ? new Date(ts * 1000).toLocaleString(undefined,
+  {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit", second:"2-digit"}) : "–";
+const ago = ts => {
+  if (!ts) return "";
+  const s = Math.max(0, Date.now()/1000 - ts);
+  if (s < 90) return Math.round(s) + "s ago";
+  if (s < 5400) return Math.round(s/60) + "m ago";
+  if (s < 172800) return Math.round(s/3600) + "h ago";
+  return Math.round(s/86400) + "d ago";
+};
+const tag = l => `<span class="tag" style="color:var(--${(l||"unknown").toLowerCase()},var(--unknown))">${l||"?"}</span>`;
+const base = p => { if (!p) return ""; const i = p.lastIndexOf("/"); return i < 0 ? p : p.slice(i+1); };
+const dir = p => { if (!p) return ""; const i = p.lastIndexOf("/"); return i < 0 ? "" : p.slice(0,i+1); };
+const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function card(title, inner) {
+  return `<div class="card"><h2>${esc(title)}</h2>${inner}</div>`;
+}
+function rows(pairs) {
+  return pairs.filter(p => p).map(([k, v]) =>
+    `<div class="row"><span class="sub">${esc(k)}</span><span>${v}</span></div>`).join("");
+}
+
+// --- per-source renderers. Add one to show a new source nicely; omit it and the
+// --- source still appears, as raw JSON.
+const RENDER = {
+  observer(d) {
+    const s = d.stats || {};
+    const lost = d.lost_events;
+    const health = d.keeping_up
+      ? `<span style="color:var(--ok)">keeping up</span>`
+      : `<span style="color:var(--bad)">LOSING EVENTS (${lost})</span>`;
+    return card("Access observer",
+      `<div class="big">${(d.playing||[]).length} <span class="sub">playing now</span></div>` +
+      rows([
+        ["events seen", (s.records||0).toLocaleString()],
+        ["dropped by kernel", (s.kernel_dropped ?? "–")],
+        ["health", health],
+        ["sessions closed", (s.sessions_closed||0).toLocaleString()],
+        ["indexed files", (s.index_files||0).toLocaleString()],
+        s.bulk_suppressed != null ? ["sweeps suppressed", s.bulk_suppressed] : null,
+        s.arrivals != null ? ["arrivals seen", s.arrivals] : null,
+      ]));
+  },
+  tier(d) {
+    const f = d.used_fraction;
+    const cls = f == null ? "" : (f > 0.95 ? "bad" : f > 0.85 ? "warn" : "");
+    const bar = f == null ? "" :
+      `<div class="bar"><i class="${cls}" style="width:${Math.min(100, f*100).toFixed(1)}%"></i></div>
+       <div class="sub">${(f*100).toFixed(1)}% of ${fmtB(d.budget_bytes)} budget</div>`;
+    return card("Fast tier",
+      `<div class="big">${fmtB(d.used_bytes)}</div>${bar}` +
+      rows((d.jobs||[]).map(j => [j.name, j.bytes == null
+        ? `<span class="err">${esc(j.error||"?")}</span>`
+        : `${fmtB(j.bytes)} <span class="sub">${(j.files||0).toLocaleString()} files</span>`])));
+  },
+  state(d) {
+    return card("Promotion",
+      `<div class="big">${d.promotions ?? "–"} <span class="sub">protected</span></div>` +
+      rows([
+        ["measured rate", d.rate_bps ? fmtB(d.rate_bps) + "/s" : "–"],
+        ["observed plays", (d.observed_plays ?? 0).toLocaleString()],
+      ]) +
+      ((d.recent_promotions||[]).length
+        ? `<div class="sub" style="margin-top:8px">most recent</div>` +
+          (d.recent_promotions||[]).slice(0,4).map(p =>
+            `<div class="path" title="${esc(p.dir)}"><b>${esc(p.label||base(p.dir))}</b>
+             <span class="sub">${ago(p.at)}</span></div>`).join("")
+        : ""));
+  },
+  config(d) {
+    return card("Configuration",
+      rows([
+        ["budget", d.budget_gb ? d.budget_gb + " GB" : "–"],
+        ["pins", `${d.next_up_max_items ?? "–"} / ${d.next_up_max_gb ?? "–"} GB`],
+        ["players", (d.players||[]).map(p => esc(p.kind)).join(", ") || "–"],
+        ["roots", d.roots ?? "–"],
+      ]) +
+      `<div class="sub" style="margin-top:8px">jobs</div>` +
+      (d.jobs||[]).map(j =>
+        `<div class="row"><span class="path">${esc(j.name)}</span>
+         <span class="sub">${esc(j.mode)}${j.depth != null ? " d"+j.depth : ""}</span></div>`).join(""));
+  },
+  history(d) {
+    const l = d.labels_24h || {};
+    const keys = Object.keys(l).sort((a,b) => l[b]-l[a]);
+    return card("Last 24 hours",
+      keys.length
+        ? rows(keys.map(k => [k, l[k].toLocaleString()]))
+        : `<div class="muted">no sessions</div>`);
+  },
+};
+
+function renderNow(payload) {
+  const d = payload.data || {}, errs = payload.errors || {};
+  const order = ["observer", "tier", "state", "history", "config"];
+  const names = [...order.filter(n => n in d || n in errs),
+                 ...Object.keys(d).filter(n => !order.includes(n))];
+  $("#cards").innerHTML = names.map(n => {
+    if (errs[n]) return card(n, `<div class="err">${esc(errs[n])}</div>`);
+    const r = RENDER[n];
+    if (r) { try { return r(d[n]); } catch (e) { return card(n, `<div class="err">${esc(e)}</div>`); } }
+    // Unknown source: show it rather than hiding it.
+    return card(n, `<details class="raw" open><summary>raw</summary><pre>${
+      esc(JSON.stringify(d[n], null, 2))}</pre></details>`);
+  }).join("");
+
+  const live = (d.observer && d.observer.sessions) || [];
+  $("#live").innerHTML = live.length ? live.map(s =>
+    `<div class="row" style="align-items:flex-start">
+       <span>${tag(s.label)}
+         <span class="path"><b>${esc(base(s.path) || "unresolved")}</b><br>${esc(dir(s.path))}</span>
+       </span>
+       <span class="n">${fmtB(s.bytes)}<br>
+         <span class="sub">${s.coverage != null ? (s.coverage*100).toFixed(0)+"% · " : ""}${
+           esc(s.client||"")}</span></span>
+     </div>`).join("") : `<div class="muted">nothing being read</div>`;
+}
+
+function renderHistory(h) {
+  const tb = $("#sessions tbody");
+  tb.innerHTML = (h.sessions || []).map(s =>
+    `<tr>
+       <td class="sub" style="white-space:nowrap">${fmtT(s.ts)}</td>
+       <td>${tag(s.label)}</td>
+       <td class="sub">${esc(s.client||"")}</td>
+       <td class="n">${fmtB(s.bytes)}</td>
+       <td class="n sub">${s.coverage != null ? (s.coverage*100).toFixed(0)+"%" : "–"}</td>
+       <td class="n sub">${s.rate ? fmtB(s.rate)+"/s" : "–"}</td>
+       <td class="path"><b>${esc(base(s.path) || "unresolved")}</b></td>
+     </tr>`).join("") || `<tr><td colspan="7" class="muted">no sessions recorded</td></tr>`;
+  $("#hist-note").textContent = `${(h.sessions||[]).length} most recent`;
+}
+
+let failures = 0;
+async function tick() {
+  try {
+    const r = await fetch("api/state", {cache: "no-store"});
+    const p = await r.json();
+    renderNow(p);
+    const errs = Object.keys(p.errors || {});
+    $("#foot").innerHTML = `updated ${fmtT(p.generated)}` +
+      (errs.length ? ` · <span class="err">unavailable: ${esc(errs.join(", "))}</span>` : "");
+    failures = 0;
+  } catch (e) {
+    failures++;
+    $("#foot").innerHTML = `<span class="err">cannot reach pamts-web (${failures})</span>`;
+  }
+  if (!$("#view-history").classList.contains("hide")) {
+    try { renderHistory(await (await fetch("api/history?limit=200", {cache:"no-store"})).json()); }
+    catch (e) { /* the Now view already reports connectivity */ }
+  }
+}
+
+function show(which) {
+  const now = which === "now";
+  $("#view-now").classList.toggle("hide", !now);
+  $("#view-history").classList.toggle("hide", now);
+  $("#tab-now").setAttribute("aria-current", String(now));
+  $("#tab-history").setAttribute("aria-current", String(!now));
+  tick();
+}
+$("#tab-now").onclick = () => show("now");
+$("#tab-history").onclick = () => show("history");
+
+tick();
+setInterval(tick, 5000);
+</script>
+</body>
+</html>

@@ -194,6 +194,23 @@ which also covers two gotchas worth reading before you configure music: LMS expo
 play history at all, and Navidrome's annotations are per-user so a fresh service account
 reports nothing.
 
+## Dashboard
+
+```sh
+pamts-web.py --config /etc/pamts/pamts.toml --listen 127.0.0.1:8622
+```
+
+Current state and history, in one page, standard library only and no build step.
+Shows the fast tier against its budget, what is being read right now with each
+verdict, recent promotions, and the classified session log — which is the useful
+part, because it shows what was *rejected* as well as what counted.
+
+Adding a data source is one class and one registry line, and **the page renders it
+without being changed**: an unrecognised source is shown as raw JSON rather than
+hidden. See [DASHBOARD.md](docs/DASHBOARD.md).
+
+No authentication; it binds localhost by default. See the doc before exposing it.
+
 ## Requirements
 
 - Python **3.11+** (for `tomllib`)
@@ -222,6 +239,7 @@ needed on the file server, and no `tracefs` mount or restart is required.
 | [Design](docs/DESIGN.md) | why playback-only, why copy-not-move, why not atime |
 | [Players](docs/PLAYERS.md) | write an adapter for another media server |
 | [Observer](docs/OBSERVER.md) | the eBPF access tap: what it sees, and the traps |
+| [Dashboard](docs/DASHBOARD.md) | the web view, and how to add a data source |
 
 ## Testing
 

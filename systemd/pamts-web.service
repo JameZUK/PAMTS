@@ -1,0 +1,35 @@
+# PAMTS dashboard.
+#
+# There is NO authentication. It is read-only -- nothing here can change state -- but
+# the data includes file paths and client addresses.
+#
+# --listen 0.0.0.0:8622 makes it reachable from the local network, which is the point
+# of a dashboard. On an untrusted network, put a reverse proxy with auth in front of
+# it instead, or bind 127.0.0.1 and tunnel.
+#
+# It reads: the observer's HTTP API, the observer's SQLite store (read-only), the
+# state file, the config, and the tier directories. It writes nothing.
+[Unit]
+Description=PAMTS dashboard
+Documentation=https://github.com/JameZUK/PAMTS/blob/main/docs/DASHBOARD.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/pamts/pamts-web.py \
+    --config /etc/pamts/pamts.toml \
+    --observer-url http://127.0.0.1:8621 \
+    --observer-db /var/lib/pamts/observer.db \
+    --state-file /var/lib/pamts/state.json \
+    --listen 0.0.0.0:8622
+Restart=always
+RestartSec=10
+# The tier footprint scan is the only heavy thing it does, and it must never
+# compete with serving media.
+Nice=15
+IOSchedulingClass=idle
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
