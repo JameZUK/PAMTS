@@ -637,6 +637,18 @@ The startup index now runs in the **background** and the daemon serves immediate
 API came up in 1 ms instead of 102 s. Lookups miss until the index lands, which is the
 contract rebuilds already used.
 
+**And raise `--index-max-age` well above its default when indexing a union.** A lookup
+miss on a stale index triggers a rebuild, so at the 900 s default an array with
+`hddstandby` set gets woken every 15 minutes and never sleeps. Observed rebuilds were
+taking 118–140 s and finding **zero** new files each time, which is pure cost. 6 hours
+is a reasonable value: the price is that a freshly arrived file stays unresolvable for
+longer, and arrivals are tracked separately anyway — on a 225,318-file index, only 3
+lookups were missing.
+
+The proper fix, if this ever matters more, is a persisted index refreshed
+incrementally: mergerfs inodes are deterministic, so a stored map stays valid and only
+directories whose mtime changed need rewalking.
+
 ### Knowing whether you lost events
 
 A full ring buffer drops silently. Without a counter, "nothing is happening" and
