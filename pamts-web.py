@@ -10,7 +10,7 @@ no change here.
 
     GET /                      the dashboard
     GET /api/state             every source's current view, plus per-source errors
-    GET /api/history?since=&limit=
+    GET /api/history?since=&limit=&labels=PLAY,FETCH
     GET /api/sources           what is registered and whether it is available
     GET /health
 
@@ -81,12 +81,20 @@ def make_handler(sources, page_path):
                 elif u.path == "/api/history":
                     since = float(q.get("since", ["0"])[0])
                     limit = int(q.get("limit", ["200"])[0])
+                    # labels= restricts the verdicts returned. Omit it for all of
+                    # them; labels=demand is shorthand for whatever the observer
+                    # counts as demand, so the page need not hardcode the set.
+                    raw = ",".join(q.get("labels", []))
+                    labels = [x.strip().upper() for x in raw.split(",") if x.strip()]
+                    if labels == ["DEMAND"]:
+                        labels = list(pamts_dash.DEMAND_LABELS)
                     hist = next((s for s in sources if s.name == "history"), None)
                     if hist is None or not hist.available():
                         self._send({"error": "history source unavailable"}, code=503)
                     else:
                         self._send({"generated": time.time(),
-                                    **hist.collect(since=since, limit=limit)})
+                                    **hist.collect(since=since, limit=limit,
+                                                   labels=labels or None)})
                 else:
                     self._send({"error": "not found"}, code=404)
             except Exception as e:                              # noqa: BLE001

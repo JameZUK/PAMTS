@@ -60,6 +60,14 @@ details.raw summary{cursor:pointer;color:var(--dim);font-size:12px}
 details.raw pre{overflow:auto;background:var(--bg);padding:8px;border-radius:6px;
   font-size:11px;max-height:260px}
 .hide{display:none}
+.filter{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:0 0 10px}
+.filter button{background:none;border:1px solid var(--line);color:var(--dim);
+  padding:3px 10px;border-radius:20px;cursor:pointer;font:inherit;font-size:12px}
+.filter button[aria-pressed="true"]{border-color:currentColor;font-weight:600}
+.filter button.preset{border-radius:6px;color:var(--ink)}
+.filter button.preset[aria-pressed="true"]{background:var(--accent);
+  border-color:var(--accent);color:#fff}
+.filter .count{color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums}
 footer{padding:10px 16px;color:var(--dim);font-size:12px;border-top:1px solid var(--line)}
 </style>
 </head>
@@ -76,7 +84,7 @@ footer{padding:10px 16px;color:var(--dim);font-size:12px;border-top:1px solid va
   <section id="view-now">
     <div class="grid" id="cards"></div>
     <div class="card" style="margin-top:12px">
-      <h2>Reading right now</h2>
+      <h2>Reading right now <span class="sub" id="live-note"></span></h2>
       <div id="live"></div>
     </div>
   </section>
@@ -84,6 +92,7 @@ footer{padding:10px 16px;color:var(--dim);font-size:12px;border-top:1px solid va
   <section id="view-history" class="hide">
     <div class="card">
       <h2>Classified sessions <span class="sub" id="hist-note"></span></h2>
+      <div class="filter" id="filter"></div>
       <div style="overflow:auto;max-height:70vh">
         <table id="sessions"><thead><tr>
           <th>Time</th><th>Verdict</th><th>Client</th><th class="n">Size</th>
@@ -215,7 +224,11 @@ function renderNow(payload) {
       esc(JSON.stringify(d[n], null, 2))}</pre></details>`);
   }).join("");
 
-  const live = (d.observer && d.observer.sessions) || [];
+  const all = (d.observer && d.observer.sessions) || [];
+  const live = liveFilter(all);
+  const hidden = all.length - live.length;
+  $("#live-note").textContent = hidden > 0
+    ? `${hidden} hidden by filter` : "";
   $("#live").innerHTML = live.length ? live.map(s =>
     `<div class="row" style="align-items:flex-start">
        <span>${tag(s.label)}
@@ -224,10 +237,17 @@ function renderNow(payload) {
        <span class="n">${fmtB(s.bytes)}<br>
          <span class="sub">${s.coverage != null ? (s.coverage*100).toFixed(0)+"% · " : ""}${
            esc(s.client||"")}</span></span>
-     </div>`).join("") : `<div class="muted">nothing being read</div>`;
+     </div>`).join("")
+    : `<div class="muted">${all.length
+        ? "nothing matching the filter is being read"
+        : "nothing being read"}</div>`;
 }
 
 function renderHistory(h) {
+  if (h.demand_labels) window.__demand = h.demand_labels;
+  if (h.available_labels && h.available_labels.length) knownLabels = h.available_labels;
+  if (!selected) selected = loadSelection() || (h.demand_labels || ["PLAY","FETCH"]).slice();
+  renderFilter(h.labels_24h);
   const tb = $("#sessions tbody");
   tb.innerHTML = (h.sessions || []).map(s =>
     `<tr>
@@ -238,8 +258,72 @@ function renderHistory(h) {
        <td class="n sub">${s.coverage != null ? (s.coverage*100).toFixed(0)+"%" : "–"}</td>
        <td class="n sub">${s.rate ? fmtB(s.rate)+"/s" : "–"}</td>
        <td class="path"><b>${esc(base(s.path) || "unresolved")}</b></td>
-     </tr>`).join("") || `<tr><td colspan="7" class="muted">no sessions recorded</td></tr>`;
-  $("#hist-note").textContent = `${(h.sessions||[]).length} most recent`;
+     </tr>`).join("")
+    || `<tr><td colspan="7" class="muted">no sessions match this filter</td></tr>`;
+  $("#hist-note").textContent =
+    `${(h.sessions||[]).length} most recent` +
+    (h.filtered_by ? ` of ${h.filtered_by.join(", ")}` : " (all verdicts)");
+}
+
+// Which verdicts to show. Copies and scans outnumber plays by hundreds to one, so
+// the default is the observer's own notion of demand -- otherwise the view is a wall
+// of COPY with the occasional play buried in it. null means "not chosen yet", and is
+// replaced by the server's demand set on first load.
+let selected = null;
+let knownLabels = [];
+
+function loadSelection() {
+  try {
+    const v = localStorage.getItem("pamts.labels");
+    if (v) return JSON.parse(v);
+  } catch (e) { /* private window, blocked storage: fall back to the default */ }
+  return null;
+}
+function saveSelection() {
+  try { localStorage.setItem("pamts.labels", JSON.stringify(selected)); }
+  catch (e) { /* non-fatal: the filter just will not be remembered */ }
+}
+
+function renderFilter(counts) {
+  const el = $("#filter");
+  if (!el) return;
+  const demand = (window.__demand || ["PLAY", "FETCH"]);
+  const isDemand = selected && selected.length === demand.length &&
+                   demand.every(l => selected.includes(l));
+  const isAll = selected && selected.length === knownLabels.length;
+  const chip = (l) => {
+    const on = selected ? selected.includes(l) : false;
+    const n = (counts && counts[l]) != null ? ` <span class="count">${counts[l].toLocaleString()}</span>` : "";
+    return `<button data-label="${esc(l)}" aria-pressed="${on}"
+      style="color:var(--${l.toLowerCase()},var(--unknown))">${esc(l)}${n}</button>`;
+  };
+  el.innerHTML =
+    `<button class="preset" data-preset="demand" aria-pressed="${!!isDemand}"
+       title="Only what counted as someone wanting the file">Media only</button>` +
+    `<button class="preset" data-preset="all" aria-pressed="${!!isAll}"
+       title="Every verdict, including scans and copies">All</button>` +
+    `<span class="sub" style="margin:0 4px">·</span>` +
+    knownLabels.map(chip).join("");
+
+  el.querySelectorAll("button").forEach(b => b.onclick = () => {
+    const pre = b.dataset.preset;
+    if (pre === "demand") selected = demand.slice();
+    else if (pre === "all") selected = knownLabels.slice();
+    else {
+      const l = b.dataset.label;
+      selected = selected ? selected.slice() : [];
+      selected = selected.includes(l) ? selected.filter(x => x !== l) : [...selected, l];
+    }
+    saveSelection();
+    tick();
+  });
+}
+
+// The live list uses the same selection, so "media only" means the same thing in
+// both views.
+function liveFilter(sessions) {
+  if (!selected || !selected.length) return sessions;
+  return sessions.filter(s => selected.includes(s.label));
 }
 
 let failures = 0;
@@ -257,7 +341,12 @@ async function tick() {
     $("#foot").innerHTML = `<span class="err">cannot reach pamts-web (${failures})</span>`;
   }
   if (!$("#view-history").classList.contains("hide")) {
-    try { renderHistory(await (await fetch("api/history?limit=200", {cache:"no-store"})).json()); }
+    // Filter server-side: with copies outnumbering plays hundreds to one, filtering
+    // the most recent 200 rows client-side would show almost nothing.
+    const q = selected && selected.length && selected.length !== knownLabels.length
+      ? "&labels=" + encodeURIComponent(selected.join(","))
+      : (selected === null ? "&labels=demand" : "");
+    try { renderHistory(await (await fetch("api/history?limit=200" + q, {cache:"no-store"})).json()); }
     catch (e) { /* the Now view already reports connectivity */ }
   }
 }

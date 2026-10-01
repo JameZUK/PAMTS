@@ -33,6 +33,28 @@ coverage, rate, file. This is the view worth having, because it shows what was
 *rejected* as well as what counted. `PROBE` and `COPY` rows are the system declining
 to treat a scan as demand.
 
+### Filtering, and why it is server-side
+
+Scans and copies outnumber plays enormously. On a real estate, the 200 most recent
+sessions were **200 `COPY` and zero plays** — the unfiltered view was not merely
+cluttered, it showed no media activity at all.
+
+So the filter is applied **in SQL**, not in the page. A client-side filter on the most
+recent 200 rows would have discarded 200 of them and shown nothing.
+
+`Media only` is the default and uses the observer's own notion of demand
+(`PLAY`, `FETCH`); `All` shows every verdict; the individual chips toggle one at a
+time, with 24-hour counts beside each. The chip list is built from the labels **present
+in the data**, so a verdict added later appears without touching the page. The
+selection is remembered per browser and applies to the live list too, so "media only"
+means the same thing in both views.
+
+    GET /api/history?labels=PLAY,FETCH
+    GET /api/history?labels=demand        # whatever the observer counts as demand
+
+Labels arrive from a query string and are passed as SQL parameters; there is a test
+asserting a label containing SQL is treated as data.
+
 ## Adding a source
 
 This is the extension point. A source is one class and one registry line — the same

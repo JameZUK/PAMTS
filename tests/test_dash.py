@@ -138,6 +138,33 @@ check("since= filters", len(h.collect(since=now + 100)["sessions"]) == 0)
 check("limit caps the result", len(h.collect(limit=2)["sessions"]) == 2)
 check("it opens the db READ-ONLY, so a running daemon is undisturbed",
       "mode=ro" in dash.HistorySource.__dict__["_conn"].__code__.co_consts[1])
+# Copies and scans outnumber plays by hundreds to one, so filtering has to happen in
+# SQL. A client-side filter on the most recent N rows would discard nearly all of them.
+print("\nhistory: label filtering")
+check("filtering returns only the asked-for verdicts",
+      [x["label"] for x in h.collect(labels=["PLAY"])["sessions"]] == ["PLAY"],
+      str([x["label"] for x in h.collect(labels=["PLAY"])["sessions"]]))
+check("several labels are allowed",
+      sorted(x["label"] for x in h.collect(labels=["PLAY", "COPY"])["sessions"])
+      == ["COPY", "PLAY"])
+check("no filter means everything", len(h.collect()["sessions"]) == 4)
+check("an unmatched label returns nothing, not everything",
+      h.collect(labels=["NOPE"])["sessions"] == [])
+check("the response says what it filtered by",
+      h.collect(labels=["PLAY"])["filtered_by"] == ["PLAY"])
+check("...and None when unfiltered", h.collect()["filtered_by"] is None)
+check("available labels are discovered from the data, not hardcoded",
+      h.collect()["available_labels"] == ["BULK", "COPY", "PLAY", "PROBE"],
+      str(h.collect()["available_labels"]))
+check("the demand set is published so the UI need not hardcode it",
+      h.collect()["demand_labels"] == list(dash.DEMAND_LABELS))
+# labels arrive from a query string, so they must be parameterised
+check("a label containing SQL is treated as data",
+      h.collect(labels=["PLAY'; DROP TABLE sessions; --"])["sessions"] == [])
+check("...and the table survived", len(h.collect()["sessions"]) == 4)
+check("limit still applies alongside a filter",
+      len(h.collect(labels=["PLAY", "COPY", "PROBE", "BULK"], limit=2)["sessions"]) == 2)
+
 check("unavailable when the db is missing",
       not dash.HistorySource({"observer_db": "/nope.db"}).available())
 

@@ -221,6 +221,13 @@ class TierSource(Source):
         }
 
 
+#: What counts as someone actually wanting the file. Must match DEMAND in the
+#: observer daemon: PROBE, COPY, BULK and IMPORT are the system declining to treat a
+#: scan as demand, and they outnumber real plays by roughly 600 to 1 -- so an
+#: unfiltered history view shows essentially no plays at all.
+DEMAND_LABELS = ("PLAY", "FETCH")
+
+
 class HistorySource(Source):
     """Recent sessions and play history, read straight from the observer's store.
 
@@ -244,17 +251,29 @@ class HistorySource(Source):
         # Read-only, so a running daemon is never disturbed.
         return sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, timeout=5)
 
-    def collect(self, since=0.0, limit=None):
+    def collect(self, since=0.0, limit=None, labels=None):
+        """`labels` restricts which verdicts are returned.
+
+        Filtering here rather than in the page is not an optimisation, it is the
+        difference between the view working and not: copies and scans outnumber plays
+        by hundreds to one, so a client-side filter on the most recent N rows would
+        discard almost all of them and show nothing.
+        """
         limit = int(limit or self.limit)
         con = self._conn()
         try:
+            where, params = "ts > ?", [since]
+            if labels:
+                labels = [str(l) for l in labels]
+                where += " AND label IN (%s)" % ",".join("?" * len(labels))
+                params += labels
             sessions = [
                 {"ts": r[0], "label": r[1], "client": r[2], "bytes": r[3],
                  "coverage": r[4], "duration": r[5], "rate": r[6], "path": r[7]}
                 for r in con.execute(
                     "SELECT ts,label,client,bytes,coverage,duration,rate,path "
-                    "FROM sessions WHERE ts > ? ORDER BY ts DESC LIMIT ?",
-                    (since, limit))]
+                    f"FROM sessions WHERE {where} ORDER BY ts DESC LIMIT ?",
+                    (*params, limit))]
             plays = [
                 {"path": r[0], "last_play": r[1], "play_count": r[2], "label": r[3]}
                 for r in con.execute(
@@ -266,7 +285,14 @@ class HistorySource(Source):
                     "SELECT label, COUNT(*) FROM sessions WHERE ts > ? GROUP BY label",
                     (time.time() - 86400,)):
                 counts[lab] = n
-            return {"sessions": sessions, "plays": plays, "labels_24h": counts}
+            # Offer the labels that actually exist rather than a hardcoded list, so
+            # a verdict added later appears in the UI without the page changing.
+            known = [r[0] for r in con.execute(
+                "SELECT DISTINCT label FROM sessions WHERE ts > ? ORDER BY label",
+                (time.time() - 7 * 86400,)) if r[0]]
+            return {"sessions": sessions, "plays": plays, "labels_24h": counts,
+                    "available_labels": known, "demand_labels": list(DEMAND_LABELS),
+                    "filtered_by": list(labels) if labels else None}
         finally:
             con.close()
 
