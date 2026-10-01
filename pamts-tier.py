@@ -111,11 +111,19 @@ def scan_dir(path, views=None, pins=None):
 
     Symlinks count as zero and are never followed, so a link cannot inflate a
     directory's size or drag in another tree's timestamps.
+
+    `mtime` is the newest CONTENT file's mtime: metadata written beside the media
+    ([tier] sidecar_suffixes) is ignored, because ranking falls back to mtime whenever
+    there is no play record, and a nightly .nfo rewrite would otherwise make every
+    never-played item look brand new. `mtime_any` keeps the unfiltered value for
+    diagnostics. A directory holding only sidecars falls back to their mtime rather
+    than reporting zero.
     """
     views = views or {}
     pins = pins or {}
     suffixes = tuple(pamts.TIER["inprogress_suffixes"])
-    out = {"size": 0, "mtime": 0, "inprogress": False, "last_view": 0,
+    sidecars = tuple(s.lower() for s in pamts.TIER["sidecar_suffixes"])
+    out = {"size": 0, "mtime": 0, "mtime_any": 0, "inprogress": False, "last_view": 0,
            "pinned_bytes": 0, "pinned_rels": []}
     for dirpath, _dirs, files in os.walk(path, followlinks=False):
         for fn in files:
@@ -127,13 +135,17 @@ def scan_dir(path, views=None, pins=None):
             if os.path.islink(fp):
                 continue
             out["size"] += st.st_size
-            out["mtime"] = max(out["mtime"], st.st_mtime)
+            out["mtime_any"] = max(out["mtime_any"], st.st_mtime)
+            if not fn.lower().endswith(sidecars):
+                out["mtime"] = max(out["mtime"], st.st_mtime)
             out["last_view"] = max(out["last_view"], views.get(fp, 0))
             if fp in pins:
                 out["pinned_bytes"] += st.st_size
                 out["pinned_rels"].append(os.path.relpath(fp, path))
             if fn.endswith(suffixes):
                 out["inprogress"] = True
+    if not out["mtime"]:
+        out["mtime"] = out["mtime_any"]
     return out
 
 
@@ -155,8 +167,24 @@ def cleanup_empty_dirs(root, dry_run):
 
 
 def run_rsync(cmd, dry_run):
+    cmd = list(cmd)
     if dry_run and "--dry-run" not in cmd:
-        cmd = list(cmd[:1]) + ["--dry-run"] + list(cmd[1:])
+        # --dry-run belongs after the RSYNC executable, which is not always argv[0]:
+        # eviction prefixes the command with `ionice -c3`. Inserting at index 1 put the
+        # flag where ionice parses its own options, so ionice exited with
+        # "unrecognized option '--dry-run'" and every eviction dry run failed at its
+        # first item instead of reporting a plan. Backups were unaffected because their
+        # argv starts with rsync, which is why this went unnoticed.
+        try:
+            i = next(n for n, a in enumerate(cmd)
+                     if os.path.basename(str(a)) == "rsync")
+        except StopIteration:
+            # Do NOT fall through to a real transfer because the flag could not be
+            # placed. A dry run that silently copies is far worse than one that fails.
+            logging.error("cannot find rsync in %r - refusing to run it at all rather "
+                          "than risk a real transfer during a dry run", cmd)
+            return 1, "", "rsync not found in argv; refusing to run"
+        cmd.insert(i + 1, "--dry-run")
     logging.debug("rsync: %s", " ".join(cmd))
     p = subprocess.run(cmd, capture_output=True, text=True)
     return p.returncode, p.stdout, p.stderr

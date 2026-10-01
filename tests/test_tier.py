@@ -869,6 +869,133 @@ check("half-full is in between",
 check("over budget still pins one", pamts.pin_depth(B * 2, B) == 1,
       str(pamts.pin_depth(B * 2, B)))
 
+# ------------------------------------------------------------------- sidecar mtime
+print("=== SIDECAR mtime: a metadata rewrite must not make content look fresh")
+_sroot = pathlib.Path(tempfile.mkdtemp(prefix="pamts-sidecar-"))
+# An album last touched 400 days ago, whose album.nfo was rewritten minutes ago --
+# exactly what Lidarr's XbmcMetadata consumer did to 6,436 directories nightly.
+mkfile(_sroot / "album" / "01.flac", size=4096, mtime_days=400)
+mkfile(_sroot / "album" / "album.nfo", size=300, mtime_days=0)
+_d = tier.scan_dir(str(_sroot / "album"))
+_age_days = (time.time() - _d["mtime"]) / 86400
+check("mtime comes from the media file, not the .nfo", _age_days > 399,
+      f"mtime is {_age_days:.1f} days old")
+check("mtime_any still reports the unfiltered newest file",
+      (time.time() - _d["mtime_any"]) / 86400 < 1,
+      f"mtime_any is {(time.time() - _d['mtime_any']) / 86400:.2f} days old")
+check("size still counts the sidecar", _d["size"] == 4096 + 300, str(_d["size"]))
+
+# Artwork, subtitles and playlists are sidecars too.
+for _sc in ("cover.jpg", "folder.png", "sub.srt", "list.m3u", "x.lrc"):
+    mkfile(_sroot / "many" / _sc, size=10, mtime_days=0)
+mkfile(_sroot / "many" / "track.mp3", size=2048, mtime_days=200)
+_d = tier.scan_dir(str(_sroot / "many"))
+check("several sidecar types are all ignored",
+      (time.time() - _d["mtime"]) / 86400 > 199,
+      f"mtime is {(time.time() - _d['mtime']) / 86400:.1f} days old")
+
+# A directory of nothing but sidecars must not report mtime 0: that would sort it to
+# the very front of the eviction queue on a fabricated timestamp.
+mkfile(_sroot / "only" / "album.nfo", size=100, mtime_days=30)
+_d = tier.scan_dir(str(_sroot / "only"))
+check("a sidecar-only directory falls back rather than reporting zero",
+      _d["mtime"] > 0 and abs(_d["mtime"] - _d["mtime_any"]) < 1,
+      f"mtime={_d['mtime']} mtime_any={_d['mtime_any']}")
+
+# And the ranking consequence: the stamped album must still be evicted before an
+# album whose CONTENT is genuinely new.
+mkfile(_sroot / "tier" / "Old Album" / "01.flac", size=1024 * 1024, mtime_days=400)
+mkfile(_sroot / "tier" / "Old Album" / "album.nfo", size=200, mtime_days=0)
+mkfile(_sroot / "tier" / "New Album" / "01.flac", size=1024 * 1024, mtime_days=1)
+_slow = _sroot / "slowside"
+captured.clear()
+tier.do_tier([job("tier", _sroot / "tier", _slow, depth=1, grace=False)],
+             budget=1024 * 1024, dry_run=False, views={})
+_moved = [" ".join(c) for c in captured if "--remove-source-files" in c]
+check("the .nfo-stamped old album is the one evicted",
+      any("Old Album" in m for m in _moved), str(_moved))
+check("the genuinely new album is kept",
+      not any("New Album" in m for m in _moved), str(_moved))
+shutil.rmtree(_sroot, ignore_errors=True)
+
+print("=== CONFIG: suffix lists are validated")
+
+
+def _suffix_err(toml_frag):
+    d = pathlib.Path(tempfile.mkdtemp(prefix="pamts-suf-"))
+    f = d / "pamts.toml"
+    f.write_text('[[players]]\nname = "p"\nurl = "http://x"\ntoken_file = "/dev/null"\n'
+                 '[[roots]]\nplayer_path = "/p"\nfast = "/f"\nslow = "/s"\n'
+                 '[[jobs]]\nname = "t"\nmode = "tier"\nsource = "/a"\ndest = "/b"\n'
+                 + toml_frag)
+    try:
+        pamts.load_and_configure(str(f))
+        return None
+    except pamts.ConfigError as e:
+        return str(e)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+e = _suffix_err('[tier]\nsidecar_suffixes = ["nfo"]\n')
+check("a suffix without a leading dot is refused", e is not None and "'.'" in e, repr(e))
+e = _suffix_err('[tier]\nsidecar_suffixes = ".nfo"\n')
+check("a bare string instead of a list is refused",
+      e is not None and "list of suffixes" in e, repr(e))
+e = _suffix_err('[tier]\nsidecar_suffixes = [".nfo", ".jpg"]\n')
+check("a well-formed list is accepted", e is None, repr(e))
+
+
+# ------------------------------------------------------------------ dry-run plumbing
+print("=== DRY RUN: --dry-run lands after rsync, not after an ionice prefix")
+_seen = []
+
+
+def _capture(cmd, dry_run):
+    _seen.append(list(cmd))
+    return 0, "", ""
+
+
+_saved_run = tier.run_rsync
+tier.run_rsync = _real          # the genuine implementation, not the spy
+try:
+    import subprocess as _sp
+    _calls = []
+    _saved_sp = _sp.run
+
+    def _fake_run(cmd, **kw):
+        _calls.append(list(cmd))
+        class R:
+            returncode, stdout, stderr = 0, "", ""
+        return R()
+    _sp.run = _fake_run
+    tier.run_rsync(["ionice", "-c3", "rsync", "-a", "/src", "/dst"], dry_run=True)
+    got = _calls[-1]
+    check("the ionice prefix survives", got[:2] == ["ionice", "-c3"], str(got))
+    check("--dry-run goes immediately after rsync, where rsync will parse it",
+          got[2] == "rsync" and got[3] == "--dry-run", str(got))
+    tier.run_rsync(["rsync", "-a", "--delete", "/src", "/dst"], dry_run=True)
+    got = _calls[-1]
+    check("an unprefixed rsync still gets the flag in position 1",
+          got[0] == "rsync" and got[1] == "--dry-run", str(got))
+    tier.run_rsync(["ionice", "-c3", "rsync", "-a", "/s", "/d"], dry_run=False)
+    check("a real run gets no --dry-run", "--dry-run" not in _calls[-1],
+          str(_calls[-1]))
+    tier.run_rsync(["rsync", "--dry-run", "-a", "/s", "/d"], dry_run=True)
+    check("an already-present --dry-run is not duplicated",
+          _calls[-1].count("--dry-run") == 1, str(_calls[-1]))
+    # The dangerous case: if the flag cannot be placed, nothing must run at all.
+    _before = len(_calls)
+    rc, _o, err = tier.run_rsync(["ionice", "-c3", "notrsync", "/s", "/d"],
+                                 dry_run=True)
+    check("when rsync is not in argv the command is NOT executed",
+          len(_calls) == _before, f"{len(_calls) - _before} command(s) ran")
+    check("and it reports failure rather than succeeding silently", rc != 0, str(rc))
+finally:
+    _sp.run = _saved_sp
+    tier.run_rsync = _saved_run
+
+
 # ------------------------------------------------------------- per-job tier budget
 print("=== BUDGET GROUPS: a job with its own budget_gb does not share a pool")
 

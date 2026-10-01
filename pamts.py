@@ -57,6 +57,18 @@ DEFAULTS = {
         # the originals. Set this to the filesystem type your slow tier really is.
         # Use ["*"] to disable the check entirely (NOT recommended).
         "dest_fstypes": ["nfs", "nfs4"],
+        # Metadata written beside the media -- .nfo, artwork, subtitles, playlists.
+        # These are EXCLUDED from a directory's mtime, because ranking uses mtime
+        # whenever there is no play record and a metadata rewrite is not a sign the
+        # content is fresh. Lidarr's XbmcMetadata consumer rewrote 6,436 album.nfo
+        # files nightly on this estate, which stamped every album with today's date and
+        # sorted never-played albums to the BACK of the eviction queue -- the opposite
+        # of what was wanted. A directory holding nothing but sidecars falls back to
+        # their mtime, so this can never report a mtime of zero.
+        "sidecar_suffixes": [".nfo", ".jpg", ".jpeg", ".png", ".webp", ".tbn",
+                             ".srt", ".sub", ".idx", ".ass", ".ssa", ".vtt",
+                             ".cue", ".lrc", ".m3u", ".m3u8", ".txt", ".sfv",
+                             ".md5", ".bif", ".theme"],
         "inprogress_suffixes": [".part", ".tmp", ".!qB", ".partial", ".crdownload"],
     },
     "promote": {
@@ -311,6 +323,14 @@ def configure(raw):
         raise ConfigError("[promote] time_safety must be between 0 and 1")
     if int(TIER["pin_depth_max"]) < 1:
         raise ConfigError("[tier] pin_depth_max must be at least 1")
+    for key in ("sidecar_suffixes", "inprogress_suffixes"):
+        val = TIER[key]
+        if not isinstance(val, (list, tuple)):
+            raise ConfigError(f"[tier] {key} must be a list of suffixes")
+        for suf in val:
+            if not isinstance(suf, str) or not suf.startswith("."):
+                raise ConfigError(f"[tier] {key} entries must be strings starting with "
+                                  f"'.', got {suf!r}")
     return True
 
 
