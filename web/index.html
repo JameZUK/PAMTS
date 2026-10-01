@@ -10,6 +10,7 @@
   --accent:#2563eb; --ok:#15803d; --warn:#b45309; --bad:#b91c1c;
   --play:#15803d; --probe:#6b7280; --copy:#b45309; --bulk:#7c3aed;
   --fetch:#0369a1; --unknown:#9ca3af; --seek:#0f766e; --error:#b91c1c;
+  --hot:#15803d; --cold:#6e7781;
 }
 @media (prefers-color-scheme: dark){
   :root:not([data-theme="light"]){
@@ -17,6 +18,7 @@
     --accent:#60a5fa; --ok:#4ade80; --warn:#fbbf24; --bad:#f87171;
     --play:#4ade80; --probe:#9aa1ad; --copy:#fbbf24; --bulk:#c084fc;
     --fetch:#38bdf8; --unknown:#6b7280; --seek:#2dd4bf; --error:#f87171;
+    --hot:#4ade80; --cold:#9aa1ad;
   }
 }
 *{box-sizing:border-box}
@@ -95,7 +97,7 @@ footer{padding:10px 16px;color:var(--dim);font-size:12px;border-top:1px solid va
       <div class="filter" id="filter"></div>
       <div style="overflow:auto;max-height:70vh">
         <table id="sessions"><thead><tr>
-          <th>Time</th><th>Verdict</th><th>Client</th><th class="n">Size</th>
+          <th>Time</th><th>Verdict</th><th>Tier</th><th>Client</th><th class="n">Size</th>
           <th class="n">Cov</th><th class="n">Rate</th><th>File</th>
         </tr></thead><tbody></tbody></table>
       </div>
@@ -127,6 +129,13 @@ const ago = ts => {
   return Math.round(s/86400) + "d ago";
 };
 const tag = l => `<span class="tag" style="color:var(--${(l||"unknown").toLowerCase()},var(--unknown))">${l||"?"}</span>`;
+// Which tier served the read. Recorded when it happened, not derived now: the file
+// may have moved tiers since, so a lookup today would answer a different question.
+const tierTag = t => (t === "hot" || t === "cold")
+  ? `<span class="tag" style="color:var(--${t})" title="${t === "hot"
+      ? "served from the fast tier"
+      : "served from the slow tier - this read woke the array"}">${t.toUpperCase()}</span>`
+  : `<span class="sub">–</span>`;
 const base = p => { if (!p) return ""; const i = p.lastIndexOf("/"); return i < 0 ? p : p.slice(i+1); };
 const dir = p => { if (!p) return ""; const i = p.lastIndexOf("/"); return i < 0 ? "" : p.slice(0,i+1); };
 const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c =>
@@ -231,7 +240,7 @@ function renderNow(payload) {
     ? `${hidden} hidden by filter` : "";
   $("#live").innerHTML = live.length ? live.map(s =>
     `<div class="row" style="align-items:flex-start">
-       <span>${tag(s.label)}
+       <span>${tag(s.label)} ${tierTag(s.tier)}
          <span class="path"><b>${esc(base(s.path) || "unresolved")}</b><br>${esc(dir(s.path))}</span>
        </span>
        <span class="n">${fmtB(s.bytes)}<br>
@@ -253,16 +262,31 @@ function renderHistory(h) {
     `<tr>
        <td class="sub" style="white-space:nowrap">${fmtT(s.ts)}</td>
        <td>${tag(s.label)}</td>
+       <td>${tierTag(s.tier)}</td>
        <td class="sub">${esc(s.client||"")}</td>
        <td class="n">${fmtB(s.bytes)}</td>
        <td class="n sub">${s.coverage != null ? (s.coverage*100).toFixed(0)+"%" : "–"}</td>
        <td class="n sub">${s.rate ? fmtB(s.rate)+"/s" : "–"}</td>
        <td class="path"><b>${esc(base(s.path) || "unresolved")}</b></td>
      </tr>`).join("")
-    || `<tr><td colspan="7" class="muted">no sessions match this filter</td></tr>`;
+    || `<tr><td colspan="8" class="muted">no sessions match this filter</td></tr>`;
+  // Where demand reads came from over 24h. Restricted to PLAY/FETCH server-side: a
+  // cold PLAY is a spin-up somebody waited for, while a cold COPY is just the backup
+  // doing its job and would swamp the ratio.
+  const t = h.tier_24h || {}, hot = t.hot || 0, cold = t.cold || 0, unk = t.unknown || 0;
+  let tierNote = "";
+  if (h.tier_known === false) {
+    tierNote = " \u00b7 tier not recorded yet";
+  } else if (hot + cold > 0) {
+    tierNote = ` \u00b7 24h demand ${Math.round(hot*100/(hot+cold))}% hot `
+             + `(${hot.toLocaleString()} hot, ${cold.toLocaleString()} cold`
+             + `${unk ? ", " + unk.toLocaleString() + " unresolved" : ""})`;
+  } else if (unk) {
+    tierNote = ` \u00b7 24h demand: ${unk.toLocaleString()} with no tier resolved`;
+  }
   $("#hist-note").textContent =
     `${(h.sessions||[]).length} most recent` +
-    (h.filtered_by ? ` of ${h.filtered_by.join(", ")}` : " (all verdicts)");
+    (h.filtered_by ? ` of ${h.filtered_by.join(", ")}` : " (all verdicts)") + tierNote;
 }
 
 // Which verdicts to show. Copies and scans outnumber plays by hundreds to one, so

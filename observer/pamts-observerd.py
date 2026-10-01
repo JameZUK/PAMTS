@@ -180,6 +180,65 @@ class InodeIndex:
 
 
 # ---------------------------------------------------------------------------
+# Tier resolution
+# ---------------------------------------------------------------------------
+
+
+class TierResolver:
+    """Which tier served a read: "hot", "cold", or None when it cannot be told.
+
+    Built from --tier-map UNION=HOT pairs, e.g.
+        --tier-map /media/library/tv=/media/media-cache/tv
+
+    A read arriving through a mergerfs union gives no hint of which branch answered
+    it: nfsd reports the union's device, not the branch's. But the union's search
+    policy is `ff` (first found) and the fast branch is first, so a file present on
+    the fast branch is necessarily the one being read. One stat on the fast branch
+    therefore settles it.
+
+    Only the FAST branch is ever stat'd. Statting the slow branch to confirm a miss
+    would wake the array to answer a question about a read that has already happened
+    -- the exact cost this whole system exists to avoid. Absent from fast means cold.
+
+    A path that is already under a fast branch is hot without any stat at all.
+    """
+
+    def __init__(self, tier_map=None):
+        self.unions = []        # (union prefix, fast prefix), longest union first
+        self.fast = []          # fast prefixes, longest first
+        for union, fast in (tier_map or []):
+            u = os.path.abspath(union).rstrip("/")
+            f = os.path.abspath(fast).rstrip("/")
+            self.unions.append((u, f))
+            self.fast.append(f)
+        self.unions.sort(key=lambda t: -len(t[0]))
+        self.fast = sorted(set(self.fast), key=len, reverse=True)
+        self.counts = {"hot": 0, "cold": 0, "unknown": 0}
+
+    def tier_of(self, path):
+        if not path:
+            self.counts["unknown"] += 1
+            return None
+        # Read directly off the fast tier, not through a union.
+        for f in self.fast:
+            if path == f or path.startswith(f + "/"):
+                self.counts["hot"] += 1
+                return "hot"
+        for union, fast in self.unions:
+            if path.startswith(union + "/"):
+                candidate = fast + path[len(union):]
+                try:
+                    hot = os.path.lexists(candidate)
+                except OSError:
+                    hot = False
+                key = "hot" if hot else "cold"
+                self.counts[key] += 1
+                return key
+        self.counts["unknown"] += 1
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Store
 # ---------------------------------------------------------------------------
 
@@ -199,7 +258,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     dev      INTEGER, ino INTEGER, client TEXT,
     label    TEXT NOT NULL,
     bytes    INTEGER, coverage REAL, duration REAL, rate REAL,
-    requests INTEGER, monotonic REAL, method TEXT
+    requests INTEGER, monotonic REAL, method TEXT,
+    tier     TEXT
 );
 CREATE INDEX IF NOT EXISTS sessions_ts ON sessions(ts);
 """
@@ -228,6 +288,14 @@ class Store:
         self._local = threading.local()
         with self._conn() as c:
             c.executescript(SCHEMA)
+            # CREATE TABLE IF NOT EXISTS does nothing to a table that already exists,
+            # so an older database keeps its old shape. Add the column rather than
+            # recreating the table: the history is the point of this database.
+            have = {r[1] for r in c.execute("PRAGMA table_info(sessions)")}
+            if "tier" not in have:
+                c.execute("ALTER TABLE sessions ADD COLUMN tier TEXT")
+                logging.info("sessions: added the 'tier' column "
+                             "(existing rows keep NULL -- their tier was not recorded)")
 
     def _conn(self):
         c = getattr(self._local, "c", None)
@@ -238,18 +306,24 @@ class Store:
             self._local.c = c
         return c
 
-    def record_session(self, path, sig, label, epoch_ts):
-        """Log the session. Always happens, immediately, whatever the verdict."""
+    def record_session(self, path, sig, label, epoch_ts, tier=None):
+        """Log the session. Always happens, immediately, whatever the verdict.
+
+        `tier` is recorded AT ACCESS TIME on purpose. Which tier served a read is a
+        property of the moment, not of the file: tonight's eviction will move
+        thousands of albums, and deriving the tier later would then report where the
+        file is now rather than where it was read from.
+        """
         c = self._conn()
         with c:
             cur = c.execute(
                 "INSERT INTO sessions(ts,path,dev,ino,client,label,bytes,coverage,"
-                "duration,rate,requests,monotonic,method) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "duration,rate,requests,monotonic,method,tier) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (epoch_ts, path, s64(sig.get("dev")), s64(sig.get("ino")),
                  sig.get("client"), label, sig["bytes"], sig["coverage"],
                  sig["duration"], sig["rate"], sig["requests"], sig["monotonic"],
-                 sig["method"]))
+                 sig["method"], tier))
             return cur.lastrowid
 
     def relabel_session(self, rowid, label):
@@ -333,8 +407,9 @@ class Store:
 
 class Daemon:
     def __init__(self, store, index, tracker, cfg, log_sessions=True,
-                 defer=True, collector=None):
+                 defer=True, collector=None, tiers=None):
         self.store, self.index, self.tracker, self.cfg = store, index, tracker, cfg
+        self.tiers = tiers
         self.log_sessions = log_sessions
         self.collector = collector
         # A rolling window can only look backwards, so the first files of a sweep
@@ -373,7 +448,8 @@ class Daemon:
         # play history. The session is still logged, so nothing is hidden.
         if path is not None and not obs.is_media(path):
             self.non_media += 1
-        rowid = self.store.record_session(path, sig, label, epoch)
+        tier = self.tiers.tier_of(path) if self.tiers else None
+        rowid = self.store.record_session(path, sig, label, epoch, tier)
 
         is_demand = bool(path) and label in DEMAND and obs.is_media(path)
         if not is_demand:
@@ -544,6 +620,12 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="PAMTS access observer daemon")
     ap.add_argument("--root", action="append", required=True,
                     help="export root to index for inode->path (repeatable)")
+    ap.add_argument("--tier-map", action="append", default=[], metavar="UNION=FAST",
+                    help="map a mergerfs union mount to its FAST branch so each "
+                         "session records which tier served it, e.g. "
+                         "/media/library/tv=/media/media-cache/tv (repeatable). "
+                         "Only the fast branch is ever stat'd; absent from it means "
+                         "the read came off the slow tier.")
     ap.add_argument("--db", default="/var/lib/pamts/observer.db")
     ap.add_argument("--source", choices=("bpf", "ndjson"), default="bpf")
     ap.add_argument("--bpf-object", default=os.path.join(
@@ -605,7 +687,22 @@ def main(argv=None):
     store = Store(args.db, keep_sessions=args.keep_sessions,
                   replay_gap=args.replay_gap)
     tracker = obs.SessionTracker(cfg)
-    daemon = Daemon(store, index, tracker, cfg,
+    tier_pairs = []
+    for spec in args.tier_map:
+        if "=" not in spec:
+            ap.error("--tier-map wants UNION=FAST, got %r" % spec)
+        u, f = spec.split("=", 1)
+        if not u.startswith("/") or not f.startswith("/"):
+            ap.error("--tier-map paths must be absolute, got %r" % spec)
+        tier_pairs.append((u, f))
+    tiers = TierResolver(tier_pairs) if tier_pairs else None
+    if tiers:
+        for u, f in tiers.unions:
+            logging.info("tier map: %s -> fast branch %s", u, f)
+    else:
+        logging.info("no --tier-map given; sessions will not record a tier")
+
+    daemon = Daemon(store, index, tracker, cfg, tiers=tiers,
                     log_sessions=not args.quiet_sessions,
                     defer=not args.no_defer)
     tracker.on_close = daemon.on_close

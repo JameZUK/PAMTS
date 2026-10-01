@@ -267,11 +267,16 @@ class HistorySource(Source):
                 labels = [str(l) for l in labels]
                 where += " AND label IN (%s)" % ",".join("?" * len(labels))
                 params += labels
+            # `tier` was added later, so a database written by an older daemon does
+            # not have the column. Ask once rather than letting every query fail.
+            cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
+            tier_col = "tier" if "tier" in cols else "NULL AS tier"
             sessions = [
                 {"ts": r[0], "label": r[1], "client": r[2], "bytes": r[3],
-                 "coverage": r[4], "duration": r[5], "rate": r[6], "path": r[7]}
+                 "coverage": r[4], "duration": r[5], "rate": r[6], "path": r[7],
+                 "tier": r[8]}
                 for r in con.execute(
-                    "SELECT ts,label,client,bytes,coverage,duration,rate,path "
+                    f"SELECT ts,label,client,bytes,coverage,duration,rate,path,{tier_col} "
                     f"FROM sessions WHERE {where} ORDER BY ts DESC LIMIT ?",
                     (*params, limit))]
             plays = [
@@ -290,8 +295,21 @@ class HistorySource(Source):
             known = [r[0] for r in con.execute(
                 "SELECT DISTINCT label FROM sessions WHERE ts > ? ORDER BY label",
                 (time.time() - 7 * 86400,)) if r[0]]
+            # Which tier served the demand reads over 24h. Restricted to PLAY/FETCH
+            # because that is the number worth watching: a cold PLAY is a spin-up a
+            # viewer waited for, while a cold COPY is just the backup doing its job
+            # and would swamp the ratio.
+            tier_counts = {}
+            if "tier" in cols:
+                qs = ",".join("?" * len(DEMAND_LABELS))
+                for t, n in con.execute(
+                        "SELECT COALESCE(tier,'unknown'), COUNT(*) FROM sessions "
+                        f"WHERE ts > ? AND label IN ({qs}) GROUP BY 1",
+                        (time.time() - 86400, *DEMAND_LABELS)):
+                    tier_counts[t] = n
             return {"sessions": sessions, "plays": plays, "labels_24h": counts,
                     "available_labels": known, "demand_labels": list(DEMAND_LABELS),
+                    "tier_24h": tier_counts, "tier_known": "tier" in cols,
                     "filtered_by": list(labels) if labels else None}
         finally:
             con.close()

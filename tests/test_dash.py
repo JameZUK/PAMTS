@@ -116,13 +116,14 @@ CREATE TABLE plays (path TEXT PRIMARY KEY, last_play REAL, play_count INTEGER,
                     last_label TEXT, last_bytes INTEGER, updated REAL);
 CREATE TABLE sessions (ts REAL, path TEXT, dev INTEGER, ino INTEGER, client TEXT,
                        label TEXT, bytes INTEGER, coverage REAL, duration REAL,
-                       rate REAL, requests INTEGER, monotonic REAL, method TEXT);
+                       rate REAL, requests INTEGER, monotonic REAL, method TEXT,
+                       tier TEXT);
 """)
 now = time.time()
 con.execute("INSERT INTO plays VALUES('/m/a.mkv',?,1,'PLAY',1048576,?)", (now, now))
 for i, lab in enumerate(("PLAY", "PROBE", "COPY", "BULK")):
     con.execute("INSERT INTO sessions VALUES(?,?,45,7,'10.0.0.1',?,1048576,0.5,10.0,"
-                "1000.0,8,1.0,'splice')", (now - i, f"/m/{lab}.mkv", lab))
+                "1000.0,8,1.0,'splice',NULL)", (now - i, f"/m/{lab}.mkv", lab))
 con.commit(); con.close()
 
 h = dash.HistorySource({"observer_db": dbp})
@@ -296,5 +297,55 @@ check("it polls a relative URL, so it works behind a proxy",
       'fetch("api/state"' in page)
 
 import shutil                                                   # noqa: E402
+# ------------------------------------------------------------------------- tier
+print("\nhistory: tier of the files accessed")
+check("sessions carry a tier field",
+      all("tier" in x for x in h.collect()["sessions"]),
+      str(h.collect()["sessions"][:1]))
+check("this fixture's rows have no tier recorded",
+      {x["tier"] for x in h.collect()["sessions"]} == {None},
+      str({x["tier"] for x in h.collect()["sessions"]}))
+check("the source reports that the column exists", h.collect()["tier_known"] is True)
+
+_tc = sqlite3.connect(dbp)
+_tc.execute("UPDATE sessions SET tier='hot'  WHERE label='PLAY'")
+_tc.execute("UPDATE sessions SET tier='cold' WHERE label='PROBE'")
+_tc.execute("UPDATE sessions SET tier='cold' WHERE label='COPY'")
+_tc.commit(); _tc.close()
+out = h.collect()
+check("a tier is returned per session",
+      {x["label"]: x["tier"] for x in out["sessions"]}.get("PLAY") == "hot",
+      str({x["label"]: x["tier"] for x in out["sessions"]}))
+# The 24h breakdown must cover DEMAND only. A cold COPY is the backup doing its job;
+# counting it would swamp the ratio and hide the number that matters -- cold PLAYs,
+# which are spin-ups a viewer waited for.
+check("the 24h tier breakdown counts demand only, not copies and scans",
+      out["tier_24h"] == {"hot": 1}, str(out["tier_24h"]))
+
+# A database written by an older daemon has no tier column at all.
+_odb = str(pathlib.Path(tempfile.mkdtemp(prefix="pamts-dash-old-")) / "old.db")
+_oc = sqlite3.connect(_odb)
+_oc.executescript("""
+CREATE TABLE plays (path TEXT PRIMARY KEY, last_play REAL NOT NULL,
+  play_count INTEGER NOT NULL DEFAULT 0, last_label TEXT, last_bytes INTEGER,
+  updated REAL NOT NULL);
+CREATE TABLE sessions (ts REAL NOT NULL, path TEXT, dev INTEGER, ino INTEGER,
+  client TEXT, label TEXT NOT NULL, bytes INTEGER, coverage REAL, duration REAL,
+  rate REAL, requests INTEGER, monotonic REAL, method TEXT);
+""")
+_oc.execute("INSERT INTO sessions VALUES(?,'/a.mkv',1,2,'c','PLAY',1,0.5,1,1,1,1,'s')",
+            (time.time(),))
+_oc.commit(); _oc.close()
+_oh = dash.HistorySource({"observer_db": _odb})
+_oout = _oh.collect()
+check("an older database without the column still returns sessions",
+      len(_oout["sessions"]) == 1, str(_oout["sessions"]))
+check("and their tier is None rather than the query failing",
+      _oout["sessions"][0]["tier"] is None, str(_oout["sessions"][0]))
+check("and the source says the column is absent", _oout["tier_known"] is False)
+check("so the page can explain itself rather than showing a false 0%",
+      _oout["tier_24h"] == {}, str(_oout["tier_24h"]))
+
+
 srv.shutdown(); shutil.rmtree(tmp, ignore_errors=True)
 summary()

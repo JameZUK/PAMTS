@@ -326,4 +326,108 @@ check("boot_epoch is positive and not absurd", 0 < be < time.time())
 
 import shutil                                                   # noqa: E402
 shutil.rmtree(tmp, ignore_errors=True)
+# ------------------------------------------------------------------- tier resolution
+print("=== TIER: which tier served the read, without ever touching the slow branch")
+_troot = pathlib.Path(tempfile.mkdtemp(prefix="pamts-tier-"))
+_fast = _troot / "cache" / "tv"
+_slow = _troot / "slow" / "TV"
+_union = _troot / "library" / "tv"
+for _d in (_fast, _slow, _union):
+    _d.mkdir(parents=True, exist_ok=True)
+# A show on the fast branch, and one only on the slow branch. The union directory is
+# deliberately left EMPTY: the resolver must not depend on it, because in production
+# the union is a FUSE mount this test cannot create.
+# Real FILES, not just directories: the resolver asks whether the file itself is on
+# the fast branch, so a bare directory would (correctly) answer "cold".
+(_fast / "Hot Show").mkdir()
+(_fast / "Hot Show" / "e01.mkv").write_bytes(b"x")
+(_slow / "Cold Show").mkdir()
+(_slow / "Cold Show" / "e01.mkv").write_bytes(b"x")
+
+tr = d.TierResolver([(str(_union), str(_fast))])
+check("a file under the union present on the fast branch is hot",
+      tr.tier_of(str(_union / "Hot Show" / "e01.mkv")) == "hot",
+      str(tr.tier_of(str(_union / "Hot Show" / "e01.mkv"))))
+check("a file under the union absent from the fast branch is cold",
+      tr.tier_of(str(_union / "Cold Show" / "e01.mkv")) == "cold",
+      str(tr.tier_of(str(_union / "Cold Show" / "e01.mkv"))))
+check("a path read directly off the fast branch is hot with no stat at all",
+      tr.tier_of(str(_fast / "Anything" / "e01.mkv")) == "hot")
+check("a file on neither branch under the union reads as cold, not unknown",
+      tr.tier_of(str(_union / "Nowhere" / "e01.mkv")) == "cold")
+check("a path under no known root resolves to None",
+      tr.tier_of("/somewhere/else/x.mkv") is None)
+check("a missing path resolves to None rather than raising",
+      tr.tier_of(None) is None)
+# Counted on a FRESH resolver making exactly these calls. Counting on `tr` above
+# would depend on how many times each check happens to invoke it -- two of them call
+# it twice, once for the assertion and once for the failure detail -- so the expected
+# numbers would silently drift as checks are added.
+_tc = d.TierResolver([(str(_union), str(_fast))])
+_tc.tier_of(str(_union / "Hot Show" / "e01.mkv"))
+_tc.tier_of(str(_union / "Cold Show" / "e01.mkv"))
+_tc.tier_of(None)
+check("counts are tallied, one per call",
+      _tc.counts == {"hot": 1, "cold": 1, "unknown": 1}, str(_tc.counts))
+
+# The whole point: answering "cold" must never stat the slow branch, or the question
+# would wake the array that the system exists to keep asleep.
+_statted = []
+_real_lexists = os.path.lexists
+try:
+    def _spy(p):
+        _statted.append(p)
+        return _real_lexists(p)
+    # The resolver calls os.path.lexists, so that is what has to be patched -- an
+    # earlier version of this test patched os.lexists and silently observed nothing,
+    # which made the assertion vacuous rather than failing.
+    os.path.lexists = _spy
+    tr2 = d.TierResolver([(str(_union), str(_fast))])
+    tr2.tier_of(str(_union / "Cold Show" / "e01.mkv"))
+finally:
+    os.path.lexists = _real_lexists
+check("resolving a COLD read stats only the fast branch",
+      _statted and all(str(_slow) not in p for p in _statted), str(_statted))
+check("and it stats exactly once", len(_statted) == 1, str(_statted))
+
+# No map configured must mean no tier, not a crash.
+tr3 = d.TierResolver([])
+check("with no tier map everything is None", tr3.tier_of(str(_union / "x.mkv")) is None)
+
+print("=== TIER: the column is added to an existing database, and recorded")
+_tdb = str(_troot / "obs.db")
+import sqlite3 as _sq
+_c = _sq.connect(_tdb)
+# A database as an older daemon left it: sessions WITHOUT a tier column.
+_c.executescript("""
+CREATE TABLE plays (path TEXT PRIMARY KEY, last_play REAL NOT NULL,
+  play_count INTEGER NOT NULL DEFAULT 0, last_label TEXT, last_bytes INTEGER,
+  updated REAL NOT NULL);
+CREATE TABLE sessions (ts REAL NOT NULL, path TEXT, dev INTEGER, ino INTEGER,
+  client TEXT, label TEXT NOT NULL, bytes INTEGER, coverage REAL, duration REAL,
+  rate REAL, requests INTEGER, monotonic REAL, method TEXT);
+""")
+_c.execute("INSERT INTO sessions VALUES(1,'/old.mkv',1,2,'c','PLAY',1,0.5,1,1,1,1,'s')")
+_c.commit(); _c.close()
+
+_store = d.Store(_tdb)
+_cols = {r[1] for r in _sq.connect(_tdb).execute("PRAGMA table_info(sessions)")}
+check("opening an old database adds the tier column", "tier" in _cols, str(sorted(_cols)))
+_old = _sq.connect(_tdb).execute("SELECT tier FROM sessions WHERE path='/old.mkv'").fetchone()
+check("rows written before the migration keep NULL, not a guess", _old[0] is None, str(_old))
+
+_sig = {"dev": 1, "ino": 9, "client": "10.0.0.5", "bytes": 100, "coverage": 1.0,
+        "duration": 2.0, "rate": 50.0, "requests": 3, "monotonic": 1.0,
+        "method": "splice", "t_last": 0.0}
+_store.record_session("/media/library/tv/Hot Show/e01.mkv", _sig, "PLAY", 1000.0, "hot")
+_store.record_session("/media/library/tv/Cold Show/e01.mkv", _sig, "PLAY", 1001.0, "cold")
+_rows = dict(_sq.connect(_tdb).execute(
+    "SELECT path, tier FROM sessions WHERE tier IS NOT NULL"))
+check("a hot session stores tier='hot'",
+      _rows.get("/media/library/tv/Hot Show/e01.mkv") == "hot", str(_rows))
+check("a cold session stores tier='cold'",
+      _rows.get("/media/library/tv/Cold Show/e01.mkv") == "cold", str(_rows))
+shutil.rmtree(_troot, ignore_errors=True)
+
+
 summary()

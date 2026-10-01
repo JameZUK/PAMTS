@@ -55,6 +55,41 @@ means the same thing in both views.
 Labels arrive from a query string and are passed as SQL parameters; there is a test
 asserting a label containing SQL is treated as data.
 
+## Tier: which tier served each read
+
+Every session records whether the read was answered by the fast tier or the slow one.
+The history table shows a `HOT` / `COLD` badge per row, and the heading carries the
+24-hour ratio over **demand reads only** (`PLAY`, `FETCH`) — a cold `PLAY` is a spin-up
+somebody waited for, whereas a cold `COPY` is just the backup doing its job and would
+swamp the number.
+
+Two things make this harder than it looks.
+
+**It cannot be derived later.** A read arriving through a mergerfs union reports the
+*union's* device to nfsd, not the branch's, so nothing in the event says which tier
+answered. And by the time anyone looks, the file may have moved — an eviction run
+relocates thousands of items. So the tier is resolved and stored at access time.
+
+**Resolving it must not wake the array.** The union's search policy is `ff` and the fast
+branch is first, so a file present on the fast branch is necessarily the one being read.
+One `lexists` on the fast branch settles it. The slow branch is **never** stat'd:
+confirming a miss there would spin the disks up to answer a question about a read that
+has already been served, which is the exact cost this system exists to avoid. Absent
+from fast means cold.
+
+Configure it on the observer, one mapping per union:
+
+```
+--tier-map /media/library/tv=/media/media-cache/tv
+--tier-map /media/library/movies=/media/media-cache/movies
+--tier-map /media/library/music=/media/media-cache/music
+```
+
+Without any `--tier-map` the column stays `NULL` and the page says the tier was not
+recorded rather than showing a misleading 0%. A database written before this existed
+gains the column on first open; its old rows keep `NULL`, because their tier genuinely
+was not recorded and guessing would be worse than admitting it.
+
 ## Adding a source
 
 This is the extension point. A source is one class and one registry line — the same
