@@ -71,9 +71,14 @@ struct pamts_event {
 	__u8  _pad[7];
 };
 
+/* 128 MB. 16 MB held about 233,000 events, which a library scan overruns in bursts:
+ * one 17-hour period dropped 40.3 MILLION events while the *sustained* rate was only
+ * ~1,200/s and steady-state drops were zero. The problem is burst absorption, not
+ * throughput, so the buffer is sized for the bursts.
+ */
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 1 << 24);		/* 16 MB */
+	__uint(max_entries, 1 << 27);		/* 128 MB, ~1.8M events */
 } events SEC(".maps");
 
 /* A full ring buffer drops events silently, which makes "nothing was captured"
@@ -191,11 +196,20 @@ int pamts_write_err(struct bpf_raw_tracepoint_args *ctx)
 		    (__s32)ctx->args[3]);
 }
 
-READ_TP(pamts_read_start,  "nfsd_read_start",  PAMTS_START)
+/* read_start is deliberately NOT attached. Every read produced three events --
+ * start, method, done -- and the start carries nothing the method event does not:
+ * the method supplies the requested length, so short reads and therefore EOF and
+ * coverage are all still detected. Dropping it is a third fewer events for no loss
+ * of information, which matters when a scan can emit tens of millions.
+ *
+ * The program is kept so it can be attached again if a kernel ever stops reporting
+ * the method, which would otherwise silently cost us coverage.
+ */
 READ_TP(pamts_read_splice, "nfsd_read_splice", PAMTS_SPLICE)
 READ_TP(pamts_read_vector, "nfsd_read_vector", PAMTS_VECTOR)
 READ_TP(pamts_read_direct, "nfsd_read_direct", PAMTS_DIRECT)
 READ_TP(pamts_read_done,   "nfsd_read_done",   PAMTS_DONE)
+READ_TP(pamts_read_start,  "nfsd_read_start",  PAMTS_START)
 
 /* read_err differs: loff_t offset and an int status, not a length. */
 SEC("raw_tp/nfsd_read_err")

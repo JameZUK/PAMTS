@@ -593,8 +593,14 @@ def main(argv=None):
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S")
     index = InodeIndex(args.root, max_age=args.index_max_age)
-    logging.info("indexing %s ...", ", ".join(index.roots))
-    index.build()
+    # Build the index in the BACKGROUND and start serving immediately. Walking a
+    # mergerfs union whose cold branch is NFS to a spun-down array took 101.8s on a
+    # cold ARC, against 2.0s warm -- and blocking startup on that means the API and
+    # the collector are both down for a minute and a half, which is indistinguishable
+    # from the daemon being broken. Lookups simply miss until the index lands, which
+    # is the contract rebuilds already use.
+    logging.info("indexing %s in the background ...", ", ".join(index.roots))
+    index.rebuild_async()
 
     store = Store(args.db, keep_sessions=args.keep_sessions,
                   replay_gap=args.replay_gap)

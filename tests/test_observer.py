@@ -443,6 +443,13 @@ check("inside a scan wave they are suppressed as BULK",
 check("the scan itself is still PROBE, not BULK",
       inwave.count("PROBE") == 60, str(inwave.count("PROBE")))
 
+check("coverage still works without read_start, which is why skipping it is free",
+      obs.signature(obs.sessionise(obs.join_requests(obs.parse(
+          read(1.0, 0x1, 0xC1, 0, 131072) +
+          read(1.1, 0x2, 0xC1, 131072, 131072, delivered=4096))))[0])["coverage"]
+      is not None,
+      "the method event must supply the requested length")
+
 print("")
 print("thread safety (a daemon closes sessions from two threads)")
 import sys as _sys                                              # noqa: E402

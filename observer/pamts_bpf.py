@@ -61,8 +61,14 @@ class Collector:
     (you cannot yield across a C call boundary).
     """
 
+    #: Programs not attached by default. read_start triples the event rate and
+    #: carries nothing the method event does not -- the method supplies the
+    #: requested length, so EOF and coverage still work without it. One 17-hour
+    #: period dropped 40.3M events, so a third fewer is worth having.
+    SKIP_PROGRAMS = frozenset(("pamts_read_start",))
+
     def __init__(self, obj_path, map_name="events", verbose=False,
-                 poll_ms=200, record_factory=None):
+                 poll_ms=200, record_factory=None, attach_all=False):
         if not os.path.exists(obj_path):
             raise BpfError(
                 f"{obj_path} not found -- build it first (see observer/Makefile). "
@@ -90,6 +96,8 @@ class Collector:
             self.lib.libbpf_set_print(self._quiet)
 
         self._record = record_factory or self._default_record
+        self.attach_all = attach_all
+        self.skipped = []
         self._open_and_load()
 
     # -- ctypes plumbing ---------------------------------------------------
@@ -140,6 +148,11 @@ class Collector:
         prog = self.lib.bpf_object__next_program(self.obj, None)
         while prog:
             name = self.lib.bpf_program__name(prog)
+            pname = name.decode() if name else "?"
+            if not self.attach_all and pname in self.SKIP_PROGRAMS:
+                self.skipped.append(pname)
+                prog = self.lib.bpf_object__next_program(self.obj, prog)
+                continue
             link = self.lib.bpf_program__attach(prog)
             if not link:
                 raise BpfError(

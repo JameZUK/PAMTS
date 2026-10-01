@@ -595,6 +595,48 @@ The regression test needs thousands of open sessions and `setswitchinterval(1e-6
 to reproduce this. A gentler version passed happily against the unlocked code and
 proved nothing.
 
+### Volume, and the two things that control it
+
+A tap on a busy server sees a great deal. One 17-hour period on a real estate:
+
+```
+emitted   8,610,624
+dropped  40,322,782      <- the ring buffer overran during library scans
+```
+
+The *sustained* rate was only ~1,200 events/s with **zero** steady-state drops, so the
+losses were entirely bursts, when a scan walks a library. The fix is burst absorption,
+not throughput:
+
+- **The ring buffer is 128 MB** (~1.8M events). 16 MB held ~233,000, which a scan
+  overruns in seconds.
+- **`read_start` is not attached by default.** Every read produced three events —
+  start, method, done — and the start carries nothing the method event does not: the
+  method supplies the requested length, so short reads, EOF and coverage all still
+  work. A third fewer events for no loss of information. `attach_all=True` restores it.
+
+After both, `emitted` and `records` track exactly with zero drops. If drops ever
+return, the next step is in-kernel aggregation — accumulate per file in a BPF map and
+emit summaries — rather than a still bigger buffer.
+
+### Indexing a union is slow when the far side is asleep
+
+Walking a mergerfs union means stat'ing both branches, and if the cold branch is NFS to
+an array with `hddstandby` set, that wakes it. Measured on the same tree:
+
+| | |
+|---|---|
+| warm ARC on the storage host | **2.0 s** |
+| cold ARC, after a nightly backup evicted it | **101.8 s** |
+
+50x, and **routine rather than exceptional** — ordinary overnight work evicts that
+cache. It used to block startup, so the API and the collector were both down for a
+minute and a half, which is indistinguishable from a broken daemon.
+
+The startup index now runs in the **background** and the daemon serves immediately: the
+API came up in 1 ms instead of 102 s. Lookups miss until the index lands, which is the
+contract rebuilds already used.
+
 ### Knowing whether you lost events
 
 A full ring buffer drops silently. Without a counter, "nothing is happening" and
