@@ -50,6 +50,20 @@ if shutil.which("rsync") is None:
 assert tier.REQUIRE_DEST_MOUNT is True, "REQUIRE_DEST_MOUNT must default to True"
 tier.REQUIRE_DEST_MOUNT = False
 
+# Eviction evicts down to (budget - [promote] headroom_gb) so that promotion has room
+# to work -- see the RESERVE section below. Nearly every test here uses a budget of a
+# few megabytes to exercise RANKING: which item is chosen, not how many. Against the
+# production default of 60 GB the target would clamp to zero and every one of them
+# would evict its whole fixture, testing nothing. So the reserve is neutralised here
+# and exercised explicitly, with its own value, in exactly one place.
+#
+# It has to be set in DEFAULTS as well as in the live dict: load_and_configure REBINDS
+# pamts.PROMOTE to a fresh _merge(DEFAULTS["promote"], ...), so the config tests further
+# down would otherwise restore 60 GB for every test after them -- which is exactly what
+# happened, and what the "leave 60.0G for promotion" line in the output gave away.
+pamts.DEFAULTS["promote"]["headroom_gb"] = 0
+pamts.PROMOTE["headroom_gb"] = 0
+
 
 def mkfile(p, size=1024, mtime_days=0, atime_days=None):
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -994,6 +1008,58 @@ try:
 finally:
     _sp.run = _saved_sp
     tier.run_rsync = _saved_run
+
+
+# -------------------------------------------------------- the promotion reserve
+print("=== RESERVE: eviction leaves room for promotion, instead of filling to budget")
+_rroot = pathlib.Path(tempfile.mkdtemp(prefix="pamts-reserve-"))
+_rfast, _rslow = _rroot / "fast", _rroot / "slow"
+# 10 items of 1 MB each, all last played long ago so all are evictable.
+for i in range(10):
+    mkfile(_rfast / "tv" / f"Show {i}" / "e01.mkv", size=1024 * 1024, mtime_days=400)
+_rviews = {str(_rfast / "tv" / f"Show {i}" / "e01.mkv"): time.time() - 86400 * (400 - i)
+           for i in range(10)}
+
+_saved_headroom = dict(pamts.PROMOTE)
+try:
+    # Budget 6 MB with a 2 MB reserve: eviction must take the tier to 4 MB, not 6 MB,
+    # or promotion would subtract a reserve that does not exist and refuse to run.
+    pamts.PROMOTE["headroom_gb"] = 2 / 1024.0        # 2 MB, expressed in GB
+    captured.clear()
+    ok = tier.do_tier([job("tier", _rfast / "tv", _rslow / "tv", depth=1, grace=False)],
+                      budget=6 * 1024 * 1024, dry_run=False, views=_rviews)
+    check("the run succeeds", ok)
+    _left = sum(1 for _ in (_rfast / "tv").iterdir())
+    check("eviction stops at budget minus the reserve, not at the budget",
+          _left == 4, f"{_left} item(s) left, expected 4 (6 MB budget - 2 MB reserve)")
+    _moved = [c for c in captured if "--remove-source-files" in c]
+    check("and it moved the other six", len(_moved) == 6, f"{len(_moved)} rsync(s)")
+
+    # Under the reserve-adjusted target, nothing should move at all.
+    for i in range(10, 13):
+        mkfile(_rfast / "tv2" / f"Show {i}" / "e01.mkv", size=1024 * 1024,
+               mtime_days=400)
+        _rviews[str(_rfast / "tv2" / f"Show {i}" / "e01.mkv")] = time.time() - 86400
+    captured.clear()
+    tier.do_tier([job("tier", _rfast / "tv2", _rslow / "tv2", depth=1, grace=False)],
+                 budget=6 * 1024 * 1024, dry_run=False, views=_rviews)
+    check("a tier already below the reserve-adjusted target is left alone",
+          not [c for c in captured if "--remove-source-files" in c],
+          str([c[-2:] for c in captured]))
+
+    # A reserve larger than the budget must not ask for a negative footprint.
+    pamts.PROMOTE["headroom_gb"] = 99
+    captured.clear()
+    ok = tier.do_tier([job("tier", _rfast / "tv2", _rslow / "tv2", depth=1,
+                           grace=False)],
+                      budget=1024 * 1024, dry_run=False, views=_rviews)
+    check("a reserve bigger than the budget clamps to zero rather than going negative",
+          ok is True, "do_tier returned " + repr(ok))
+finally:
+    pamts.PROMOTE.clear()
+    pamts.PROMOTE.update(_saved_headroom)
+    pamts.PROMOTE["headroom_gb"] = 0      # back to neutral for anything after this
+shutil.rmtree(_rroot, ignore_errors=True)
 
 
 # ------------------------------------------------------------- per-job tier budget

@@ -388,9 +388,24 @@ def do_tier(jobs, budget, dry_run, views=_FETCH, pins=None, items=None, hist_ok=
     if footprint - cand_bytes > 0:
         logging.info(f"[tier] {human(footprint - cand_bytes)} sits above the candidate "
                      "depth and is not individually evictable")
+    # Evict to budget MINUS the promotion reserve, not to the budget itself.
+    #
+    # [promote] headroom_gb is documented as "reserved so a promotion cannot push the
+    # tier over budget and cause its own eviction on the next run". But eviction used to
+    # stop the moment it reached the budget, which left exactly zero reserve -- so
+    # promotion subtracted a reserve that was never there and refused to promote
+    # anything. The reserve only existed by luck, in pools whose content happened to
+    # fall under budget.
+    #
+    # Observed: after music was tiered, eviction took it to 798.9G of its 800G budget
+    # and promotion reported "0B left" on every pass. An album could never be warmed,
+    # which is the entire point of tiering music.
+    reserve = int(float(pamts.PROMOTE["headroom_gb"]) * pamts.GB)
+    target = max(0, budget - reserve)
     logging.info(f"[tier] fast tier holds {human(footprint)} across {len(cands)} "
-                 f"candidate(s); budget {human(budget)}")
-    if footprint <= budget:
+                 f"candidate(s); budget {human(budget)}, evicting down to "
+                 f"{human(target)} to leave {human(reserve)} for promotion")
+    if footprint <= target:
         logging.info("[tier] under budget - nothing to evict, destination not touched")
         return True
 
@@ -441,25 +456,25 @@ def do_tier(jobs, budget, dry_run, views=_FETCH, pins=None, items=None, hist_ok=
 
     to_move, freed = [], 0
     for c in queue:
-        if footprint - freed <= budget:
+        if footprint - freed <= target:
             break
         to_move.append(c)
         freed += c["evictable"]
-    if footprint - freed > budget and grace_queue:
-        logging.warning(f"[tier] still over budget by {human(footprint - freed - budget)} "
+    if footprint - freed > target and grace_queue:
+        logging.warning(f"[tier] still over budget by {human(footprint - freed - target)} "
                         f"after everything eligible - falling back to {len(grace_queue)} "
                         f"item(s) inside the {grace_days}d grace window, oldest first")
         for c in grace_queue:
-            if footprint - freed <= budget:
+            if footprint - freed <= target:
                 break
             to_move.append(c)
             freed += c["evictable"]
     if not to_move:
-        logging.warning(f"[tier] over budget by {human(footprint - budget)} but nothing "
+        logging.warning(f"[tier] over budget by {human(footprint - target)} but nothing "
                         "is eligible to evict")
         return True
 
-    logging.info(f"[tier] over budget by {human(footprint - budget)}; evicting "
+    logging.info(f"[tier] over budget by {human(footprint - target)}; evicting "
                  f"{len(to_move)} item(s), {human(freed)}")
 
     # Guard EVERY destination before a single byte moves. --remove-source-files deletes

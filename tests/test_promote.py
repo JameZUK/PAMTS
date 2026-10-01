@@ -506,6 +506,82 @@ def main():
     check(all(os.path.exists(os.path.join(fast, "Show", "Season 1", f"e{i:02d}.mkv"))
               for i in (5, 6)), "both files landed on fast storage")
 
+    # --------------------------------------------------------- per-pool headroom
+    print("=== HEADROOM: each budget pool is measured on its own")
+    hp = pathlib.Path(tempfile.mkdtemp(prefix="pamts-headroom-"))
+    vid, mus = hp / "fast" / "tv", hp / "fast" / "music"
+    mkfile(str(vid / "Show" / "e01.mkv"), 300 * 1024 * 1024)      # 300 MB of video
+    mkfile(str(mus / "Artist" / "Album" / "01.flac"), 10 * 1024 * 1024)
+    jobs = [
+        {"name": "tv", "mode": "tier", "source": str(vid), "dest": "/slow/tv"},
+        {"name": "music", "mode": "tier", "source": str(mus), "dest": "/slow/music",
+         "budget_gb": 4.0},
+        {"name": "backup-ignored", "mode": "backup", "source": str(hp), "dest": "/x"},
+    ]
+    # shared budget 1 GB, no reserve
+    hr = promote.Headroom(jobs, 1.0, 0)
+    check(len(hr.pools) == 2,
+          f"backup jobs are ignored, 2 pools remain (got {len(hr.pools)})")
+    check("__shared__" in hr.pools and "music" in hr.pools, str(sorted(hr.pools)))
+    check(abs(hr.pools["__shared__"]["footprint"] - 300 * 1024 * 1024) < 65536,
+          f"the shared pool measures only video ({hr.pools['__shared__']['footprint']})")
+    check(abs(hr.pools["music"]["footprint"] - 10 * 1024 * 1024) < 65536,
+          f"the music pool measures only music ({hr.pools['music']['footprint']})")
+    check(hr.pool_of(str(vid / "Show" / "e01.mkv")) == "__shared__",
+          "a video path maps to the shared pool")
+    check(hr.pool_of(str(mus / "Artist" / "Album" / "01.flac")) == "music",
+          "a music path maps to the music pool")
+    check(hr.pool_of("/elsewhere/x.mkv") is None, "an unknown path belongs to no pool")
+    check(hr.left("/elsewhere/x.mkv") == 0, "and therefore has no headroom")
+
+    # THE REGRESSION. Before per-pool accounting, promotion summed every fast root and
+    # compared the total to the single shared budget. Here that total is 310 MB against
+    # a 1 GB shared budget, which happens to pass -- so make the video pool genuinely
+    # full and prove music is still promotable.
+    hr2 = promote.Headroom(jobs, 0.2, 0)        # shared budget 200 MB, video is 300 MB
+    check(hr2.left(str(vid / "Show" / "e02.mkv")) <= 0,
+          f"an over-budget video pool has no headroom ({hr2.left(str(vid / 'x'))})")
+    check(hr2.left(str(mus / "Artist" / "Album" / "02.flac")) > 3 * GB,
+          "but the music pool still has nearly all of its own 4 GB")
+    check(hr2.any_left() is True,
+          "so promotion must NOT refuse outright -- that is the bug this replaces")
+
+    # Charging one pool must not touch the other.
+    before_music = hr2.left(str(mus / "a.flac"))
+    hr2.charge(str(vid / "Show" / "e03.mkv"), 50 * 1024 * 1024)
+    check(hr2.left(str(mus / "a.flac")) == before_music,
+          "charging the video pool leaves the music pool untouched")
+    m_before = hr2.left(str(mus / "a.flac"))
+    hr2.charge(str(mus / "Artist" / "Album" / "03.flac"), 100 * 1024 * 1024)
+    check(hr2.left(str(mus / "a.flac")) == m_before - 100 * 1024 * 1024,
+          "charging the music pool reduces exactly that pool")
+
+    # Nested sources must resolve to the most specific pool, which is how music is
+    # configured in production: the tier job is on music/Organised, not all of music.
+    nested = [
+        {"name": "all", "mode": "tier", "source": str(hp / "fast"), "dest": "/s1"},
+        {"name": "inner", "mode": "tier", "source": str(mus), "dest": "/s2",
+         "budget_gb": 9.0},
+    ]
+    hn = promote.Headroom(nested, 1.0, 0)
+    check(hn.pool_of(str(mus / "Artist" / "Album" / "01.flac")) == "inner",
+          "the longest matching tier source wins")
+    # The outer job declares no budget_gb, so it lives in the shared pool -- pools are
+    # keyed by budget, not by job name, exactly as eviction groups them.
+    check(hn.pool_of(str(vid / "Show" / "e01.mkv")) == "__shared__",
+          f"a path matching only the budget-less outer source is shared "
+          f"(got {hn.pool_of(str(vid / 'Show' / 'e01.mkv'))})")
+
+    # And a pool with no headroom must stop filter_candidates charging it.
+    mkfile(os.path.join(slow, "Pool", "big.mkv"), 4096)
+    hr3 = promote.Headroom(
+        [{"name": "tv", "mode": "tier", "source": fast, "dest": slow}], 0.0000001, 0)
+    sel = promote.filter_candidates(
+        [Candidate(path="/player/tv/Pool/big.mkv", label="Big", order=0)],
+        Caps(10, 10 ** 9), hr3)
+    check(sel == [], "filter_candidates promotes nothing into a pool with no headroom")
+    shutil.rmtree(hp, ignore_errors=True)
+
     # ------------------------------------------------- promote rules: rule lookup
     print("=== PROMOTE RULES: lookup, and an exact match beats the catch-all")
     pamts.PROMOTE_RULES = [

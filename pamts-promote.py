@@ -70,6 +70,69 @@ def tier_footprint(paths):
     return total
 
 
+class Headroom:
+    """Promotable bytes remaining, PER BUDGET POOL.
+
+    Promotion used to measure one footprint against one budget. Once a medium has its
+    own `budget_gb` that is wrong in both directions: a full video pool would block
+    music promotion, and an empty music pool would appear to licence video promotion.
+
+    It was wrong in practice, not just in theory. With music tiered into its own 800 GB
+    pool the combined fast-tier footprint reached 1.3 TB against the global 400 GB video
+    budget, so the single `budget_left` went negative and promotion refused every item
+    on every pass -- silently disabling the feature, while logging a cheerful
+    "promotable headroom 0B".
+
+    Pools are derived from the tier jobs exactly as eviction groups them: a job with its
+    own budget_gb is its own pool, everything else shares the global one.
+    """
+
+    def __init__(self, jobs, shared_gb, reserve_bytes):
+        self.pools = {}
+        for j in jobs:
+            if j.get("mode") != "tier":
+                continue
+            own = j.get("budget_gb")
+            key = j["name"] if own else "__shared__"
+            pool = self.pools.setdefault(
+                key, {"budget": int(float(own or shared_gb) * pamts.GB),
+                      "sources": [], "footprint": 0})
+            pool["sources"].append(os.path.abspath(j["source"]).rstrip("/"))
+        for key, pool in self.pools.items():
+            live = [p for p in pool["sources"] if os.path.isdir(p)]
+            pool["footprint"] = tier_footprint(live)
+            pool["left"] = pool["budget"] - reserve_bytes - pool["footprint"]
+
+    def pool_of(self, fast_path):
+        """Longest matching tier source wins, so nested sources resolve correctly."""
+        best, best_len = None, -1
+        for key, pool in self.pools.items():
+            for src in pool["sources"]:
+                if fast_path == src or fast_path.startswith(src + "/"):
+                    if len(src) > best_len:
+                        best, best_len = key, len(src)
+        return best
+
+    def left(self, fast_path):
+        key = self.pool_of(fast_path)
+        return self.pools[key]["left"] if key else 0
+
+    def charge(self, fast_path, nbytes):
+        key = self.pool_of(fast_path)
+        if key:
+            self.pools[key]["left"] -= nbytes
+
+    def any_left(self):
+        return any(p["left"] > 0 for p in self.pools.values())
+
+    def describe(self):
+        return "; ".join(
+            "%s %s of %s (%s left)" % (
+                "shared" if k == "__shared__" else k,
+                human(p["footprint"]), human(p["budget"]), human(max(0, p["left"])))
+            for k, p in sorted(self.pools.items()))
+
+
 def effective_caps(caps, headroom, remaining_s, rate_bps):
     """Scale an adapter's ceiling down by the space AND the time actually available.
 
@@ -120,7 +183,11 @@ def rule_caps(base, rule, want_current):
 
 
 def filter_candidates(cands, caps, budget_left):
-    """Drop what is already local or unavailable, then apply the caps."""
+    """Drop what is already local or unavailable, then apply the caps.
+
+    `budget_left` is either a byte count or a Headroom, which charges each item against
+    the budget pool that actually owns it.
+    """
     suffixes = tuple(pamts.TIER["inprogress_suffixes"])
     chosen, used = [], 0
     for c in sorted(cands, key=lambda x: x.order):
@@ -148,10 +215,14 @@ def filter_candidates(cands, caps, budget_left):
             logging.info(f"    {c.label}: would exceed the {human(caps.max_bytes)} "
                          "per-event cap - stopping")
             break
-        if used + size > budget_left:
-            logging.info(f"    {c.label}: no budget headroom left "
-                         f"({human(max(0, budget_left - used))}) - stopping")
+        avail = (budget_left.left(fpath) if isinstance(budget_left, Headroom)
+                 else budget_left - used)
+        if size > avail:
+            logging.info(f"    {c.label}: no budget headroom left in its pool "
+                         f"({human(max(0, avail))}) - stopping")
             break
+        if isinstance(budget_left, Headroom):
+            budget_left.charge(fpath, size)
         # Protection is recorded against the CONTAINING directory, which is the unit
         # tiering evicts. pamts.is_protected also matches prefixes in both directions,
         # so a granularity mismatch over-protects rather than leaving this exposed.
@@ -232,10 +303,19 @@ def do_next_up(players, budget, budget_left, footprint, state, stats, now, dry_r
                 it["last_viewed"] = o
                 folded += 1
         logging.info(f"[next-up] folded in {folded} observed play(s)")
-    # The FOOTPRINT, not budget_left: budget_left has the anti-thrash reserve taken
-    # out, and passing it here made this derive a different depth from the eviction
+    # The FOOTPRINT, not the remaining headroom: headroom has the anti-thrash reserve
+    # taken out, and using it here made this derive a different depth from the eviction
     # side. Both must compute the identical pin set.
-    depth = pamts.pin_depth(footprint, budget)
+    #
+    # Pin depth is still derived from the SHARED pool. Pins are a next-episode notion,
+    # so they live entirely in the video pool; deriving the depth from the estate total
+    # would let a terabyte of albums decide how many episodes to hold.
+    shared = budget_left.pools.get("__shared__") if isinstance(budget_left, Headroom) \
+        else None
+    if shared:
+        depth = pamts.pin_depth(shared["footprint"], shared["budget"])
+    else:
+        depth = pamts.pin_depth(footprint, budget)
     pins = pamts.next_up(items, int(pamts.TIER["next_up_max_items"]),
                          int(pamts.TIER["next_up_max_gb"]) * pamts.GB, depth)
     logging.info(f"[next-up] pinning {depth} item(s) ahead per series; {len(pins)} "
@@ -257,7 +337,14 @@ def do_next_up(players, budget, budget_left, footprint, state, stats, now, dry_r
 
     fit, used = [], 0
     for m in missing:
-        if used + m["size"] > budget_left:
+        if isinstance(budget_left, Headroom):
+            avail = budget_left.left(m["dst"])
+            if m["size"] > avail:
+                logging.info(f"[next-up] no headroom in {m['label']}'s pool "
+                             f"({human(max(0, avail))}) - skipping it")
+                continue          # another pool may still have room
+            budget_left.charge(m["dst"], m["size"])
+        elif used + m["size"] > budget_left:
             logging.info(f"[next-up] no headroom for {m['label']} - stopping")
             break
         fit.append(m)
@@ -315,11 +402,13 @@ def main():
     now = time.time()
     fast_roots = sorted({f for f, _s in pamts.ROOTS.values()})
     live = [p for p in fast_roots if os.path.isdir(p)]
-    footprint = tier_footprint(live)
-    budget = budget_gb * pamts.GB
-    budget_left = budget - int(P["headroom_gb"]) * pamts.GB - footprint
-    logging.info(f"fast tier holds {human(footprint)}; budget {human(budget)}; "
-                 f"promotable headroom {human(max(0, budget_left))}")
+    reserve = int(float(P["headroom_gb"]) * pamts.GB)
+    hr = Headroom(pamts.JOBS, budget_gb, reserve)
+    budget_left = hr
+    footprint = sum(pl["footprint"] for pl in hr.pools.values())
+    budget = sum(pl["budget"] for pl in hr.pools.values())
+    logging.info(f"fast tier holds {human(footprint)} across "
+                 f"{len(hr.pools)} budget pool(s): {hr.describe()}")
 
     # The budget is a policy number; it does not know what else shares the filesystem.
     if live:
@@ -334,8 +423,9 @@ def main():
         except OSError as e:
             logging.warning(f"cannot statvfs {live[0]}: {e}")
 
-    if budget_left <= 0:
-        logging.info("no headroom below budget - refusing to promote (anti-thrash)")
+    if not hr.any_left():
+        logging.info("no headroom below budget in any pool - refusing to promote "
+                     "(anti-thrash)")
         return 0
 
     state = pamts.load_state()
@@ -477,9 +567,14 @@ def main():
         if not cands:
             logging.info("  nothing to promote for this item")
             continue
+        # Scale this event's allowance by the headroom of the pool that owns it, not
+        # by the estate total: a near-full video pool must not shrink an album fetch.
+        m = pamts.split_root(ev.path)
+        ev_fast = os.path.join(m[1], m[0]) if m else None
+        ev_head = hr.left(ev_fast) if ev_fast else 0
         caps = effective_caps(rule_caps(pl.caps, rule, want_current),
-                              budget_left - promoted, ev.remaining_s, rate)
-        items = filter_candidates(cands, caps, budget_left - promoted)
+                              ev_head, ev.remaining_s, rate)
+        items = filter_candidates(cands, caps, hr)
         if not items:
             logging.info("  nothing to promote (already local, or capped)")
             continue
