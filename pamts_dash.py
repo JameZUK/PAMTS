@@ -157,25 +157,49 @@ class ConfigSource(Source):
         with open(self.path, "rb") as f:
             raw = tomllib.load(f)
         tier = raw.get("tier") or {}
+        promote = raw.get("promote") or {}
+        # Everything a reader might otherwise have to shell in and read the TOML for.
+        # Deliberately whole: budget_gb, grace and exclude_from are exactly the fields
+        # that explain WHY the system did what it did, and omitting them was why the
+        # config view could not answer anything useful.
+        jobs = [{"name": j.get("name"), "mode": j.get("mode"),
+                 "source": j.get("source"), "dest": j.get("dest"),
+                 "depth": j.get("depth"), "max_delete": j.get("max_delete"),
+                 "budget_gb": j.get("budget_gb"), "grace": j.get("grace"),
+                 "exclude_from": j.get("exclude_from")}
+                for j in (raw.get("jobs") or [])]
         return {
+            "path": self.path,
             "budget_gb": tier.get("budget_gb"),
             "next_up_max_items": tier.get("next_up_max_items"),
             "next_up_max_gb": tier.get("next_up_max_gb"),
-            "jobs": [{"name": j.get("name"), "mode": j.get("mode"),
-                      "source": j.get("source"), "dest": j.get("dest"),
-                      "depth": j.get("depth"), "max_delete": j.get("max_delete")}
-                     for j in (raw.get("jobs") or [])],
+            "jobs": jobs,
+            "tier_jobs": sum(1 for j in jobs if j["mode"] == "tier"),
+            "backup_jobs": sum(1 for j in jobs if j["mode"] == "backup"),
             "players": [{"name": p.get("name"), "kind": p.get("kind")}
                         for p in (raw.get("players") or [])],
+            "player_names": [p.get("name") or p.get("kind")
+                             for p in (raw.get("players") or [])],
+            "promote_rules": promote.get("rules") or [],
+            "tier_settings": {k: v for k, v in tier.items()},
+            "promote_settings": {k: v for k, v in promote.items() if k != "rules"},
             "roots": len(raw.get("roots") or []),
+            "root_map": [{"player_path": r.get("player_path"), "fast": r.get("fast"),
+                          "slow": r.get("slow")} for r in (raw.get("roots") or [])],
         }
 
 
 class TierSource(Source):
-    """How full the fast tier is, per tier job.
+    """How full the fast tier is, PER BUDGET POOL.
 
     Scanning is the expensive thing this dashboard does, hence the long TTL. It is
     also the number people actually want, so it is worth the cost.
+
+    Pools, not one total. A tier job may carve out its own `budget_gb`; everything else
+    shares the global one. Summing every job's footprint and dividing by the shared
+    budget produced "281.2% of 400.0G budget" -- 1.07 TB of video AND music measured
+    against the 400 GB video allowance. That number was not merely ugly, it was
+    meaningless: nothing was over budget at all.
     """
     name = "tier"
     ttl = 120.0
@@ -184,6 +208,7 @@ class TierSource(Source):
         super().__init__(cfg)
         self.jobs = self.cfg.get("tier_jobs") or []
         self.budget_gb = self.cfg.get("budget_gb")
+        self.reserve_gb = self.cfg.get("promote_headroom_gb") or 0
 
     def available(self):
         return bool(self.jobs)
@@ -201,23 +226,51 @@ class TierSource(Source):
         return total, files
 
     def collect(self):
-        out, grand = [], 0
+        GB = 1024 ** 3
+        # float(), not int(): int() truncates a sub-1 GB budget to zero, which then
+        # reads as "no budget configured" and silently hides every derived figure.
+        shared = int(float(self.budget_gb) * GB) if self.budget_gb else None
+        reserve = int(float(self.reserve_gb) * GB)
+        out, pools = [], {}
         for j in self.jobs:
+            own = j.get("budget_gb")
+            key = j.get("name") if own else "__shared__"
+            pool = pools.setdefault(key, {
+                "pool": key,
+                "label": j.get("name") if own else "movies + tv (shared)",
+                "budget_bytes": int(float(own) * GB) if own else shared,
+                "own_budget": bool(own), "bytes": 0, "files": 0, "jobs": []})
             src = j.get("source")
             if not src or not os.path.isdir(src):
-                out.append({"name": j.get("name"), "bytes": None, "files": None,
-                            "error": "not a directory"})
+                out.append({"name": j.get("name"), "pool": key, "bytes": None,
+                            "files": None, "error": "not a directory"})
                 continue
             b, f = self._usage(src)
-            grand += b
-            out.append({"name": j.get("name"), "source": src,
+            pool["bytes"] += b
+            pool["files"] += f
+            pool["jobs"].append(j.get("name"))
+            out.append({"name": j.get("name"), "pool": key, "source": src,
                         "bytes": b, "files": f})
-        budget = int(self.budget_gb) * 1024 ** 3 if self.budget_gb else None
+        for pool in pools.values():
+            bud = pool["budget_bytes"]
+            pool["reserve_bytes"] = reserve
+            # Eviction evicts down to budget - reserve, so that is the line that
+            # actually governs, and the one worth showing people.
+            pool["target_bytes"] = max(0, bud - reserve) if bud else None
+            pool["used_fraction"] = (pool["bytes"] / bud) if bud else None
+            pool["free_bytes"] = (bud - pool["bytes"]) if bud else None
+            pool["over_budget"] = bool(bud and pool["bytes"] > bud)
+            pool["promotable_bytes"] = (max(0, pool["target_bytes"] - pool["bytes"])
+                                        if pool["target_bytes"] is not None else None)
+        ordered = sorted(pools.values(), key=lambda p: -(p["bytes"] or 0))
         return {
+            "pools": ordered,
             "jobs": out,
-            "used_bytes": grand,
-            "budget_bytes": budget,
-            "used_fraction": (grand / budget) if budget else None,
+            # A grand total is still useful ("how much is on the fast tier"), but it is
+            # deliberately NOT divided by any budget: there is no single budget to
+            # divide it by.
+            "used_bytes": sum(p["bytes"] for p in pools.values()),
+            "total_budget_bytes": sum(p["budget_bytes"] or 0 for p in pools.values()),
         }
 
 
@@ -316,11 +369,89 @@ class HistorySource(Source):
 
 
 #: Registry. Adding a source is one line here, exactly as with player adapters.
+class EventsSource(Source):
+    """Promotion and demotion history, throughput, and utilisation over time.
+
+    Reads the append-only store pamts_events writes. Opened READ-ONLY so a tiering run
+    recording a transfer is never blocked by someone refreshing the page.
+
+    Throughput is bucketed server-side. A night of eviction is ten thousand rows; the
+    page wants a line, and shipping ten thousand points to draw a few hundred pixels
+    would make the response larger than the rest of the page put together.
+    """
+    name = "events"
+    ttl = 5.0
+
+    def __init__(self, cfg=None):
+        super().__init__(cfg)
+        self.path = self.cfg.get("events_db")
+
+    def available(self):
+        return bool(self.path) and os.path.exists(self.path)
+
+    def _conn(self):
+        return sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, timeout=5)
+
+    def collect(self, since=None, limit=200, buckets=48, window=86400 * 7):
+        now = time.time()
+        since = now - window if since is None else since
+        con = self._conn()
+        try:
+            cols = {r[1] for r in con.execute("PRAGMA table_info(transfers)")}
+            if not cols:
+                return {"available": False}
+
+            recent = [
+                {"ts": r[0], "kind": r[1], "pool": r[2], "job": r[3], "item": r[4],
+                 "bytes": r[5], "seconds": r[6], "rate": r[7], "label": r[8],
+                 "reason": r[9]}
+                for r in con.execute(
+                    "SELECT ts,kind,pool,job,item,bytes,seconds,rate,label,reason "
+                    "FROM transfers ORDER BY ts DESC LIMIT ?", (limit,))]
+
+            totals = {}
+            for kind, n, b in con.execute(
+                    "SELECT kind, COUNT(*), COALESCE(SUM(bytes),0) FROM transfers "
+                    "WHERE ts > ? GROUP BY kind", (since,)):
+                totals[kind] = {"count": n, "bytes": b}
+
+            # Throughput: bytes moved per bucket, split by direction. Width is derived
+            # from the window so the same code serves an hour and a month.
+            width = max(1.0, (now - since) / max(1, buckets))
+            series = {}
+            for kind, bucket, b, secs in con.execute(
+                    "SELECT kind, CAST((ts - ?) / ? AS INTEGER), "
+                    "COALESCE(SUM(bytes),0), COALESCE(SUM(seconds),0) "
+                    "FROM transfers WHERE ts > ? GROUP BY 1, 2",
+                    (since, width, since)):
+                row = series.setdefault(kind, [None] * (buckets + 1))
+                idx = min(int(bucket), buckets)
+                row[idx] = {"bytes": b, "seconds": secs,
+                            "rate": (b / secs) if secs else None}
+
+            # Utilisation: the latest sample in each bucket, per pool. Latest rather
+            # than averaged, because it is a level, not a flow.
+            util = {}
+            for pool, bucket, fp, bud in con.execute(
+                    "SELECT pool, CAST((ts - ?) / ? AS INTEGER), footprint, budget "
+                    "FROM samples WHERE ts > ? "
+                    "GROUP BY 1, 2 HAVING ts = MAX(ts)", (since, width, since)):
+                row = util.setdefault(pool, [None] * (buckets + 1))
+                row[min(int(bucket), buckets)] = {"footprint": fp, "budget": bud}
+
+            return {"available": True, "recent": recent, "totals": totals,
+                    "window_s": now - since, "bucket_s": width, "buckets": buckets,
+                    "since": since, "throughput": series, "utilisation": util}
+        finally:
+            con.close()
+
+
 SOURCES = {
     ObserverSource.name: ObserverSource,
     StateSource.name: StateSource,
     ConfigSource.name: ConfigSource,
     TierSource.name: TierSource,
+    EventsSource.name: EventsSource,
     HistorySource.name: HistorySource,
 }
 

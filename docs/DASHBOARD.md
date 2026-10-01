@@ -55,6 +55,51 @@ means the same thing in both views.
 Labels arrive from a query string and are passed as SQL parameters; there is a test
 asserting a label containing SQL is treated as data.
 
+## Views
+
+**Now** — one card per source, plus a per-pool utilisation panel and what is being read
+right now. **Transfers** — every promotion and demotion, filterable by direction.
+**Graphs** — throughput, utilisation over time, and reads by verdict. **Sessions** — the
+classified session log. **Config** — what PAMTS is actually configured to do, so nobody
+has to shell in and read the TOML.
+
+## Budgets are per pool, and so are the percentages
+
+A tier job may carve out its own `budget_gb`; the rest share the global one. The tier
+card and the utilisation panel therefore report **one bar per pool**, each against its
+own budget.
+
+This used to be one total divided by the shared budget, which printed
+**"281.2% of 400.0G budget"** on a system where nothing was over budget at all — 1.07 TB
+of video *and* music measured against the 400 GB video allowance. There is deliberately
+no estate-wide percentage now, because there is no single budget to divide by.
+
+Each bar also carries a tick at the **eviction target**: `budget - [promote] headroom_gb`.
+That is the line eviction actually works to, and showing only the budget hides why
+eviction stops where it does.
+
+## History and graphs
+
+`pamts_events` records, append-only, to `[paths] events_db`:
+
+* **transfers** — one row per item moved, either direction, with bytes and seconds. This
+  is both the promotion/demotion history and the source of the throughput chart.
+* **samples** — one row per pool per run. Sampled rather than derived from transfers,
+  because content also arrives and leaves by other means and a derived figure would
+  drift from reality.
+
+Recording is **fail-safe**: if the store cannot be opened or written, it becomes a no-op.
+Losing a graph is a nuisance; aborting an eviction half way through because a telemetry
+table was locked is a real problem.
+
+Bucketing happens in SQL, not the browser: a night of eviction is ten thousand rows and
+the chart is a few hundred pixels wide. `GET /api/events?window=&buckets=&limit=`.
+
+Charts are hand-drawn inline SVG with **no charting library**, because the page makes
+zero external requests — it has to work on a storage box with no route to the internet.
+Lines **break at gaps** rather than interpolating: a missing sample means PAMTS did not
+run, and a straight line across it would invent history.
+
 ## Tier: which tier served each read
 
 Every session records whether the read was answered by the fast tier or the slow one.

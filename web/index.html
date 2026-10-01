@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PAMTS</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Crect width=%2716%27 height=%2716%27 rx=%273%27 fill=%27%232563eb%27/%3E%3Crect x=%273%27 y=%274%27 width=%2710%27 height=%272.5%27 rx=%271%27 fill=%27white%27/%3E%3Crect x=%273%27 y=%279.5%27 width=%276%27 height=%272.5%27 rx=%271%27 fill=%27white%27 opacity=%27.6%27/%3E%3C/svg%3E">
 <style>
 :root{
   --bg:#f7f7f8; --panel:#fff; --ink:#16181d; --dim:#6b7280; --line:#e3e5e9;
@@ -11,6 +12,8 @@
   --play:#15803d; --probe:#6b7280; --copy:#b45309; --bulk:#7c3aed;
   --fetch:#0369a1; --unknown:#9ca3af; --seek:#0f766e; --error:#b91c1c;
   --hot:#15803d; --cold:#6e7781;
+  --promote:#2563eb; --evict:#b45309; --grid:#eceef2;
+  --p1:#2563eb; --p2:#7c3aed; --p3:#0f766e; --p4:#b45309;
 }
 @media (prefers-color-scheme: dark){
   :root:not([data-theme="light"]){
@@ -19,7 +22,18 @@
     --play:#4ade80; --probe:#9aa1ad; --copy:#fbbf24; --bulk:#c084fc;
     --fetch:#38bdf8; --unknown:#6b7280; --seek:#2dd4bf; --error:#f87171;
     --hot:#4ade80; --cold:#9aa1ad;
+    --promote:#60a5fa; --evict:#fbbf24; --grid:#232730;
+    --p1:#60a5fa; --p2:#c084fc; --p3:#2dd4bf; --p4:#fbbf24;
   }
+}
+:root[data-theme="dark"]{
+  --bg:#101216; --panel:#181b21; --ink:#e8eaed; --dim:#9aa1ad; --line:#282c35;
+  --accent:#60a5fa; --ok:#4ade80; --warn:#fbbf24; --bad:#f87171;
+  --play:#4ade80; --probe:#9aa1ad; --copy:#fbbf24; --bulk:#c084fc;
+  --fetch:#38bdf8; --unknown:#6b7280; --seek:#2dd4bf; --error:#f87171;
+  --hot:#4ade80; --cold:#9aa1ad;
+  --promote:#60a5fa; --evict:#fbbf24; --grid:#232730;
+  --p1:#60a5fa; --p2:#c084fc; --p3:#2dd4bf; --p4:#fbbf24;
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);
@@ -71,6 +85,32 @@ details.raw pre{overflow:auto;background:var(--bg);padding:8px;border-radius:6px
   border-color:var(--accent);color:#fff}
 .filter .count{color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums}
 footer{padding:10px 16px;color:var(--dim);font-size:12px;border-top:1px solid var(--line)}
+
+/* --- added with the graphs and transfer views --- */
+header{position:sticky;top:0;background:var(--bg);z-index:5;align-items:center}
+nav{display:flex;gap:4px;flex-wrap:wrap}
+.spacer{flex:1 1 auto}
+.iconbtn{font:inherit;cursor:pointer;border:1px solid var(--line);background:transparent;
+  color:var(--dim);border-radius:8px;padding:5px 9px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  padding:13px 14px;margin-top:12px}
+.panel h2{font-size:13px;margin:0 0 10px;font-weight:600;display:flex;gap:9px;
+  align-items:baseline;flex-wrap:wrap}
+.bar{position:relative}
+.bar u{position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--dim);opacity:.7}
+.tblwrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+th.n,td.n{text-align:right}
+.chart{width:100%;height:auto;display:block;overflow:visible}
+.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--dim);margin:2px 0 8px}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px}
+.ranges{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:4px}
+.ranges button{font:inherit;font-size:12px;cursor:pointer;padding:3px 9px;
+  border-radius:999px;border:1px solid var(--line);background:transparent;color:var(--dim)}
+.ranges button[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);
+  color:#fff;font-weight:600}
+pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:9px;
+  overflow-x:auto;font-size:12px;margin:0}
+@media (max-width:560px){ main{padding:12px 16px} h1{font-size:16px} .big{font-size:22px} }
 </style>
 </head>
 <body>
@@ -78,30 +118,74 @@ footer{padding:10px 16px;color:var(--dim);font-size:12px;border-top:1px solid va
   <h1>PAMTS <span id="sub">dashboard</span></h1>
   <nav>
     <button id="tab-now" aria-current="true">Now</button>
-    <button id="tab-history">History</button>
+    <button id="tab-moves">Transfers</button>
+    <button id="tab-graphs">Graphs</button>
+    <button id="tab-sessions">Sessions</button>
+    <button id="tab-config">Config</button>
   </nav>
+  <span class="spacer"></span>
+  <button class="iconbtn" id="theme" title="Switch between light and dark">&#9680;</button>
 </header>
 
 <main>
   <section id="view-now">
     <div class="grid" id="cards"></div>
+    <div class="panel">
+      <h2>Fast tier, per budget pool <span class="sub" id="pool-note"></span></h2>
+      <div id="pools"></div>
+    </div>
     <div class="card" style="margin-top:12px">
       <h2>Reading right now <span class="sub" id="live-note"></span></h2>
       <div id="live"></div>
     </div>
   </section>
+  <section id="view-moves" class="hide">
+    <div class="grid" id="move-cards"></div>
+    <div class="panel">
+      <h2>Promotions and demotions <span class="sub" id="move-note"></span></h2>
+      <div class="filter" id="move-filter"></div>
+      <div class="tblwrap">
+        <table id="moves"><thead><tr>
+          <th>Time</th><th>Direction</th><th>Pool</th><th class="n">Size</th>
+          <th class="n">Rate</th><th>Why</th><th>Item</th>
+        </tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+  </section>
 
-  <section id="view-history" class="hide">
-    <div class="card">
+  <section id="view-graphs" class="hide">
+    <div class="ranges" id="ranges"></div>
+    <div class="panel">
+      <h2>Throughput <span class="sub">bytes moved per interval, by direction</span></h2>
+      <div class="legend" id="tp-legend"></div>
+      <div id="tp-chart"></div>
+    </div>
+    <div class="panel">
+      <h2>Fast tier utilisation <span class="sub">sampled each run, against each pool's budget</span></h2>
+      <div class="legend" id="ut-legend"></div>
+      <div id="ut-chart"></div>
+    </div>
+    <div class="panel">
+      <h2>Reads by verdict <span class="sub">last 24h, from the access observer</span></h2>
+      <div id="verdict-chart"></div>
+    </div>
+  </section>
+
+  <section id="view-sessions" class="hide">
+    <div class="panel">
       <h2>Classified sessions <span class="sub" id="hist-note"></span></h2>
       <div class="filter" id="filter"></div>
-      <div style="overflow:auto;max-height:70vh">
+      <div class="tblwrap">
         <table id="sessions"><thead><tr>
           <th>Time</th><th>Verdict</th><th>Tier</th><th>Client</th><th class="n">Size</th>
           <th class="n">Cov</th><th class="n">Rate</th><th>File</th>
         </tr></thead><tbody></tbody></table>
       </div>
     </div>
+  </section>
+
+  <section id="view-config" class="hide">
+    <div id="config-body"></div>
   </section>
 </main>
 
@@ -141,6 +225,110 @@ const dir = p => { if (!p) return ""; const i = p.lastIndexOf("/"); return i < 0
 const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
+const fmtPct = f => f == null ? "\u2013" : (f * 100).toFixed(1) + "%";
+const dirTag = k => k === "promote"
+  ? `<span class="tag" style="color:var(--promote)" title="copied onto the fast tier">PROMOTE</span>`
+  : k === "evict"
+  ? `<span class="tag" style="color:var(--evict)" title="moved out to the slow tier">DEMOTE</span>`
+  : tag(k);
+const poolLabel = p => p === "__shared__" ? "shared" : (p || "\u2013");
+
+// Charts are drawn by hand rather than with a library because this page makes ZERO
+// external requests: it has to work on a storage box with no route to the internet,
+// and a dashboard that cannot load is worse than one with plain charts.
+const CH = {w: 760, h: 150, l: 54, r: 8, t: 8, b: 20};
+const axisTicks = (max, n) => !(max > 0) ? [0]
+  : Array.from({length: n + 1}, (_, i) => max * i / n);
+const timeLabel = (ts, spanS) => {
+  const d = new Date(ts * 1000);
+  return spanS <= 86400 * 1.5
+    ? d.toLocaleTimeString(undefined, {hour: "2-digit", minute: "2-digit"})
+    : d.toLocaleDateString(undefined, {month: "short", day: "numeric"});
+};
+function gridAndAxis(max, fmt) {
+  const ih = CH.h - CH.t - CH.b, y = v => CH.t + ih - (v / max) * ih;
+  return axisTicks(max, 3).map(tv =>
+    `<line x1="${CH.l}" x2="${CH.w - CH.r}" y1="${y(tv).toFixed(1)}" y2="${y(tv).toFixed(1)}"
+       stroke="var(--grid)" stroke-width="1"/>
+     <text x="${CH.l - 6}" y="${(y(tv) + 3.5).toFixed(1)}" text-anchor="end"
+       font-size="10" fill="var(--dim)">${esc(fmt(tv))}</text>`).join("");
+}
+function xLabels(n, since, bucketS, xOf) {
+  const step = Math.max(1, Math.round(n / 5)), out = [];
+  for (let i = 0; i < n; i += step)
+    out.push(`<text x="${xOf(i).toFixed(1)}" y="${CH.h - 5}" text-anchor="middle"
+      font-size="10" fill="var(--dim)">${esc(timeLabel(since + i * bucketS, n * bucketS))}</text>`);
+  return out.join("");
+}
+/** Grouped bars. series: [{name,color,points:[num|null]}] */
+function barChart(series, o) {
+  o = Object.assign({fmt: fmtB, since: 0, bucketS: 3600}, o || {});
+  const n = Math.max(1, ...series.map(x => x.points.length));
+  const max = Math.max(0, ...series.flatMap(x => x.points.map(v => v == null ? 0 : v)));
+  if (max <= 0) return `<div class="muted" style="padding:14px 0">nothing moved in this window</div>`;
+  const iw = CH.w - CH.l - CH.r, ih = CH.h - CH.t - CH.b;
+  const bw = iw / n, inner = Math.max(1, (bw * 0.76) / series.length);
+  const y = v => CH.t + ih - (v / max) * ih;
+  let bars = "";
+  series.forEach((sr, si) => sr.points.forEach((v, i) => {
+    if (v == null || v <= 0) return;
+    const x = CH.l + i * bw + bw * 0.12 + si * inner;
+    bars += `<rect x="${x.toFixed(1)}" y="${y(v).toFixed(1)}" width="${inner.toFixed(1)}"
+      height="${Math.max(1, CH.t + ih - y(v)).toFixed(1)}" fill="${sr.color}" rx="1"
+      ><title>${esc(sr.name)}: ${esc(o.fmt(v))} at ${esc(fmtT(o.since + i * o.bucketS))}</title></rect>`;
+  }));
+  return `<svg class="chart" viewBox="0 0 ${CH.w} ${CH.h}" role="img"
+    aria-label="${esc(o.aria || "bar chart")}">${gridAndAxis(max, o.fmt)}${bars}${
+    xLabels(n, o.since, o.bucketS, i => CH.l + i * bw + bw / 2)}</svg>`;
+}
+/** Lines, broken at gaps, with optional dashed reference lines. */
+function lineChart(series, o) {
+  o = Object.assign({fmt: fmtB, since: 0, bucketS: 3600, refs: []}, o || {});
+  const n = Math.max(1, ...series.map(x => x.points.length));
+  const vals = series.flatMap(x => x.points.filter(v => v != null));
+  if (!vals.length) return `<div class="muted" style="padding:14px 0">no samples in this window yet</div>`;
+  const max = Math.max(...vals, ...o.refs.map(r => r.value || 0), 1);
+  const iw = CH.w - CH.l - CH.r, ih = CH.h - CH.t - CH.b;
+  const x = i => CH.l + (n === 1 ? iw / 2 : (i / (n - 1)) * iw);
+  const y = v => CH.t + ih - (v / max) * ih;
+  const refs = o.refs.filter(r => r.value != null).map(r =>
+    `<line x1="${CH.l}" x2="${CH.w - CH.r}" y1="${y(r.value).toFixed(1)}"
+       y2="${y(r.value).toFixed(1)}" stroke="${r.color || "var(--dim)"}" stroke-width="1"
+       stroke-dasharray="4 3" opacity=".85"
+       ><title>${esc(r.name)}: ${esc(o.fmt(r.value))}</title></line>`).join("");
+  let paths = "";
+  series.forEach(sr => {
+    // The path BREAKS at a gap rather than interpolating: a missing sample means PAMTS
+    // did not run, and a straight line across it would invent history.
+    let d = "", pen = false, dots = "";
+    sr.points.forEach((v, i) => {
+      if (v == null) { pen = false; return; }
+      d += (pen ? " L " : " M ") + x(i).toFixed(1) + " " + y(v).toFixed(1);
+      pen = true;
+      dots += `<circle cx="${x(i).toFixed(1)}" cy="${y(v).toFixed(1)}" r="2.1" fill="${sr.color}"
+        ><title>${esc(sr.name)}: ${esc(o.fmt(v))} at ${esc(fmtT(o.since + i * o.bucketS))}</title></circle>`;
+    });
+    paths += `<path d="${d}" fill="none" stroke="${sr.color}" stroke-width="1.8"
+      stroke-linejoin="round"/>${dots}`;
+  });
+  return `<svg class="chart" viewBox="0 0 ${CH.w} ${CH.h}" role="img"
+    aria-label="${esc(o.aria || "line chart")}">${gridAndAxis(max, o.fmt)}${refs}${paths}${
+    xLabels(n, o.since, o.bucketS, x)}</svg>`;
+}
+/** Horizontal bars for a plain category count. */
+function hBars(items, o) {
+  o = Object.assign({fmt: n => n.toLocaleString()}, o || {});
+  const max = Math.max(1, ...items.map(i => i.value || 0));
+  return items.map(i => `<div class="kv" style="border-bottom:0;padding:3px 0">
+      <span style="min-width:80px">${i.html || esc(i.name)}</span>
+      <span style="flex:1 1 auto;padding:0 10px"><span class="bar" style="margin:4px 0"
+        ><i style="width:${((i.value || 0) / max * 100).toFixed(1)}%;background:${
+        i.color || "var(--accent)"}"></i></span></span>
+      <span>${esc(o.fmt(i.value || 0))}</span></div>`).join("");
+}
+const legend = items => items.map(i =>
+  `<span><i style="background:${i.color}"></i>${esc(i.name)}</span>`).join("");
+
 function card(title, inner) {
   return `<div class="card"><h2>${esc(title)}</h2>${inner}</div>`;
 }
@@ -171,16 +359,31 @@ const RENDER = {
       ]));
   },
   tier(d) {
-    const f = d.used_fraction;
-    const cls = f == null ? "" : (f > 0.95 ? "bad" : f > 0.85 ? "warn" : "");
-    const bar = f == null ? "" :
-      `<div class="bar"><i class="${cls}" style="width:${Math.min(100, f*100).toFixed(1)}%"></i></div>
-       <div class="sub">${(f*100).toFixed(1)}% of ${fmtB(d.budget_bytes)} budget</div>`;
+    // No single percentage here, deliberately. There is no single budget: each pool
+    // has its own. Dividing the estate total by one of them is how this card used to
+    // report "281.2% of 400.0G budget" while nothing was over budget at all.
+    const pools = d.pools || [];
     return card("Fast tier",
-      `<div class="big">${fmtB(d.used_bytes)}</div>${bar}` +
-      rows((d.jobs||[]).map(j => [j.name, j.bytes == null
-        ? `<span class="err">${esc(j.error||"?")}</span>`
-        : `${fmtB(j.bytes)} <span class="sub">${(j.files||0).toLocaleString()} files</span>`])));
+      `<div class="big">${fmtB(d.used_bytes)}</div>` +
+      `<div class="sub">across ${pools.length} budget pool${pools.length === 1 ? "" : "s"}` +
+      `${d.total_budget_bytes ? ", " + fmtB(d.total_budget_bytes) + " allowed in total" : ""}</div>` +
+      rows(pools.map(p => [p.label,
+        `${fmtB(p.bytes)} <span class="sub">of ${fmtB(p.budget_bytes)} \u00b7 ${
+          fmtPct(p.used_fraction)}</span>`])));
+  },
+  events(d) {
+    if (!d || !d.available)
+      return card("Transfers", `<div class="muted">no transfer history yet</div>`);
+    const t = d.totals || {}, p = t.promote || {}, e = t.evict || {};
+    const days = Math.max(1, Math.round((d.window_s || 0) / 86400));
+    return card("Transfers",
+      `<div class="big">${fmtB(p.bytes || 0)} <span class="sub">promoted</span></div>` +
+      `<div class="sub">last ${days} day${days === 1 ? "" : "s"}</div>` +
+      rows([
+        ["promotions", (p.count || 0).toLocaleString()],
+        ["demotions", (e.count || 0).toLocaleString()],
+        ["demoted bytes", fmtB(e.bytes || 0)],
+      ]));
   },
   state(d) {
     return card("Promotion",
@@ -221,7 +424,7 @@ const RENDER = {
 
 function renderNow(payload) {
   const d = payload.data || {}, errs = payload.errors || {};
-  const order = ["observer", "tier", "state", "history", "config"];
+  const order = ["observer", "tier", "state", "events", "history", "config"];
   const names = [...order.filter(n => n in d || n in errs),
                  ...Object.keys(d).filter(n => !order.includes(n))];
   $("#cards").innerHTML = names.map(n => {
@@ -232,6 +435,8 @@ function renderNow(payload) {
     return card(n, `<details class="raw" open><summary>raw</summary><pre>${
       esc(JSON.stringify(d[n], null, 2))}</pre></details>`);
   }).join("");
+
+  renderPools(d.tier);
 
   const all = (d.observer && d.observer.sessions) || [];
   const live = liveFilter(all);
@@ -288,6 +493,249 @@ function renderHistory(h) {
     `${(h.sessions||[]).length} most recent` +
     (h.filtered_by ? ` of ${h.filtered_by.join(", ")}` : " (all verdicts)") + tierNote;
 }
+
+function renderPools(t) {
+  const el = $("#pools");
+  if (!el) return;
+  if (!t || !(t.pools || []).length) {
+    el.innerHTML = `<div class="muted">no tier jobs configured</div>`;
+    $("#pool-note").textContent = "";
+    return;
+  }
+  $("#pool-note").textContent = t.pools.length + " pool" + (t.pools.length === 1 ? "" : "s");
+  el.innerHTML = t.pools.map(p => {
+    const f = p.used_fraction;
+    const cls = f == null ? "" : (p.over_budget ? "bad" : f > 0.9 ? "warn" : "");
+    const width = f == null ? 0 : Math.min(100, f * 100);
+    // The tick is the line eviction actually works to -- budget minus the promotion
+    // reserve. Showing only the budget hides why eviction stops where it does.
+    const mark = (p.target_bytes && p.budget_bytes)
+      ? `<u style="left:${Math.min(100, p.target_bytes / p.budget_bytes * 100).toFixed(1)}%"
+           title="eviction target ${esc(fmtB(p.target_bytes))}: the budget minus the ${
+           esc(fmtB(p.reserve_bytes))} promotion reserve"></u>` : "";
+    return `<div style="margin-bottom:14px">
+      <div class="kv" style="border-bottom:0;padding-bottom:1px">
+        <span style="color:var(--ink);font-weight:600">${esc(p.label)}
+          <span class="sub">${p.own_budget ? "own budget" : "shared budget"}</span></span>
+        <span>${fmtB(p.bytes)} <span class="sub">of ${fmtB(p.budget_bytes)}</span></span>
+      </div>
+      <div class="bar"><i class="${cls}" style="width:${width.toFixed(1)}%"></i>${mark}</div>
+      <div class="sub">${fmtPct(f)} used \u00b7 ${
+        p.over_budget ? `<span class="err">over budget by ${fmtB(p.bytes - p.budget_bytes)}</span>`
+                      : `${fmtB(p.free_bytes)} free`}${
+        p.promotable_bytes != null ? ` \u00b7 ${fmtB(p.promotable_bytes)} promotable` : ""
+        } \u00b7 ${(p.files || 0).toLocaleString()} files \u00b7 ${
+        esc((p.jobs || []).join(", "))}</div>
+    </div>`;
+  }).join("");
+}
+
+// ------------------------------------------------------------- Transfers view
+let moveKind = null;      // null = both directions
+function renderMoves(d) {
+  if (!d || d.available === false) {
+    $("#moves tbody").innerHTML = `<tr><td colspan="7" class="muted">No transfer history
+      yet. It appears once PAMTS has promoted or evicted something.</td></tr>`;
+    $("#move-note").textContent = "";
+    $("#move-cards").innerHTML = "";
+    $("#move-filter").innerHTML = "";
+    return;
+  }
+  const t = d.totals || {}, pr = t.promote || {}, ev = t.evict || {};
+  const days = Math.max(1, Math.round((d.window_s || 0) / 86400));
+  const net = (pr.bytes || 0) - (ev.bytes || 0);
+  $("#move-cards").innerHTML =
+    card("Promoted", `<div class="big" style="color:var(--promote)">${fmtB(pr.bytes || 0)}</div>
+      <div class="sub">${(pr.count || 0).toLocaleString()} item(s) over ${days}d</div>`) +
+    card("Demoted", `<div class="big" style="color:var(--evict)">${fmtB(ev.bytes || 0)}</div>
+      <div class="sub">${(ev.count || 0).toLocaleString()} item(s) over ${days}d</div>`) +
+    card("Net onto the fast tier",
+      `<div class="big">${(net >= 0 ? "+" : "\u2212") + fmtB(Math.abs(net))}</div>
+       <div class="sub">promotions minus demotions</div>`);
+
+  const chip = (k, label, colour) => `<button data-kind="${k}" aria-pressed="${moveKind === k}"
+    style="color:${colour}">${esc(label)}</button>`;
+  $("#move-filter").innerHTML =
+    `<button class="preset" data-kind="" aria-pressed="${moveKind === null}">Both</button>` +
+    chip("promote", "Promotions", "var(--promote)") +
+    chip("evict", "Demotions", "var(--evict)");
+  $("#move-filter").querySelectorAll("button").forEach(b => b.onclick = () => {
+    moveKind = b.dataset.kind || null;
+    renderMoves(d);
+  });
+
+  const rs = (d.recent || []).filter(r => !moveKind || r.kind === moveKind);
+  $("#move-note").textContent = `${rs.length} most recent`;
+  $("#moves tbody").innerHTML = rs.length ? rs.map(r => `<tr>
+      <td class="sub" style="white-space:nowrap">${fmtT(r.ts)}</td>
+      <td>${dirTag(r.kind)}</td>
+      <td class="sub">${esc(poolLabel(r.pool))}</td>
+      <td class="n">${fmtB(r.bytes)}</td>
+      <td class="n sub">${r.rate ? fmtB(r.rate) + "/s" : "\u2013"}</td>
+      <td class="sub">${esc(r.reason || "")}</td>
+      <td class="path">${esc(r.label || r.item || "")}</td>
+    </tr>`).join("") : `<tr><td colspan="7" class="muted">nothing matches this filter</td></tr>`;
+}
+
+// ------------------------------------------------------------- Graphs view
+const RANGES = [["6h", 21600], ["24h", 86400], ["7d", 604800], ["30d", 2592000]];
+let range = 86400;
+function renderRanges() {
+  $("#ranges").innerHTML = RANGES.map(([l, w]) =>
+    `<button data-w="${w}" aria-pressed="${range === w}">${l}</button>`).join("");
+  $("#ranges").querySelectorAll("button").forEach(b => b.onclick = () => {
+    range = Number(b.dataset.w);
+    renderRanges();
+    tick();
+  });
+}
+
+function renderGraphs(d, verdicts) {
+  const vc = $("#verdict-chart");
+  if (verdicts && Object.keys(verdicts).length) {
+    vc.innerHTML = hBars(Object.entries(verdicts).sort((a, b) => b[1] - a[1])
+      .map(([k, v]) => ({name: k, html: tag(k), value: v,
+                         color: `var(--${k.toLowerCase()}, var(--unknown))`})));
+  } else {
+    vc.innerHTML = `<div class="muted">no sessions recorded in the last 24 hours</div>`;
+  }
+  if (!d || d.available === false) {
+    $("#tp-chart").innerHTML = `<div class="muted">No transfer history yet.</div>`;
+    $("#ut-chart").innerHTML = `<div class="muted">No utilisation samples yet.</div>`;
+    $("#tp-legend").innerHTML = "";
+    $("#ut-legend").innerHTML = "";
+    return;
+  }
+  const tp = d.throughput || {};
+  const pick = k => (tp[k] || []).map(x => x ? x.bytes : null);
+  const tpSeries = [
+    {name: "promoted", color: "var(--promote)", points: pick("promote")},
+    {name: "demoted", color: "var(--evict)", points: pick("evict")},
+  ].filter(x => x.points.some(v => v != null));
+  $("#tp-legend").innerHTML = legend(tpSeries);
+  $("#tp-chart").innerHTML = barChart(tpSeries.length ? tpSeries
+      : [{name: "none", color: "var(--dim)", points: []}],
+    {since: d.since, bucketS: d.bucket_s, fmt: fmtB,
+     aria: "bytes promoted and demoted over time"});
+
+  const ut = d.utilisation || {};
+  const colours = ["var(--p1)", "var(--p2)", "var(--p3)", "var(--p4)"];
+  const utSeries = [], refs = [];
+  Object.keys(ut).sort().forEach((pool, i) => {
+    const col = colours[i % colours.length];
+    utSeries.push({name: poolLabel(pool), color: col,
+                   points: ut[pool].map(x => x ? x.footprint : null)});
+    const last = ut[pool].filter(Boolean).slice(-1)[0];
+    if (last && last.budget) refs.push({name: poolLabel(pool) + " budget",
+                                       value: last.budget, color: col});
+  });
+  $("#ut-legend").innerHTML = legend(utSeries) +
+    (refs.length ? `<span class="sub">dashed = budget</span>` : "");
+  $("#ut-chart").innerHTML = utSeries.length
+    ? lineChart(utSeries, {since: d.since, bucketS: d.bucket_s, fmt: fmtB, refs,
+                           aria: "fast tier utilisation per pool over time"})
+    : `<div class="muted">no utilisation samples in this window yet</div>`;
+}
+
+// --------------------------------------------------------------- Config view
+// The point of this view is that the dashboard should answer "what is PAMTS actually
+// configured to do" without anyone shelling in to read the TOML.
+function renderConfig(d) {
+  const c = (d || {}).config || {}, t = (d || {}).tier || {};
+  const jobs = c.jobs || [];
+  const tierJobs = jobs.filter(j => j.mode === "tier");
+  const backupJobs = jobs.filter(j => j.mode === "backup");
+  const rules = c.promote_rules || [];
+  const sec = (title, inner) => `<div class="panel"><h2>${esc(title)}</h2>${inner}</div>`;
+  const tbl = (head, body) => `<div class="tblwrap"><table><thead><tr>${
+    head.map(h => `<th${h.n ? ' class="n"' : ""}>${esc(h.t || h)}</th>`).join("")
+    }</tr></thead><tbody>${body}</tbody></table></div>`;
+  const num = v => (v == null ? "\u2013" : Number(v).toLocaleString());
+
+  let out = sec("Source", rows([
+    ["config file", `<span class="path">${esc(c.path || "\u2013")}</span>`],
+    ["players", esc((c.player_names || []).join(", ") || "\u2013")],
+    ["tier jobs", tierJobs.length],
+    ["backup jobs", backupJobs.length],
+    ["promotion rules", rules.length],
+  ]));
+
+  out += sec("Tier jobs \u2014 cached, and evicted when over budget",
+    tierJobs.length ? tbl(
+      ["Job", "Source", "Destination", {t: "Depth", n: 1}, {t: "Budget", n: 1}, "Grace"],
+      tierJobs.map(j => {
+        const p = (t.pools || []).find(x => (x.jobs || []).includes(j.name));
+        // The figure is the POOL's, not this job's. Movies and tv share one, so
+        // printing it bare under each made it read as if each held the whole lot.
+        const shared = p && (p.jobs || []).length > 1;
+        return `<tr><td><b>${esc(j.name)}</b>${p ? `<div class="sub">${
+            shared ? "pool: " : ""}${fmtB(p.bytes)} of ${fmtB(p.budget_bytes)} \u00b7 ${
+            fmtPct(p.used_fraction)}${shared ? ` (${esc(p.jobs.join(" + "))})` : ""}</div>`
+            : ""}</td>
+          <td class="path">${esc(j.source || "")}</td>
+          <td class="path">${esc(j.dest || "")}</td>
+          <td class="n">${j.depth ?? "\u2013"}</td>
+          <td class="n">${j.budget_gb ? esc(j.budget_gb) + "G"
+            : `<span class="sub">shared</span>`}</td>
+          <td class="sub">${j.grace === false ? "off" : "on"}</td></tr>`;
+      }).join("")) : `<div class="muted">none</div>`);
+
+  out += sec("Backup jobs \u2014 mirrored, and deletions propagate",
+    backupJobs.length ? tbl(
+      ["Job", "Source", "Destination", {t: "max_delete", n: 1}, "Protected by"],
+      backupJobs.map(j => `<tr><td><b>${esc(j.name)}</b></td>
+        <td class="path">${esc(j.source || "")}</td>
+        <td class="path">${esc(j.dest || "")}</td>
+        <td class="n">${num(j.max_delete)}</td>
+        <td class="path">${esc(j.exclude_from || "")}</td></tr>`).join(""))
+      : `<div class="muted">none</div>`);
+
+  out += sec("Promotion rules \u2014 what is fetched, per medium",
+    rules.length ? tbl(
+      ["Playing", {t: "Promote it after", n: 1}, {t: "Lookahead", n: 1}, {t: "Cap", n: 1}],
+      rules.map(r => {
+        const after = (r.current || {}).after_seconds;
+        const items = (r.lookahead || {}).items;
+        return `<tr><td>${tag(String(r.match || "?").toUpperCase())}</td>
+          <td class="n">${after == null ? `<span class="sub">never</span>` : esc(after) + "s"}</td>
+          <td class="n">${items == null ? `<span class="sub">adapter default</span>`
+            : items === 0 ? `<span class="sub">off</span>` : esc(items) + " item(s)"}</td>
+          <td class="n">${r.max_bytes_gb ? esc(r.max_bytes_gb) + "G"
+            : `<span class="sub">adapter default</span>`}</td></tr>`;
+      }).join(""))
+      : `<div class="muted">none configured \u2014 promotion then fetches only what
+         FOLLOWS the playing item, and a film has nothing after it</div>`);
+
+  const settings = o => rows(Object.entries(o || {}).filter(([k]) => k !== "rules")
+    .map(([k, v]) => [k, `<span class="path">${esc(
+      Array.isArray(v) ? v.join(", ") : String(v))}</span>`]));
+  out += sec("[tier] settings", settings(c.tier_settings));
+  out += sec("[promote] settings", settings(c.promote_settings));
+  out += sec("Path mapping \u2014 how a player's path becomes a tier",
+    (c.root_map || []).length ? tbl(["Reported by the player", "Fast tier", "Slow tier"],
+      (c.root_map || []).map(r => `<tr><td class="path">${esc(r.player_path || "")}</td>
+        <td class="path">${esc(r.fast || "")}</td>
+        <td class="path">${esc(r.slow || "")}</td></tr>`).join(""))
+      : `<div class="muted">none</div>`);
+  $("#config-body").innerHTML = out;
+}
+
+// Honours the OS by default; the toggle only overrides once asked. Wrapped because
+// storage throws in a private window.
+(function initTheme() {
+  let saved = null;
+  try { saved = localStorage.getItem("pamts.theme"); } catch (e) {}
+  if (saved) document.documentElement.setAttribute("data-theme", saved);
+  const b = $("#theme");
+  if (b) b.onclick = () => {
+    const cur = document.documentElement.getAttribute("data-theme");
+    const dark = cur ? cur === "dark"
+                     : matchMedia("(prefers-color-scheme: dark)").matches;
+    const next = dark ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", next);
+    try { localStorage.setItem("pamts.theme", next); } catch (e) {}
+  };
+})();
 
 // Which verdicts to show. Copies and scans outnumber plays by hundreds to one, so
 // the default is the observer's own notion of demand -- otherwise the view is a wall
@@ -350,43 +798,76 @@ function liveFilter(sessions) {
   return sessions.filter(s => selected.includes(s.label));
 }
 
-let failures = 0;
+// ------------------------------------------------------------------- polling
+// Each view fetches only what it shows. Now is the one people leave open, so it is the
+// only one polled unconditionally.
+let failures = 0, lastVerdicts = null, view = "now";
 async function tick() {
+  let state = null;
   try {
-    const r = await fetch("api/state", {cache: "no-store"});
-    const p = await r.json();
-    renderNow(p);
-    const errs = Object.keys(p.errors || {});
-    $("#foot").innerHTML = `updated ${fmtT(p.generated)}` +
-      (errs.length ? ` · <span class="err">unavailable: ${esc(errs.join(", "))}</span>` : "");
+    state = await (await fetch("api/state", {cache: "no-store"})).json();
+    // labels_24h rides along on /api/state, so the verdict chart works on first load
+    // rather than waiting for someone to open the Sessions tab.
+    lastVerdicts = ((state.data || {}).history || {}).labels_24h || lastVerdicts;
+    if (view === "now") renderNow(state);
+    if (view === "config") renderConfig(state.data || {});
+    const errs = Object.keys(state.errors || {});
+    $("#foot").innerHTML = `updated ${fmtT(state.generated)}` +
+      (errs.length ? ` \u00b7 <span class="err">unavailable: ${esc(errs.join(", "))}</span>` : "");
     failures = 0;
   } catch (e) {
     failures++;
     $("#foot").innerHTML = `<span class="err">cannot reach pamts-web (${failures})</span>`;
   }
-  if (!$("#view-history").classList.contains("hide")) {
+
+  if (view === "sessions") {
     // Filter server-side: with copies outnumbering plays hundreds to one, filtering
     // the most recent 200 rows client-side would show almost nothing.
     const q = selected && selected.length && selected.length !== knownLabels.length
       ? "&labels=" + encodeURIComponent(selected.join(","))
       : (selected === null ? "&labels=demand" : "");
-    try { renderHistory(await (await fetch("api/history?limit=200" + q, {cache:"no-store"})).json()); }
-    catch (e) { /* the Now view already reports connectivity */ }
+    try {
+      const h = await (await fetch("api/history?limit=200" + q, {cache: "no-store"})).json();
+      lastVerdicts = h.labels_24h || lastVerdicts;
+      renderHistory(h);
+    } catch (e) { /* the footer already reports connectivity */ }
+  }
+
+  if (view === "moves" || view === "graphs") {
+    const w = view === "graphs" ? range : 604800;
+    try {
+      const r = await fetch(`api/events?window=${w}&buckets=48&limit=300`,
+                            {cache: "no-store"});
+      const d = r.ok ? await r.json() : {available: false};
+      if (view === "moves") renderMoves(d); else renderGraphs(d, lastVerdicts);
+    } catch (e) {
+      // 503 until PAMTS has moved something: an explanation, not an error.
+      if (view === "moves") renderMoves({available: false});
+      else renderGraphs({available: false}, lastVerdicts);
+    }
   }
 }
 
+const TABS = {now: "#view-now", moves: "#view-moves", graphs: "#view-graphs",
+              sessions: "#view-sessions", config: "#view-config"};
 function show(which) {
-  const now = which === "now";
-  $("#view-now").classList.toggle("hide", !now);
-  $("#view-history").classList.toggle("hide", now);
-  $("#tab-now").setAttribute("aria-current", String(now));
-  $("#tab-history").setAttribute("aria-current", String(!now));
+  view = TABS[which] ? which : "now";
+  for (const [k, sel] of Object.entries(TABS)) {
+    const el = $(sel); if (el) el.classList.toggle("hide", k !== view);
+    const b = $("#tab-" + k); if (b) b.setAttribute("aria-current", String(k === view));
+  }
+  try { localStorage.setItem("pamts.view", view); } catch (e) {}
   tick();
 }
-$("#tab-now").onclick = () => show("now");
-$("#tab-history").onclick = () => show("history");
+Object.keys(TABS).forEach(k => {
+  const b = $("#tab-" + k);
+  if (b) b.onclick = () => show(k);
+});
 
-tick();
+renderRanges();
+let startView = "now";
+try { startView = localStorage.getItem("pamts.view") || "now"; } catch (e) {}
+show(startView);
 setInterval(tick, 5000);
 </script>
 </body>

@@ -11,6 +11,9 @@ no change here.
     GET /                      the dashboard
     GET /api/state             every source's current view, plus per-source errors
     GET /api/history?since=&limit=&labels=PLAY,FETCH
+    GET /api/events?window=&buckets=&limit=
+                               promotion/demotion history, throughput and
+                               utilisation, bucketed for charting
     GET /api/sources           what is registered and whether it is available
     GET /health
 
@@ -95,6 +98,21 @@ def make_handler(sources, page_path):
                         self._send({"generated": time.time(),
                                     **hist.collect(since=since, limit=limit,
                                                    labels=labels or None)})
+                elif u.path == "/api/events":
+                    # window= seconds of history, buckets= how many points to return.
+                    # Bucketing happens in SQL: a night of eviction is ten thousand
+                    # rows and the page draws a few hundred pixels.
+                    window = float(q.get("window", [str(86400 * 7)])[0])
+                    buckets = max(2, min(400, int(q.get("buckets", ["48"])[0])))
+                    limit = max(1, min(2000, int(q.get("limit", ["200"])[0])))
+                    ev = next((s for s in sources if s.name == "events"), None)
+                    if ev is None or not ev.available():
+                        self._send({"error": "no event history yet; it appears once "
+                                             "PAMTS has moved something"}, code=503)
+                    else:
+                        self._send({"generated": time.time(),
+                                    **ev.collect(limit=limit, buckets=buckets,
+                                                 window=window)})
                 else:
                     self._send({"error": "not found"}, code=404)
             except Exception as e:                              # noqa: BLE001
@@ -112,6 +130,7 @@ def source_cfg(args):
         "state_file": args.state_file,
         "config_file": args.config,
         "observer_db": args.observer_db,
+        "events_db": args.events_db,
         "history_limit": args.history_limit,
     }
     # The tier source needs to know which jobs are tier jobs and what the budget is.
@@ -124,6 +143,14 @@ def source_cfg(args):
             cfg["tier_jobs"] = [j for j in (raw.get("jobs") or [])
                                 if j.get("mode") == "tier"]
             cfg["budget_gb"] = (raw.get("tier") or {}).get("budget_gb")
+            # Eviction evicts to budget MINUS this, so the dashboard needs it to show
+            # the line that actually governs rather than the nominal budget.
+            cfg["promote_headroom_gb"] = (raw.get("promote") or {}).get("headroom_gb", 0)
+            # Nothing else is duplicated here: ConfigSource reads this same file and
+            # returns the rest. Copying it into the source config as well just created
+            # two places to keep in step.
+            if not cfg.get("events_db"):
+                cfg["events_db"] = (raw.get("paths") or {}).get("events_db")
         except Exception as e:                                  # noqa: BLE001
             print(f"warning: could not read {args.config}: {e}", file=sys.stderr)
     return cfg
@@ -136,6 +163,8 @@ def main(argv=None):
     ap.add_argument("--observer-url", default="http://127.0.0.1:8621")
     ap.add_argument("--observer-db", default="/var/lib/pamts/observer.db")
     ap.add_argument("--state-file", default="/var/lib/pamts/state.json")
+    ap.add_argument("--events-db", default="/var/lib/pamts/events.db",
+                    help="the transfer/utilisation history pamts_events writes")
     ap.add_argument("--listen", default="127.0.0.1:8622",
                     help="host:port. Defaults to localhost because there is no "
                          "authentication; use 0.0.0.0:8622 to expose it on a "

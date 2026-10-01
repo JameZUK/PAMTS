@@ -196,8 +196,13 @@ t = dash.TierSource({"tier_jobs": [{"name": "tv", "source": tj}], "budget_gb": 1
 check("sums the tier footprint", t.collect()["used_bytes"] == 4096,
       str(t.collect()["used_bytes"]))
 check("counts files", t.collect()["jobs"][0]["files"] == 1)
-check("computes the used fraction against the budget",
-      abs(t.collect()["used_fraction"] - 4096 / 1024**3) < 1e-9)
+# The fraction now lives on the POOL, because there is no estate-wide budget to
+# divide by. The old estate-wide used_fraction is what produced "281.2% of 400.0G".
+_p0 = t.collect()["pools"][0]
+check("computes the used fraction against that pool's own budget",
+      abs(_p0["used_fraction"] - 4096 / 1024**3) < 1e-9, str(_p0["used_fraction"]))
+check("a job with no budget_gb lands in the shared pool",
+      _p0["pool"] == "__shared__", _p0["pool"])
 bad = dash.TierSource({"tier_jobs": [{"name": "gone", "source": "/nope"}]})
 check("a missing job directory is an error on that job, not a crash",
       bad.collect()["jobs"][0]["error"] == "not a directory")
@@ -287,8 +292,23 @@ check("unavailable when nothing is listening",
 print("\nthe page")
 page = (ROOT / "web" / "index.html").read_text()
 check("page exists and is not empty", len(page) > 1000)
+# The intent is "fetches nothing from the network", not "contains no http substring".
+# The SVG namespace in the inline favicon is an XML identifier that no browser ever
+# requests, so it is excluded explicitly rather than by loosening the check.
+SVG_NS = "http://www.w3.org/2000/svg"
+_page_net = page.replace(SVG_NS, "").replace(SVG_NS.replace("/", "%2F"), "")
 check("no external requests: it must work with no internet",
-      "http://" not in page and "https://" not in page)
+      "http://" not in _page_net and "https://" not in _page_net,
+      "found: " + ", ".join(sorted({w for w in _page_net.split('"')
+                                    if w.startswith(("http://", "https://"))}))[:200])
+# And the things that actually cause a fetch, named directly.
+for _bad, _why in (("<script src", "external scripts"),
+                   ('rel="stylesheet"', "external stylesheets"),
+                   ("@import", "imported stylesheets"),
+                   ("url(http", "remote assets in CSS")):
+    check(f"the page loads no {_why}", _bad not in page, _bad)
+check("the favicon is inlined, so there is no 404 on every load",
+      'rel="icon"' in page and "data:image/svg+xml" in page)
 check("supports light and dark", "prefers-color-scheme" in page)
 check("an UNREGISTERED source still renders, as raw JSON",
       "raw" in page and "JSON.stringify" in page,
@@ -346,6 +366,115 @@ check("and the source says the column is absent", _oout["tier_known"] is False)
 check("so the page can explain itself rather than showing a false 0%",
       _oout["tier_24h"] == {}, str(_oout["tier_24h"]))
 
+
+# --------------------------------------------------------------- tier pools
+print("\ntier: budgets are per pool, not one total")
+_tj = [
+    {"name": "movies", "mode": "tier", "source": os.path.join(tmp, "m")},
+    {"name": "tv", "mode": "tier", "source": os.path.join(tmp, "t")},
+    {"name": "music", "mode": "tier", "source": os.path.join(tmp, "a"), "budget_gb": 0.000002},
+]
+for d, size in (("m", 1024), ("t", 2048), ("a", 4096)):
+    os.makedirs(os.path.join(tmp, d), exist_ok=True)
+    with open(os.path.join(tmp, d, "f.bin"), "wb") as fh:
+        fh.truncate(size)
+ts = dash.TierSource({"tier_jobs": _tj, "budget_gb": 0.000005,
+                      "promote_headroom_gb": 0.000001})
+to = ts.collect()
+check("jobs collapse into two pools", len(to["pools"]) == 2, str(len(to["pools"])))
+byname = {p["pool"]: p for p in to["pools"]}
+check("movies and tv share one pool", "__shared__" in byname, str(sorted(byname)))
+check("music has its own pool", "music" in byname, str(sorted(byname)))
+check("the shared pool sums only its own jobs",
+      byname["__shared__"]["bytes"] == 1024 + 2048, str(byname["__shared__"]["bytes"]))
+check("the music pool sums only music", byname["music"]["bytes"] == 4096,
+      str(byname["music"]["bytes"]))
+check("each pool reports its OWN budget",
+      byname["music"]["budget_bytes"] != byname["__shared__"]["budget_bytes"],
+      str([p["budget_bytes"] for p in to["pools"]]))
+# THE BUG THIS REPLACES. The old source summed every job and divided by the shared
+# budget, which reported "281.2% of 400.0G" on a system where nothing was over budget.
+check("there is no estate-wide used_fraction to misread",
+      "used_fraction" not in to, str(sorted(to)))
+check("the grand total is still reported", to["used_bytes"] == 1024 + 2048 + 4096,
+      str(to["used_bytes"]))
+for p in to["pools"]:
+    f = p["used_fraction"]
+    check(f"{p['pool']} fraction is a plausible ratio, not an artefact",
+          f is None or 0 <= f <= 2.0, f"{p['pool']}={f}")
+check("the eviction target is budget minus the reserve",
+      byname["music"]["target_bytes"]
+      == byname["music"]["budget_bytes"] - byname["music"]["reserve_bytes"],
+      str(byname["music"]))
+check("a pool under budget reports promotable room",
+      byname["music"]["promotable_bytes"] >= 0, str(byname["music"]["promotable_bytes"]))
+# 512 bytes of budget against 1024 bytes of content. Expressed in GB because that is
+# the unit the config uses, which is also why the source must not int() it away.
+_tiny = dash.TierSource({"tier_jobs": [dict(_tj[0])], "budget_gb": 512 / 1024 ** 3,
+                         "promote_headroom_gb": 0})
+_t2 = _tiny.collect()["pools"][0]
+check("an over-budget pool says so", _t2["over_budget"] is True, str(_t2))
+check("a sub-1GB budget survives rather than truncating to zero",
+      _t2["budget_bytes"] == 512, str(_t2["budget_bytes"]))
+check("and its fraction exceeds 1", _t2["used_fraction"] > 1, str(_t2["used_fraction"]))
+
+# ------------------------------------------------------------------- events
+print("\nevents: transfer history, throughput and utilisation")
+import pamts_events                                              # noqa: E402
+_edb = os.path.join(tmp, "events.db")
+pamts_events.configure(_edb)
+check("configure creates the store", os.path.exists(_edb))
+now = time.time()
+_con = sqlite3.connect(_edb)
+# Seed at known offsets so bucketing can be asserted rather than eyeballed.
+for off, kind, pool, nbytes, secs in (
+        (-30, "promote", "__shared__", 1000, 2.0),
+        (-30, "evict", "music", 4000, 4.0),
+        (-7200, "promote", "music", 2000, 1.0)):
+    _con.execute("INSERT INTO transfers(ts,kind,pool,job,item,bytes,seconds,rate,label,"
+                 "reason) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                 (now + off, kind, pool, "j", "it", nbytes, secs, nbytes / secs, "L", "R"))
+for off, pool, fp in ((-30, "music", 700), (-7200, "music", 900)):
+    _con.execute("INSERT INTO samples(ts,pool,footprint,budget,reserve) VALUES(?,?,?,?,?)",
+                 (now + off, pool, fp, 1000, 60))
+_con.commit(); _con.close()
+
+es = dash.EventsSource({"events_db": _edb})
+check("the source is available once the file exists", es.available())
+eo = es.collect(window=86400, buckets=24)
+check("recent transfers come back newest first",
+      [r["ts"] for r in eo["recent"]] == sorted((r["ts"] for r in eo["recent"]), reverse=True),
+      str([round(r["ts"] - now) for r in eo["recent"]]))
+check("totals are split by direction",
+      eo["totals"]["promote"]["count"] == 2 and eo["totals"]["evict"]["count"] == 1,
+      str(eo["totals"]))
+check("and summed in bytes", eo["totals"]["evict"]["bytes"] == 4000, str(eo["totals"]))
+check("a per-item rate is derived", eo["recent"][0]["rate"] is not None)
+tp = eo["throughput"]
+check("throughput is bucketed per direction", set(tp) == {"promote", "evict"}, str(sorted(tp)))
+check("each series has one slot per bucket",
+      all(len(v) == eo["buckets"] + 1 for v in tp.values()),
+      str({k: len(v) for k, v in tp.items()}))
+check("buckets with nothing in them are None, not zero",
+      any(x is None for x in tp["evict"]), "evict series has no gaps at all")
+check("the two promotions land in DIFFERENT buckets, two hours apart",
+      len([x for x in tp["promote"] if x]) == 2,
+      str([i for i, x in enumerate(tp["promote"]) if x]))
+ut = eo["utilisation"]
+check("utilisation is returned per pool", list(ut) == ["music"], str(sorted(ut)))
+check("and carries the budget for a reference line",
+      any(x and x["budget"] == 1000 for x in ut["music"]), str([x for x in ut["music"] if x]))
+
+# Recording must never take a run down with it.
+pamts_events.configure("/proc/definitely/not/writable/x.db")
+check("an unwritable store disables recording rather than raising",
+      pamts_events.record_transfer("promote", "x", 1) is False)
+check("and samples too", pamts_events.record_sample("p", 1, 2) is False)
+pamts_events.configure(None)
+check("configure(None) is a no-op store", pamts_events.record_transfer("evict", "y", 1) is False)
+
+_eo2 = dash.EventsSource({"events_db": os.path.join(tmp, "nope.db")})
+check("a missing events db is unavailable, not an error", _eo2.available() is False)
 
 srv.shutdown(); shutil.rmtree(tmp, ignore_errors=True)
 summary()

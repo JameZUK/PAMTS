@@ -47,6 +47,7 @@ import sys
 import time
 
 import pamts
+import pamts_events
 import pamts_players
 from pamts_players import Caps
 
@@ -227,7 +228,10 @@ def filter_candidates(cands, caps, budget_left):
         # tiering evicts. pamts.is_protected also matches prefixes in both directions,
         # so a granularity mismatch over-protects rather than leaving this exposed.
         chosen.append({"rel": rel, "src": spath, "dst": fpath, "size": size,
-                       "label": c.label, "group_dir": os.path.dirname(fpath)})
+                       "label": c.label, "group_dir": os.path.dirname(fpath),
+                       "pool": (budget_left.pool_of(fpath)
+                                if isinstance(budget_left, Headroom) else None),
+                       "reason": "playing now" if c.order < 0 else "lookahead"})
         used += size
     return chosen
 
@@ -255,11 +259,15 @@ def copy_items(items, dry_run, stats=None):
         if p.returncode != 0:
             logging.error(f"    rsync failed rc={p.returncode}: {p.stderr.strip()[:200]}")
             ok = False
-        elif stats is not None:
+        else:
             dt = max(0.001, time.time() - t0)
-            stats["bytes"] = stats.get("bytes", 0) + it["size"]
-            stats["seconds"] = stats.get("seconds", 0.0) + dt
-            logging.info(f"      {human(it['size'] / dt)}/s")
+            if stats is not None:
+                stats["bytes"] = stats.get("bytes", 0) + it["size"]
+                stats["seconds"] = stats.get("seconds", 0.0) + dt
+                logging.info(f"      {human(it['size'] / dt)}/s")
+            pamts_events.record_transfer(
+                "promote", it["rel"], it["size"], dt, pool=it.get("pool"),
+                label=it.get("label"), reason=it.get("reason"))
     return ok
 
 
@@ -330,7 +338,10 @@ def do_next_up(players, budget, budget_left, footprint, state, stats, now, dry_r
         label = f"{info['show']} S{info['season']}E{info['episode']}"
         missing.append({"rel": info["rel"], "src": info["slow"], "dst": fast_path,
                         "size": info["size"] or 0, "label": label,
-                        "group_dir": os.path.dirname(fast_path)})
+                        "group_dir": os.path.dirname(fast_path),
+                        "pool": (budget_left.pool_of(fast_path)
+                                 if isinstance(budget_left, Headroom) else None),
+                        "reason": "next-up"})
     if not missing:
         logging.info("[next-up] every pinned item is already on fast storage")
         return 0
@@ -379,6 +390,9 @@ def main():
         return 2
 
     pamts.setup_logging(pamts.PATHS["promote_log"], args.dry_run)
+    # Telemetry only, and fail-safe: if the store cannot be opened, recording becomes a
+    # no-op rather than taking the run down with it.
+    pamts_events.configure(None if args.dry_run else pamts.PATHS.get("events_db"))
     if args.simulate_recent and not args.dry_run:
         logging.error("--simulate-recent is a validation aid and requires --dry-run")
         return 2

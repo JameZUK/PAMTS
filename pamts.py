@@ -34,6 +34,10 @@ DEFAULTS = {
         "state_file": "/var/lib/pamts/state.json",
         "tier_log": "/var/log/pamts-tier.log",
         "promote_log": "/var/log/pamts-promote.log",
+        # Append-only record of transfers and tier utilisation, for the dashboard's
+        # history and graphs. Separate from the observer's database on purpose -- see
+        # pamts_events. Set to "" to disable recording entirely.
+        "events_db": "/var/lib/pamts/events.db",
     },
     "tier": {
         "budget_gb": 400,

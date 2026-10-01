@@ -49,6 +49,7 @@ import sys
 import time
 
 import pamts
+import pamts_events
 import pamts_players
 
 # Set False only by the test suite; production must always require a real mount.
@@ -284,6 +285,7 @@ def tier_candidates(jobs, views=None, pins=None):
                         "pinned_bytes": d["pinned_bytes"],
                         "pinned_rels": d["pinned_rels"],
                         "evictable": d["size"] - d["pinned_bytes"],
+                        "job": job.get("name"),
                         "grace_allowed": bool(job.get("grace", True))})
     return out
 
@@ -349,7 +351,8 @@ def gather_views(jobs):
     return views, items, hist_ok
 
 
-def do_tier(jobs, budget, dry_run, views=_FETCH, pins=None, items=None, hist_ok=True):
+def do_tier(jobs, budget, dry_run, views=_FETCH, pins=None, items=None,
+            hist_ok=True, pool=None):
     now = time.time()
     protected = pamts.protected_now(now)
     if protected:
@@ -402,6 +405,10 @@ def do_tier(jobs, budget, dry_run, views=_FETCH, pins=None, items=None, hist_ok=
     # which is the entire point of tiering music.
     reserve = int(float(pamts.PROMOTE["headroom_gb"]) * pamts.GB)
     target = max(0, budget - reserve)
+    # Sampled, not derived from the transfer log: content also arrives and leaves by
+    # other means (a download, a manual delete), so a derived figure would drift.
+    if not dry_run:
+        pamts_events.record_sample(pool or "__shared__", footprint, budget, reserve)
     logging.info(f"[tier] fast tier holds {human(footprint)} across {len(cands)} "
                  f"candidate(s); budget {human(budget)}, evicting down to "
                  f"{human(target)} to leave {human(reserve)} for promotion")
@@ -515,7 +522,15 @@ def do_tier(jobs, budget, dry_run, views=_FETCH, pins=None, items=None, hist_ok=
         for pr in c["pinned_rels"]:
             cmd.append(f"--exclude=/{base}/{pr}")
         cmd += [c["path"], c["dst"] + "/"]
+        t0 = time.time()
         rc, out, err = run_rsync(cmd, dry_run)
+        if rc == 0 and not dry_run:
+            pamts_events.record_transfer(
+                "evict", c["rel"], c["evictable"], time.time() - t0,
+                pool=pool or "__shared__", job=c.get("job"), label=c["rel"],
+                reason=(f"last played {(now - c['last_view']) / 86400:.0f}d ago"
+                        if c["last_view"] else
+                        f"never played, added {(now - c['mtime']) / 86400:.0f}d ago"))
         if rc != 0:
             logging.error(f"[tier] rsync failed for {c['path']} rc={rc}\n"
                           f"{out.strip()}\n{err.strip()}")
@@ -558,6 +573,9 @@ def main():
         return 2
 
     pamts.setup_logging(pamts.PATHS["tier_log"], args.dry_run)
+    # Telemetry only, and fail-safe: if the store cannot be opened, recording becomes a
+    # no-op rather than taking the run down with it.
+    pamts_events.configure(None if args.dry_run else pamts.PATHS.get("events_db"))
     budget_gb = args.budget_gb if args.budget_gb is not None else pamts.TIER["budget_gb"]
 
     # Scheduled work waits rather than abandoning its run: losing a race with the
@@ -599,8 +617,10 @@ def main():
                 names = ", ".join(j["name"] for j in grp)
                 logging.info(f"[tier] ----- group [{names}]: budget {gb:g} GB "
                              f"({'own' if is_own else 'shared'})")
+                pool_name = grp[0]["name"] if is_own else "__shared__"
                 if not do_tier(grp, int(gb * pamts.GB), args.dry_run,
-                               views=views, pins=None, items=items, hist_ok=hist_ok):
+                               views=views, pins=None, items=items, hist_ok=hist_ok,
+                               pool=pool_name):
                     failures += 1
     for j in [j for j in jobs if j["mode"] == "backup"]:
         if not do_backup(j, args.dry_run):
