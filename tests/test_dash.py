@@ -210,13 +210,29 @@ od = o.collect()
 check("separates PLAY sessions from the rest", len(od["playing"]) == 1,
       str(od["playing"]))
 check("keeps all sessions too", len(od["sessions"]) == 2)
-check("reports keeping_up when emitted == records", od["keeping_up"] is True)
-check("lost_events is zero when nothing was lost", od["lost_events"] == 0)
-FakeObs.STATS = dict(FakeObs.STATS, records=90)     # userspace fell behind
-check("detects loss when emitted exceeds records",
+check("healthy when nothing was dropped", od["keeping_up"] is True)
+check("lag is reported", od["lag"] == 0)
+# The two counters are read non-atomically, so records can run one AHEAD. An
+# earlier version used strict equality and cried wolf on that.
+FakeObs.STATS = dict(FakeObs.STATS, records=101)
+check("records running one AHEAD is not a fault",
+      o.get(force=True)["keeping_up"] is True,
+      "non-atomic reads make a +1 race normal")
+FakeObs.STATS = dict(FakeObs.STATS, records=90)
+check("a small lag is in-flight buffering, not a fault",
+      o.get(force=True)["keeping_up"] is True)
+FakeObs.STATS = dict(FakeObs.STATS, kernel_dropped=1234, records=100)
+check("DROPPED events are the authoritative fault signal",
       o.get(force=True)["keeping_up"] is False)
-check("...and quantifies it", o.get(force=True)["lost_events"] == 10)
-FakeObs.STATS = dict(FakeObs.STATS, kernel_emitted=None, records=90)
+check("...and are reported", o.get(force=True)["dropped"] == 1234)
+# The bound is the ring buffer's capacity: a lag larger than it cannot be
+# in-flight data, so the consumer really is behind.
+FakeObs.STATS = dict(FakeObs.STATS, kernel_dropped=0,
+                     kernel_emitted=5_000_000, records=1)
+check("a lag beyond the ring buffer IS a fault",
+      o.get(force=True)["keeping_up"] is False,
+      f"lag {5_000_000 - 1} vs bound {o.max_lag}")
+FakeObs.STATS = dict(FakeObs.STATS, kernel_emitted=None, kernel_dropped=None, records=90)
 check("an observer without counters is not reported as unhealthy",
       o.get(force=True)["keeping_up"] is True)
 check("unavailable when nothing is listening",

@@ -136,15 +136,15 @@ function rows(pairs) {
 const RENDER = {
   observer(d) {
     const s = d.stats || {};
-    const lost = d.lost_events;
     const health = d.keeping_up
       ? `<span style="color:var(--ok)">keeping up</span>`
-      : `<span style="color:var(--bad)">LOSING EVENTS (${lost})</span>`;
+      : `<span style="color:var(--bad)">LOSING EVENTS${d.dropped ? " ("+d.dropped.toLocaleString()+" dropped)" : ""}</span>`;
     return card("Access observer",
       `<div class="big">${(d.playing||[]).length} <span class="sub">playing now</span></div>` +
       rows([
         ["events seen", (s.records||0).toLocaleString()],
         ["dropped by kernel", (s.kernel_dropped ?? "–")],
+        d.lag != null ? ["in-flight lag", d.lag.toLocaleString()] : null,
         ["health", health],
         ["sessions closed", (s.sessions_closed||0).toLocaleString()],
         ["indexed files", (s.index_files||0).toLocaleString()],

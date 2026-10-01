@@ -71,6 +71,9 @@ class ObserverSource(Source):
     def __init__(self, cfg=None):
         super().__init__(cfg)
         self.url = str(self.cfg.get("url", "http://127.0.0.1:8621")).rstrip("/")
+        # A legitimate lag is bounded by the ring buffer (128 MB / 72 bytes is about
+        # 1.8M events). Anything beyond this is the consumer genuinely falling behind.
+        self.max_lag = int(self.cfg.get("max_lag", 2_000_000))
 
     def available(self):
         try:
@@ -85,15 +88,24 @@ class ObserverSource(Source):
         # A tap that has stopped looks exactly like an idle estate from outside, so
         # surface the one number that distinguishes them rather than making whoever
         # is reading the page work it out.
+        #
+        # kernel_dropped is the AUTHORITATIVE loss signal: it counts ring-buffer
+        # reserve failures, which are unrecoverable. The emitted-vs-records gap is
+        # not loss -- it is in-flight buffering, bounded by the ring buffer, and the
+        # two counters are read non-atomically so records can even run one AHEAD.
+        # Treating that as unhealthy made the indicator cry wolf on a +1 race, which
+        # is worse than having no indicator at all.
         emitted, records = stats.get("kernel_emitted"), stats.get("records")
-        healthy = emitted is None or records is None or emitted == records
+        dropped = stats.get("kernel_dropped")
+        lag = None if emitted is None or records is None else emitted - records
+        healthy = (dropped in (None, 0)) and (lag is None or lag <= self.max_lag)
         return {
             "stats": stats,
             "sessions": sessions,
             "playing": [s for s in sessions if s.get("label") == "PLAY"],
             "keeping_up": healthy,
-            "lost_events": (None if emitted is None or records is None
-                            else emitted - records),
+            "dropped": dropped,
+            "lag": lag,
         }
 
 
