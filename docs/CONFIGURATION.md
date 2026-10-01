@@ -209,6 +209,34 @@ Patterns are passed to rsync. Excluded paths are **never deleted** on the destin
 behind an exclude is protected. A configured `exclude_from` file that has gone missing
 aborts the job, because running without it would delete what the excludes protect.
 
+### `budget_gb` (tier jobs only)
+
+A tier job may carve out its own allowance instead of sharing `[tier] budget_gb`:
+
+```toml
+[[jobs]]
+name = "music"
+mode = "tier"
+source = "/media/media-cache/music/Organised"
+dest   = "/media/media-slow/Music/Organised"
+depth  = 2                  # Artist/Album -- an album is the unit
+budget_gb = 800
+```
+
+Jobs that **omit** it share the global number, and that sharing is deliberate: a quiet
+month of films lends its space to a heavy month of television, because both are watched
+from the same sofa in the same evenings.
+
+Media of very different sizes must **not** share. Four terabytes of albums in the same
+pool as a 400 GB video allowance means one combined footprint measured against one
+ceiling — so whichever medium happens to be larger evicts the other's entire working
+set, every night. Give any such medium its own `budget_gb`.
+
+Each pool is evicted independently, but play history is gathered **once** per run and
+shared, so adding a pool does not multiply the cost of sweeping your players.
+
+Setting it on a `backup` job is refused: a backup has no budget, it mirrors.
+
 ## `[tier]`
 
 | key | default | notes |
@@ -309,6 +337,68 @@ The starting guess, used only until real transfers have been measured. PAMTS the
 measurements into a running estimate. Leave `rate_alpha` alone unless your throughput is
 unusually variable.
 
+## `[[promote.rules]]` — what to promote, per medium
+
+Without any rules, promotion fetches only the items that **follow** what is playing,
+bounded by the adapter's own ceilings. That suits an episode and does nothing at all for
+a film, which has nothing after it — the log says `no locality group for this item`.
+
+A rule is matched on the kind of thing playing: `movie`, `episode`, `track`, or `*` for
+anything. An exact match always wins over `*`, whatever order they appear in. A kind with
+no matching rule keeps the old lookahead-only behaviour exactly.
+
+```toml
+# A film: nothing follows it, so the only thing worth promoting is the film itself.
+[[promote.rules]]
+match = "movie"
+current  = { after_seconds = 120 }
+lookahead = { items = 0 }
+max_bytes_gb = 40
+
+# An episode: pull the run behind it, and the episode itself once it is clearly being
+# watched rather than sampled.
+[[promote.rules]]
+match = "episode"
+current  = { after_seconds = 300 }
+lookahead = { items = 3 }
+max_bytes_gb = 24
+
+# A track: the rest of the album. Many small files rather than a few large ones.
+[[promote.rules]]
+match = "track"
+current  = { after_seconds = 30 }
+lookahead = { items = 20 }
+max_bytes_gb = 2
+```
+
+| key | meaning |
+|---|---|
+| `match` | the kind playing: `movie`, `episode`, `track`, or `*` |
+| `current.after_seconds` | promote the item **being played** once it has been playing this long. Omit `current` entirely to leave it alone. |
+| `lookahead.items` | how many **following** items to fetch. `0` disables lookahead. |
+| `max_bytes_gb` | byte ceiling for the whole event, current item included. Omit to keep the adapter's. |
+
+`lookahead.items` counts followers only; the current item is allowed on top, so
+`items = 0` still promotes the film itself rather than nothing.
+
+### What promoting the current item does and does not buy you
+
+It does **not** speed up the stream in flight. This was tested rather than assumed: the
+NFSv4 client holds the file open for the whole duration, so nfsd never ages out its
+handle and mergerfs never re-resolves which branch to read from. The playback already
+running finishes from slow storage whichever copy appears underneath it. Bursty readers
+with long idle gaps behave no differently — the open state, not the read pattern, is what
+pins the branch.
+
+What it buys is every **fresh open** of that file: a seek, a resume the next evening, a
+re-watch, a second viewer. Those are common enough for a film to make it worth the space.
+
+`current.after_seconds` is what stops a browse from being expensive. The clock starts
+when PAMTS first *sees* the item playing — no adapter reports a reliable elapsed time —
+so with a 60-second poll a 120-second gate is satisfied on the third pass. If playback
+stops, the clock is forgotten, so resuming the same file a week later starts it again
+rather than promoting instantly.
+
 ---
 
 ## Command-line reference
@@ -326,7 +416,7 @@ pamts-promote.py [--config F] [--dry-run] [--next-up]
 | `--job` | run only named jobs; repeatable |
 | `--next-up` | fetch pinned items that are not on fast storage (nightly) |
 | `--simulate-recent` | replay recently *played* items as if playing; requires `--dry-run` |
-| `--budget-gb` | override `[tier] budget_gb` for one run |
+| `--budget-gb` | override the **shared** `[tier] budget_gb` for one run; jobs with their own `budget_gb` keep it |
 
 `--simulate-recent` is the most useful validation tool here: it exercises the real
 selection logic against your real library without waiting for someone to press play, and

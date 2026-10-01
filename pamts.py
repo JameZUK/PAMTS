@@ -99,6 +99,7 @@ DEFAULTS = {
 PATHS = dict(DEFAULTS["paths"])
 TIER = dict(DEFAULTS["tier"])
 PROMOTE = dict(DEFAULTS["promote"])
+PROMOTE_RULES = []        # see load_and_configure / promote_rule
 HISTORY = dict(DEFAULTS["history"])
 PLAYERS = []        # one config dict per configured player
 ROOTS = {}          # player path -> (fast tier path, slow tier path)
@@ -140,7 +141,7 @@ def configure(raw):
     configuration will move data to the wrong place, so it is far better to refuse to
     start than to guess.
     """
-    global PATHS, TIER, PROMOTE, HISTORY, PLAYERS, ROOTS, JOBS
+    global PATHS, TIER, PROMOTE, PROMOTE_RULES, HISTORY, PLAYERS, ROOTS, JOBS
     PATHS = _merge(DEFAULTS["paths"], raw.get("paths"))
     TIER = _merge(DEFAULTS["tier"], raw.get("tier"))
     PROMOTE = _merge(DEFAULTS["promote"], raw.get("promote"))
@@ -216,18 +217,93 @@ def configure(raw):
                     f"backup job {name!r} has no 'max_delete'. Backup jobs propagate "
                     "deletions, so a circuit breaker is mandatory -- set it to a little "
                     "above the largest number of deletions you would consider normal.")
-            if j.get("depth") or j.get("grace") is not None:
-                raise ConfigError(f"backup job {name!r} must not set 'depth'/'grace' "
-                                  "(those are tier-only settings)")
+            if (j.get("depth") or j.get("grace") is not None
+                    or j.get("budget_gb") is not None):
+                raise ConfigError(
+                    f"backup job {name!r} must not set 'depth'/'grace'/'budget_gb' "
+                    "(those are tier-only settings)")
         else:
             if j.get("max_delete"):
                 raise ConfigError(
                     f"tier job {name!r} sets 'max_delete'. Tier jobs must NEVER use "
                     "--delete: the fast tier emptying is normal and expected, and "
                     "--delete would erase the permanent copy. Remove it.")
+            # A tier job may carve out its own allowance. Omitting it shares the global
+            # [tier] budget_gb -- which is what movies and TV do, deliberately, so a
+            # quiet month of films lends its space to a heavy month of television.
+            # Music does NOT want that: 4 TB of albums would swamp a 400 GB video pool.
+            if j.get("budget_gb") is not None:
+                try:
+                    bg = float(j["budget_gb"])
+                except (TypeError, ValueError):
+                    raise ConfigError(f"tier job {name!r}: budget_gb must be a number")
+                if bg <= 0:
+                    raise ConfigError(
+                        f"tier job {name!r}: budget_gb must be greater than 0. Omit it "
+                        "to share the global [tier] budget_gb instead.")
+                j = dict(j, budget_gb=bg)
         JOBS.append(dict(j))
     if not JOBS:
         raise ConfigError("no [[jobs]] configured; there is nothing for PAMTS to do")
+
+    # ------------------------------------------------------------ promotion rules
+    # What to promote differs by medium, and the differences are not small. A film has
+    # nothing after it, so the only useful promotion is the film itself. An episode has
+    # a run behind it worth pulling. A track has an album, which is many small files
+    # rather than a few large ones. One global cap cannot serve all three.
+    #
+    # A kind with no rule keeps the previous behaviour exactly: lookahead only, bounded
+    # by the adapter's own Caps.
+    PROMOTE_RULES = []
+    seen_match = set()
+    for i, r in enumerate(PROMOTE.get("rules") or []):
+        where = f"[[promote.rules]] #{i + 1}"
+        if not isinstance(r, dict):
+            raise ConfigError(f"{where} must be a table")
+        m = str(r.get("match") or "").strip()
+        if not m:
+            raise ConfigError(f"{where} is missing 'match' -- the kind of thing being "
+                              "played: 'movie', 'episode', 'track', or '*' for any")
+        if m in seen_match:
+            raise ConfigError(f"duplicate {where} match {m!r}")
+        seen_match.add(m)
+        unknown = set(r) - {"match", "current", "lookahead", "max_bytes_gb"}
+        if unknown:
+            raise ConfigError(f"{where} has unknown key(s): {', '.join(sorted(unknown))}")
+
+        cur = r.get("current") or {}
+        if not isinstance(cur, dict):
+            raise ConfigError(f"{where} 'current' must be a table, e.g. "
+                              "current = {{ after_seconds = 120 }}")
+        after = cur.get("after_seconds")
+        # Absent means "do not promote what is already playing" -- the old behaviour.
+        after = -1.0 if after is None else float(after)
+        if after < 0 and cur.get("after_seconds") is not None:
+            raise ConfigError(f"{where} current.after_seconds must be >= 0; omit "
+                              "'current' entirely to leave the playing item alone")
+
+        look = r.get("lookahead") or {}
+        if not isinstance(look, dict):
+            raise ConfigError(f"{where} 'lookahead' must be a table, e.g. "
+                              "lookahead = {{ items = 3 }}")
+        items = look.get("items")
+        if items is not None:
+            items = int(items)
+            if items < 0:
+                raise ConfigError(f"{where} lookahead.items must be >= 0 "
+                                  "(0 disables lookahead for this kind)")
+        gb = r.get("max_bytes_gb")
+        if gb is not None:
+            gb = float(gb)
+            if gb <= 0:
+                raise ConfigError(f"{where} max_bytes_gb must be greater than 0")
+
+        PROMOTE_RULES.append({
+            "match": m,
+            "current_after": after,
+            "look_items": items,
+            "max_bytes": None if gb is None else int(gb * GB),
+        })
 
     if not 0 < float(PROMOTE["headroom_fraction"]) <= 1:
         raise ConfigError("[promote] headroom_fraction must be between 0 and 1")
@@ -328,6 +404,40 @@ def is_protected(candidate, records):
 
 
 # ------------------------------------------------------- next-to-watch pinning
+def promote_rule(kind):
+    """The [[promote.rules]] entry governing `kind`, or None if none applies.
+
+    An exact match on the kind wins over a '*' catch-all, whatever order they appear
+    in, so a general rule can sit alongside specific ones without shadowing them.
+    """
+    star = None
+    for r in PROMOTE_RULES:
+        if r["match"] == kind:
+            return r
+        if r["match"] == "*" and star is None:
+            star = r
+    return star
+
+
+def track_playing(state, paths, now):
+    """Remember when each currently-playing path was FIRST seen.
+
+    Players report what is playing, not for how long, and no adapter exposes an
+    elapsed time PAMTS can rely on. So it measures from the first poll that saw the
+    item. Anything that has stopped is forgotten, so resuming it later starts the
+    clock again instead of inheriting a stale "playing for days".
+    """
+    prev = state.get("playing") or {}
+    state["playing"] = {p: prev.get(p, now) for p in paths}
+    return state["playing"]
+
+
+def playing_for(state, path, now):
+    """Seconds `path` has been playing, per track_playing. 0 if this is the first poll."""
+    first = (state.get("playing") or {}).get(path)
+    return 0.0 if first is None else max(0.0, now - float(first))
+
+
 def pin_depth(footprint_bytes, budget_bytes):
     """How many items ahead to pin, scaled by how full the fast tier is.
 

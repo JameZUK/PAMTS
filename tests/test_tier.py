@@ -869,4 +869,110 @@ check("half-full is in between",
 check("over budget still pins one", pamts.pin_depth(B * 2, B) == 1,
       str(pamts.pin_depth(B * 2, B)))
 
+# ------------------------------------------------------------- per-job tier budget
+print("=== BUDGET GROUPS: a job with its own budget_gb does not share a pool")
+
+g = tier.budget_groups([job("tier", "/a", "/A", name="movies"),
+                        job("tier", "/b", "/B", name="tv"),
+                        job("tier", "/c", "/C", name="music", budget_gb=800.0)], 400)
+check("three jobs collapse to two pools", len(g) == 2, f"got {len(g)}")
+check("movies and tv share the global pool",
+      g[0][0] == 400.0 and [j["name"] for j in g[0][1]] == ["movies", "tv"], repr(g[0]))
+check("the shared pool is flagged as not-own", g[0][2] is False)
+check("music gets its own 800 GB pool",
+      g[1][0] == 800.0 and [j["name"] for j in g[1][1]] == ["music"], repr(g[1]))
+check("the own pool is flagged as own", g[1][2] is True)
+
+g2 = tier.budget_groups([job("tier", "/c", "/C", name="music", budget_gb=800.0)], 400)
+check("a lone job with its own budget ignores the shared number",
+      len(g2) == 1 and g2[0][0] == 800.0, repr(g2))
+g3 = tier.budget_groups([job("tier", "/a", "/A", name="movies")], 123)
+check("a job with no budget_gb takes the shared number",
+      g3[0][0] == 123.0 and g3[0][2] is False, repr(g3))
+g4 = tier.budget_groups([job("tier", "/a", "/A", name="x", budget_gb=50.0),
+                         job("tier", "/b", "/B", name="y", budget_gb=50.0)], 400)
+check("two jobs naming the same budget share one pool",
+      len(g4) == 1 and len(g4[0][1]) == 2, repr(g4))
+
+print("=== BUDGET ISOLATION: a bloated medium cannot evict a frugal one")
+_broot = pathlib.Path(tempfile.mkdtemp(prefix="pamts-budget-"))
+_bfast, _bslow = _broot / "fast", _broot / "slow"
+# 8 MB of film, 8 MB of music, both last played long ago so both are evictable.
+for i in range(8):
+    mkfile(_bfast / "movies" / f"Film {i}" / "f.mkv", size=1024 * 1024, mtime_days=400)
+for i in range(8):
+    mkfile(_bfast / "music" / "Artist" / f"Album {i}" / "t.flac",
+           size=1024 * 1024, mtime_days=400)
+# views maps a fast-tier FILE path -- not a directory -- to its last-played epoch.
+# Keying directories here would match nothing and quietly rank on mtime instead,
+# which would still evict but would not be the test this claims to be.
+_bviews = {}
+for i in range(8):
+    _bviews[str(_bfast / "movies" / f"Film {i}" / "f.mkv")] = time.time() - 86400 * 400
+    _bviews[str(_bfast / "music" / "Artist" / f"Album {i}" / "t.flac")] = (
+        time.time() - 86400 * 400)
+
+_probe = tier.tier_candidates([_jmov_probe := job("tier", _bfast / "movies",
+                                                  _bslow / "movies", name="probe",
+                                                  depth=1)], _bviews)
+check("the fixture's views actually register as plays, not as mtime fallback",
+      _probe and all(c["last_view"] > 0 for c in _probe),
+      f"last_view values: {[c['last_view'] for c in _probe]}")
+
+_jmov = job("tier", _bfast / "movies", _bslow / "movies", name="movies", depth=1)
+_jmus = job("tier", _bfast / "music", _bslow / "music", name="music", depth=2,
+            budget_gb=9999.0)       # effectively unlimited: must not be touched at all
+captured.clear()
+for gb, grp, _own in tier.budget_groups([_jmov, _jmus], 0.004):   # ~4 MB shared pool
+    tier.do_tier(grp, int(gb * GB), dry_run=False, views=_bviews)
+
+_moved = [c for c in captured if "--remove-source-files" in c]
+_moved_music = [c for c in _moved if "/music/" in " ".join(c)]
+_moved_movies = [c for c in _moved if "/movies/" in " ".join(c)]
+check("the over-budget movie pool evicted something", len(_moved_movies) > 0,
+      f"{len(_moved_movies)} rsync(s)")
+check("the under-budget music pool evicted NOTHING", len(_moved_music) == 0,
+      f"music was evicted by {len(_moved_music)} rsync(s) - the pools are shared")
+_music_left = sum(1 for _ in (_bfast / "music" / "Artist").iterdir())
+check("all 8 albums are still on the fast tier", _music_left == 8,
+      f"{_music_left} of 8 remain")
+shutil.rmtree(_broot, ignore_errors=True)
+
+print("=== CONFIG: budget_gb is tier-only and must be positive")
+
+
+def _cfg_err(toml_text):
+    d = pathlib.Path(tempfile.mkdtemp(prefix="pamts-cfg-"))
+    f = d / "pamts.toml"
+    f.write_text(toml_text)
+    try:
+        pamts.load_and_configure(str(f))
+        return None
+    except pamts.ConfigError as e:
+        return str(e)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+_base = ('[[players]]\nname = "plex"\nurl = "http://x"\ntoken_file = "/dev/null"\n'
+         '[[roots]]\nplayer_path = "/p"\nfast = "/f"\nslow = "/s"\n')
+e = _cfg_err(_base + '[[jobs]]\nname = "m"\nmode = "backup"\nsource = "/a"\n'
+                     'dest = "/b"\nmax_delete = 10\nbudget_gb = 10\n')
+check("a backup job that sets budget_gb is refused", e is not None and "budget_gb" in e,
+      repr(e))
+e = _cfg_err(_base + '[[jobs]]\nname = "m"\nmode = "tier"\nsource = "/a"\n'
+                     'dest = "/b"\nbudget_gb = 0\n')
+check("budget_gb = 0 is refused", e is not None and "greater than 0" in e, repr(e))
+e = _cfg_err(_base + '[[jobs]]\nname = "m"\nmode = "tier"\nsource = "/a"\n'
+                     'dest = "/b"\nbudget_gb = -5\n')
+check("a negative budget_gb is refused", e is not None and "greater than 0" in e,
+      repr(e))
+e = _cfg_err(_base + '[[jobs]]\nname = "m"\nmode = "tier"\nsource = "/a"\n'
+                     'dest = "/b"\nbudget_gb = 800\n')
+check("a positive budget_gb on a tier job is accepted", e is None, repr(e))
+check("and it is stored as a float on the job",
+      pamts.JOBS and pamts.JOBS[0].get("budget_gb") == 800.0,
+      repr(pamts.JOBS[0] if pamts.JOBS else None))
+
+
 summary()

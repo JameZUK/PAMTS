@@ -136,8 +136,25 @@ check("counts labels over 24h", out["labels_24h"].get("PROBE") == 1,
       str(out["labels_24h"]))
 check("since= filters", len(h.collect(since=now + 100)["sessions"]) == 0)
 check("limit caps the result", len(h.collect(limit=2)["sessions"]) == 2)
-check("it opens the db READ-ONLY, so a running daemon is undisturbed",
-      "mode=ro" in dash.HistorySource.__dict__["_conn"].__code__.co_consts[1])
+# Assert the BEHAVIOUR, not the bytecode. An earlier version of this check read a
+# constant out of _conn.__code__.co_consts at a fixed index, which depends on the
+# CPython version: it passed on 3.13 and failed on the Debian 12 (3.11) host PAMTS
+# actually runs on, while never once proving a write was refused.
+_ro = h._conn()
+try:
+    _ro.execute("INSERT INTO plays VALUES('/m/ro.mkv',0,1,'PLAY',1,0)")
+    _ro.commit()
+    _ro_refused = False
+except sqlite3.OperationalError:
+    _ro_refused = True
+finally:
+    _ro.close()
+check("it opens the db READ-ONLY, so a running daemon is undisturbed", _ro_refused,
+      "a write through HistorySource._conn() succeeded")
+_vfy = sqlite3.connect(dbp)
+check("and nothing was actually written",
+      _vfy.execute("SELECT count(*) FROM plays WHERE path='/m/ro.mkv'").fetchone()[0] == 0)
+_vfy.close()
 # Copies and scans outnumber plays by hundreds to one, so filtering has to happen in
 # SQL. A client-side filter on the most recent N rows would discard nearly all of them.
 print("\nhistory: label filtering")

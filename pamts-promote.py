@@ -103,6 +103,22 @@ def effective_caps(caps, headroom, remaining_s, rate_bps):
     return Caps(max_items=min(items, caps.max_items), max_bytes=allowance)
 
 
+def rule_caps(base, rule, want_current):
+    """Apply a [[promote.rules]] override to an adapter's ceilings.
+
+    `lookahead.items` counts the items that FOLLOW. The currently-playing item, when
+    the rule lets it through, is allowed on top of that, so `items = 0` still promotes
+    the film itself rather than nothing at all.
+    """
+    if not rule:
+        return base
+    items = base.max_items if rule["look_items"] is None else rule["look_items"]
+    if want_current:
+        items += 1
+    nbytes = base.max_bytes if rule["max_bytes"] is None else rule["max_bytes"]
+    return pamts_players.Caps(max_items=max(1, items), max_bytes=nbytes)
+
+
 def filter_candidates(cands, caps, budget_left):
     """Drop what is already local or unavailable, then apply the caps."""
     suffixes = tuple(pamts.TIER["inprogress_suffixes"])
@@ -416,20 +432,53 @@ def main():
         added = pamts.observe_plays(state, seen, now)
         if added:
             logging.info(f"recorded {added} observed play(s)")
+    # The clock the `current.after_seconds` gate reads. Kept for everything playing,
+    # including under --simulate-recent, so a dry run reports the same decision a real
+    # one would.
+    pamts.track_playing(state, [ev.path for _pl, ev in pairs], now)
 
     promoted = 0
     for pl, ev in pairs:
         logging.info(f"[{pl.name}] playing {ev.kind}: {ev.label}")
+        rule = pamts.promote_rule(ev.kind)
+        cands = []
+
+        # The item playing RIGHT NOW. An experiment settled that this cannot help the
+        # stream in flight: the NFSv4 client holds the file open for its whole
+        # duration, so nfsd never ages out its handle and mergerfs never re-resolves
+        # which branch to read from -- the copy already running finishes from slow
+        # storage whatever we do. It is still worth promoting, because a seek, a
+        # resume, or a re-watch all open the file afresh and get the fast copy. The
+        # delay is what stops a ten-second skim through a library dragging whole films
+        # across.
+        want_current = False
+        if rule and rule["current_after"] >= 0:
+            waited = pamts.playing_for(state, ev.path, now)
+            if waited >= rule["current_after"]:
+                want_current = True
+                cands.append(pamts_players.Candidate(
+                    path=ev.path, label=f"{ev.label} (playing now)", order=-1))
+            else:
+                logging.info(f"  not promoting the playing item yet: {waited:.0f}s of "
+                             f"{rule['current_after']:.0f}s watched")
+
         try:
-            cands = pl.locality_group(ev)
+            group = pl.locality_group(ev)
         except Exception as e:
             logging.error(f"  cannot resolve locality group: {e}")
             rc = 1
-            continue
+            group = []
+        if rule and rule["look_items"] == 0 and group:
+            logging.info(f"  lookahead is off for {ev.kind}: ignoring "
+                         f"{len(group)} following item(s)")
+            group = []
+        cands.extend(group)
+
         if not cands:
-            logging.info("  no locality group for this item - nothing to promote")
+            logging.info("  nothing to promote for this item")
             continue
-        caps = effective_caps(pl.caps, budget_left - promoted, ev.remaining_s, rate)
+        caps = effective_caps(rule_caps(pl.caps, rule, want_current),
+                              budget_left - promoted, ev.remaining_s, rate)
         items = filter_candidates(cands, caps, budget_left - promoted)
         if not items:
             logging.info("  nothing to promote (already local, or capped)")

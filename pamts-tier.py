@@ -39,6 +39,7 @@ Usage:
 """
 
 import argparse
+import collections
 import errno
 import fcntl
 import logging
@@ -259,51 +260,87 @@ def tier_candidates(jobs, views=None, pins=None):
     return out
 
 
-def do_tier(jobs, budget, dry_run, views=_FETCH, pins=None):
+def budget_groups(tier_jobs, shared_gb):
+    """Split tier jobs into (budget_gb, [jobs]) pools, in configuration order.
+
+    A job that declares its own budget_gb gets a pool to itself; everything else
+    shares `shared_gb`. Without this, adding music -- terabytes of albums -- to the
+    same pool as movies and TV would let one medium evict the other's whole working
+    set, because eviction only ever sees one combined footprint and one ceiling.
+    """
+    groups = collections.OrderedDict()
+    for j in tier_jobs:
+        groups.setdefault(j.get("budget_gb"), []).append(j)
+    out = []
+    for own_gb, grp in groups.items():
+        out.append((float(shared_gb) if own_gb is None else float(own_gb), grp,
+                    own_gb is not None))
+    return out
+
+
+def gather_views(jobs):
+    """Collect play history once, for every budget group to share.
+
+    This sweeps every configured player, which is the expensive part of a tiering run
+    and produces a result that does not depend on which group is being evicted. It
+    therefore must not be repeated per group. Returns (views, items, hist_ok), or None
+    if there is no usable signal at all, in which case the caller must not evict.
+    """
+    players = pamts_players.build_all(pamts.PLAYERS)
+    items, hist_ok = pamts_players.sweep(players)
+    views = {it["fast"]: it["last_viewed"] for it in items if it.get("last_viewed")}
+
+    # PAMTS's own record of what it has seen playing. This is what lets a player
+    # with no history API (e.g. LMS) still drive ranking, and it is scan-immune by
+    # construction: a scan never appears as a playing session.
+    observed = pamts.observed_history()
+    newer = 0
+    for k, v in observed.items():
+        if v > views.get(k, 0):
+            views[k] = v
+            newer += 1
+    if observed:
+        logging.info(f"[tier] observed plays: {len(observed)} record(s), "
+                     f"{newer} newer than any player reported")
+
+    if not views and not hist_ok:
+        # Refuse rather than fall back to atime. Being over budget is not an
+        # emergency -- nothing is lost by leaving content on fast storage for
+        # another cycle -- whereas evicting on a signal that library scans corrupt
+        # causes needless spin-ups later.
+        logging.error("[tier] no play data from any player, and no observed plays "
+                      "yet - REFUSING to evict. Ranking by atime is not an "
+                      "acceptable fallback: a library scan resets it on every file "
+                      "it reads.")
+        return None
+    if not hist_ok:
+        logging.warning("[tier] no player supplied play history; ranking on "
+                        "PAMTS's observed plays alone. This is expected for "
+                        "session-only players, and improves as history accumulates.")
+    logging.info(f"[tier] view data: {len(views)} played item(s)")
+    return views, items, hist_ok
+
+
+def do_tier(jobs, budget, dry_run, views=_FETCH, pins=None, items=None, hist_ok=True):
     now = time.time()
     protected = pamts.protected_now(now)
     if protected:
         logging.info(f"[tier] {len(protected)} item(s) protected by a recent promotion")
 
     if views is _FETCH:
-        players = pamts_players.build_all(pamts.PLAYERS)
-        items, hist_ok = pamts_players.sweep(players)
-        views = {it["fast"]: it["last_viewed"] for it in items if it.get("last_viewed")}
-
-        # PAMTS's own record of what it has seen playing. This is what lets a player
-        # with no history API (e.g. LMS) still drive ranking, and it is scan-immune by
-        # construction: a scan never appears as a playing session.
-        observed = pamts.observed_history()
-        newer = 0
-        for k, v in observed.items():
-            if v > views.get(k, 0):
-                views[k] = v
-                newer += 1
-        if observed:
-            logging.info(f"[tier] observed plays: {len(observed)} record(s), "
-                         f"{newer} newer than any player reported")
-
-        if not views and not hist_ok:
-            # Refuse rather than fall back to atime. Being over budget is not an
-            # emergency -- nothing is lost by leaving content on fast storage for
-            # another cycle -- whereas evicting on a signal that library scans corrupt
-            # causes needless spin-ups later.
-            logging.error("[tier] no play data from any player, and no observed plays "
-                          "yet - REFUSING to evict. Ranking by atime is not an "
-                          "acceptable fallback: a library scan resets it on every file "
-                          "it reads.")
+        got = gather_views(jobs)
+        if got is None:
             return False
-        if not hist_ok:
-            logging.warning("[tier] no player supplied play history; ranking on "
-                            "PAMTS's observed plays alone. This is expected for "
-                            "session-only players, and improves as history accumulates.")
-        # Pin depth scales with how full the tier is, so measure the footprint first.
+        views, items, hist_ok = got
+
+    # Pins are per group: both the depth and the headroom it is derived from are
+    # relative to THIS group's budget and footprint, not the estate's.
+    if pins is None and items is not None:
         pre = sum(scan_dir(j["source"], views)["size"]
                   for j in jobs if os.path.isdir(j["source"]))
         depth = pamts.pin_depth(pre, budget)
         pins = pamts.next_up(items, int(pamts.TIER["next_up_max_items"]),
                              int(pamts.TIER["next_up_max_gb"]) * pamts.GB, depth)
-        logging.info(f"[tier] view data: {len(views)} played item(s)")
         logging.info(f"[tier] pinning {depth} item(s) ahead per series "
                      f"({human(max(0, budget - pre))} headroom): {len(pins)} pin(s), "
                      f"{human(sum(p['size'] or 0 for p in pins.values()))}")
@@ -466,7 +503,9 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--only", choices=("tier", "backup"))
     ap.add_argument("--job", action="append", help="run only these named jobs")
-    ap.add_argument("--budget-gb", type=float)
+    ap.add_argument("--budget-gb", type=float,
+                    help="override the SHARED [tier] budget. Jobs that declare their "
+                         "own budget_gb keep it.")
     args = ap.parse_args()
 
     try:
@@ -508,8 +547,18 @@ def main():
     failures = 0
     tier_jobs = [j for j in jobs if j["mode"] == "tier"]
     if tier_jobs:
-        if not do_tier(tier_jobs, int(budget_gb * pamts.GB), args.dry_run):
+        gathered = gather_views(tier_jobs)
+        if gathered is None:
             failures += 1
+        else:
+            views, items, hist_ok = gathered
+            for gb, grp, is_own in budget_groups(tier_jobs, budget_gb):
+                names = ", ".join(j["name"] for j in grp)
+                logging.info(f"[tier] ----- group [{names}]: budget {gb:g} GB "
+                             f"({'own' if is_own else 'shared'})")
+                if not do_tier(grp, int(gb * pamts.GB), args.dry_run,
+                               views=views, pins=None, items=items, hist_ok=hist_ok):
+                    failures += 1
     for j in [j for j in jobs if j["mode"] == "backup"]:
         if not do_backup(j, args.dry_run):
             failures += 1

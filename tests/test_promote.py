@@ -506,6 +506,136 @@ def main():
     check(all(os.path.exists(os.path.join(fast, "Show", "Season 1", f"e{i:02d}.mkv"))
               for i in (5, 6)), "both files landed on fast storage")
 
+    # ------------------------------------------------- promote rules: rule lookup
+    print("=== PROMOTE RULES: lookup, and an exact match beats the catch-all")
+    pamts.PROMOTE_RULES = [
+        {"match": "*", "current_after": 10.0, "look_items": 5, "max_bytes": 5 * GB},
+        {"match": "movie", "current_after": 120.0, "look_items": 0,
+         "max_bytes": 40 * GB},
+    ]
+    check(pamts.promote_rule("movie")["current_after"] == 120.0,
+          "an exact kind match wins even though '*' is listed first")
+    check(pamts.promote_rule("episode")["look_items"] == 5,
+          "an unmatched kind falls through to the '*' rule")
+    pamts.PROMOTE_RULES = [{"match": "track", "current_after": 30.0,
+                            "look_items": 20, "max_bytes": 2 * GB}]
+    check(pamts.promote_rule("movie") is None,
+          "with no '*' rule, an unmatched kind gets no rule at all")
+    check(pamts.promote_rule("track")["look_items"] == 20, "the matching rule is found")
+
+    # --------------------------------------------- the clock the current gate reads
+    print("=== PLAYING CLOCK: measured from first sighting, reset when playback stops")
+    st = {}
+    t0 = time.time()
+    pamts.track_playing(st, ["/player/tv/a.mkv"], t0)
+    check(pamts.playing_for(st, "/player/tv/a.mkv", t0) == 0.0,
+          "the first poll reports zero seconds watched")
+    check(pamts.playing_for(st, "/player/tv/never.mkv", t0) == 0.0,
+          "something never seen reports zero rather than raising")
+    pamts.track_playing(st, ["/player/tv/a.mkv"], t0 + 130)
+    check(abs(pamts.playing_for(st, "/player/tv/a.mkv", t0 + 130) - 130) < 1,
+          "a later poll reports the elapsed time since first sighting")
+    # Stop playing it, then start it again: the clock must restart, or a quick skim
+    # through something watched last week would promote instantly.
+    pamts.track_playing(st, [], t0 + 200)
+    check(st["playing"] == {}, "an item that stopped is forgotten")
+    pamts.track_playing(st, ["/player/tv/a.mkv"], t0 + 300)
+    check(pamts.playing_for(st, "/player/tv/a.mkv", t0 + 300) == 0.0,
+          "resuming it later starts the clock again, not at 300s")
+
+    # ---------------------------------------------------------------- rule_caps
+    print("=== RULE CAPS: lookahead.items counts followers; the current item is extra")
+    base = Caps(max_items=24, max_bytes=60 * GB)
+    movie = {"match": "movie", "current_after": 120.0, "look_items": 0,
+             "max_bytes": 40 * GB}
+    c = promote.rule_caps(base, movie, want_current=True)
+    check(c.max_items == 1,
+          f"a film with no lookahead still has room for itself (got {c.max_items})")
+    check(c.max_bytes == 40 * GB, "max_bytes_gb overrides the adapter ceiling")
+    c = promote.rule_caps(base, movie, want_current=False)
+    check(c.max_items == 1,
+          f"items never drops below 1, so a rule cannot promote nothing (got {c.max_items})")
+    ep = {"match": "episode", "current_after": 300.0, "look_items": 3,
+          "max_bytes": None}
+    c = promote.rule_caps(base, ep, want_current=True)
+    check(c.max_items == 4, f"3 followers plus the current item is 4 (got {c.max_items})")
+    check(c.max_bytes == base.max_bytes,
+          "an omitted max_bytes_gb leaves the adapter ceiling alone")
+    c = promote.rule_caps(base, ep, want_current=False)
+    check(c.max_items == 3, f"without the current item it is just 3 (got {c.max_items})")
+    check(promote.rule_caps(base, None, True) is base,
+          "no rule means the adapter's own Caps, unchanged")
+
+    # ------------------------------------------- the current item sorts ahead of the run
+    print("=== CURRENT ITEM: order -1 puts the playing file first in the queue")
+    mkfile(os.path.join(slow, "Film", "film.mkv"), 400)
+    mkfile(os.path.join(slow, "Film", "extra.mkv"), 400)
+    cur = Candidate(path="/player/tv/Film/film.mkv", label="Film (playing now)",
+                    order=-1)
+    nxt = Candidate(path="/player/tv/Film/extra.mkv", label="Extra", order=0)
+    sel = promote.filter_candidates([nxt, cur], Caps(10, 10 ** 9), 10 ** 9)
+    check([x["label"] for x in sel] == ["Film (playing now)", "Extra"],
+          f"the playing item is promoted first (got {[x['label'] for x in sel]})")
+    sel1 = promote.filter_candidates([nxt, cur], Caps(1, 10 ** 9), 10 ** 9)
+    check([x["label"] for x in sel1] == ["Film (playing now)"],
+          "at a one-item cap it is the playing item that wins, not the follower")
+
+    # ------------------------------------------------------------ config validation
+    print("=== CONFIG: [[promote.rules]] is validated")
+    _saved_roots, _saved_rules = pamts.ROOTS, pamts.PROMOTE_RULES
+
+    def cfg_err(rules_toml):
+        d = pathlib.Path(tempfile.mkdtemp(prefix="pamts-prcfg-"))
+        f = d / "pamts.toml"
+        f.write_text(
+            '[[players]]\nname = "plex"\nurl = "http://x"\ntoken_file = "/dev/null"\n'
+            '[[roots]]\nplayer_path = "/p"\nfast = "/f"\nslow = "/s"\n'
+            '[[jobs]]\nname = "t"\nmode = "tier"\nsource = "/a"\ndest = "/b"\n'
+            + rules_toml)
+        try:
+            pamts.load_and_configure(str(f))
+            return None
+        except pamts.ConfigError as e:
+            return str(e)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    e = cfg_err('[[promote.rules]]\ncurrent = { after_seconds = 10 }\n')
+    check(e is not None and "match" in e, f"a rule with no 'match' is refused ({e!r})")
+    e = cfg_err('[[promote.rules]]\nmatch = "movie"\n'
+                '[[promote.rules]]\nmatch = "movie"\n')
+    check(e is not None and "duplicate" in e, f"two rules for one kind is refused ({e!r})")
+    e = cfg_err('[[promote.rules]]\nmatch = "movie"\nlookahaed = { items = 1 }\n')
+    check(e is not None and "unknown key" in e,
+          f"a misspelled key is refused rather than silently ignored ({e!r})")
+    e = cfg_err('[[promote.rules]]\nmatch = "movie"\nlookahead = { items = -1 }\n')
+    check(e is not None and "items must be >= 0" in e,
+          f"a negative lookahead is refused ({e!r})")
+    e = cfg_err('[[promote.rules]]\nmatch = "movie"\nmax_bytes_gb = 0\n')
+    check(e is not None and "max_bytes_gb" in e, f"a zero byte ceiling is refused ({e!r})")
+    e = cfg_err('[[promote.rules]]\nmatch = "movie"\n'
+                'current = { after_seconds = -5 }\n')
+    check(e is not None and "after_seconds" in e,
+          f"a negative after_seconds is refused ({e!r})")
+
+    e = cfg_err('[[promote.rules]]\nmatch = "movie"\n'
+                'current = { after_seconds = 120 }\nlookahead = { items = 0 }\n'
+                'max_bytes_gb = 40\n'
+                '[[promote.rules]]\nmatch = "track"\n'
+                'current = { after_seconds = 30 }\nlookahead = { items = 20 }\n')
+    check(e is None, f"a well-formed pair of rules loads ({e!r})")
+    check(len(pamts.PROMOTE_RULES) == 2, "both rules are kept")
+    r = pamts.promote_rule("movie")
+    check(r["current_after"] == 120.0 and r["look_items"] == 0
+          and r["max_bytes"] == 40 * GB, f"the movie rule parsed correctly ({r})")
+    r = pamts.promote_rule("track")
+    check(r["look_items"] == 20 and r["max_bytes"] is None,
+          f"an omitted max_bytes_gb stays None ({r})")
+    check(pamts.promote_rule("episode") is None,
+          "a kind with no rule and no '*' keeps the old lookahead-only behaviour")
+
+    pamts.ROOTS, pamts.PROMOTE_RULES = _saved_roots, _saved_rules
+
     shutil.rmtree(tmp, ignore_errors=True)
     summary()                      # exits; SystemExit propagates out of main()
 
