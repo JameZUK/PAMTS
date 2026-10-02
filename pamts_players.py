@@ -848,7 +848,8 @@ Verified against Navidrome 0.64.0.
         Same answer as _items_from_db, fetched over HTTP instead. The sidecar runs
         where navidrome.db actually is, which is the point: PAMTS need not reach across
         hosts, need not hold any listener's password, and need not know Navidrome's
-        schema. See scripts/mediastream/navidrome-history in the homelab repo.
+        schema. The sidecar ships as `navidrome-history`; run it on the host that
+        holds navidrome.db.
         """
         out, index, page = [], 0, 5000
         while True:

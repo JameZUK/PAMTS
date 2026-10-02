@@ -60,8 +60,8 @@ nothing at all however much the library has been played. Covering a household th
 the API therefore means holding every listener's password.
 
 `history_url` points at the read-only sidecar instead
-(`scripts/mediastream/navidrome-history` in the homelab repo), which runs where
-`navidrome.db` is and serves the aggregate over HTTP:
+(`navidrome-history`), which runs on the host that holds `navidrome.db` and serves
+the aggregate over HTTP:
 
 ```toml
 [[players]]
