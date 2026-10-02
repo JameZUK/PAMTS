@@ -18,6 +18,7 @@ traffic. That is deliberate: it means the thing you calibrate is the thing that
 runs.
 """
 import argparse
+import collections
 import json
 import logging
 import os
@@ -239,6 +240,111 @@ class TierResolver:
 
 
 # ---------------------------------------------------------------------------
+# Service attribution
+# ---------------------------------------------------------------------------
+
+
+class ServiceResolver:
+    """Turn (client address, client uid) into a service name.
+
+    Built from --service [CLIENT:]UID=NAME pairs, e.g.
+        --service 10.0.0.11:114=lms
+        --service 10.0.0.11:1000=navidrome
+        --service 10.0.0.11:0=audiomuse
+
+    WHY BOTH HALVES. The client address names a HOST, and one host commonly serves
+    several services: a music server, a second music server and an analyser can all
+    sit behind one address. The uid names the process that mounted and read, which
+    separates exactly those -- but a uid means nothing on its own, because 1000 is
+    one service on one host and somebody else entirely on the next. The pair is the
+    smallest thing that is actually a service.
+
+    A bare UID=NAME entry applies to any client, as a fallback for a uid that is
+    the same service wherever it appears. Client-specific entries win.
+
+    WHAT IT CANNOT DO. It cannot separate peers running as the same user, and
+    containers that set no user all run as uid 0 -- a group of those resolves to one
+    name, which is the honest answer rather than a guess between them. Separating
+    them needs a different axis: a per-service local address, which svc_rqst.rq_daddr
+    would give, at the cost of an address and an export per service.
+
+    Names are NOT written to the sessions table. The uid is the fact and is stored;
+    the name is an interpretation of it, and keeping it out of the history means
+    correcting a wrong mapping fixes the past too, instead of leaving a wrong label
+    baked into every row already written.
+    """
+
+    def __init__(self, service_map=None):
+        self.by_pair = {}       # (client, uid) -> name
+        self.by_uid = {}        # uid -> name, any client
+        for client, uid, name in (service_map or []):
+            if client:
+                self.by_pair[(client, uid)] = name
+            else:
+                self.by_uid[uid] = name
+        self.counts = collections.Counter()
+
+    def name_for(self, client, uid):
+        """-> a service name, or None when the pair is not mapped."""
+        if uid is None:
+            self.counts["no-uid"] += 1
+            return None
+        name = self.by_pair.get((client, uid))
+        if name is None:
+            name = self.by_uid.get(uid)
+        self.counts[name or ("unmapped:%s:%s" % (client or "?", uid))] += 1
+        return name
+
+    def describe(self, client, uid, uids=()):
+        """A label for logs and the API: the service name when known, else the
+        raw pair, so an unmapped reader is visible rather than silently blank."""
+        if uids and len(uids) > 1:
+            return "ambiguous(uids=%s)" % ",".join(str(u) for u in uids)
+        name = self.name_for(client, uid)
+        if name:
+            return name
+        if uid is None:
+            return None
+        return "uid:%d" % uid
+
+
+def parse_service_specs(specs, fail):
+    """["[CLIENT:]UID=NAME", ...] -> [(client|None, uid, name), ...].
+
+    `fail` is called with a message for anything malformed; main passes
+    argparse's ap.error, tests pass something that raises. Separate from main so
+    it can be tested at all -- the colon handling is the kind of thing that works
+    for IPv4 and quietly mangles IPv6.
+    """
+    out = []
+    for spec in specs or ():
+        if "=" not in spec:
+            fail("--service wants [CLIENT:]UID=NAME, got %r" % spec)
+            continue
+        who, name = spec.split("=", 1)
+        name = name.strip()
+        if not name:
+            fail("--service needs a non-empty NAME, got %r" % spec)
+            continue
+        # Split on the LAST colon: an IPv6 client address is full of them and the
+        # uid is always the final field, so partitioning on the first would take
+        # the leading hextet as the uid.
+        client, sep, uid_s = who.rpartition(":")
+        if not sep:
+            client, uid_s = "", who
+        try:
+            uid = int(uid_s)
+        except ValueError:
+            fail("--service UID must be an integer, got %r in %r" % (uid_s, spec))
+            continue
+        if uid < 0:
+            fail("--service UID must not be negative, got %r" % spec)
+            continue
+        out.append((client.strip() or None, uid, name))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Store
 # ---------------------------------------------------------------------------
 
@@ -259,7 +365,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     label    TEXT NOT NULL,
     bytes    INTEGER, coverage REAL, duration REAL, rate REAL,
     requests INTEGER, monotonic REAL, method TEXT,
-    tier     TEXT
+    tier     TEXT,
+    uid      INTEGER
 );
 CREATE INDEX IF NOT EXISTS sessions_ts ON sessions(ts);
 """
@@ -296,6 +403,10 @@ class Store:
                 c.execute("ALTER TABLE sessions ADD COLUMN tier TEXT")
                 logging.info("sessions: added the 'tier' column "
                              "(existing rows keep NULL -- their tier was not recorded)")
+            if "uid" not in have:
+                c.execute("ALTER TABLE sessions ADD COLUMN uid INTEGER")
+                logging.info("sessions: added the 'uid' column (existing rows keep "
+                             "NULL -- the collector did not report a credential yet)")
 
     def _conn(self):
         c = getattr(self._local, "c", None)
@@ -318,12 +429,12 @@ class Store:
         with c:
             cur = c.execute(
                 "INSERT INTO sessions(ts,path,dev,ino,client,label,bytes,coverage,"
-                "duration,rate,requests,monotonic,method,tier) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "duration,rate,requests,monotonic,method,tier,uid) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (epoch_ts, path, s64(sig.get("dev")), s64(sig.get("ino")),
                  sig.get("client"), label, sig["bytes"], sig["coverage"],
                  sig["duration"], sig["rate"], sig["requests"], sig["monotonic"],
-                 sig["method"], tier))
+                 sig["method"], tier, sig.get("uid")))
             return cur.lastrowid
 
     def relabel_session(self, rowid, label):
@@ -407,9 +518,10 @@ class Store:
 
 class Daemon:
     def __init__(self, store, index, tracker, cfg, log_sessions=True,
-                 defer=True, collector=None, tiers=None):
+                 defer=True, collector=None, tiers=None, services=None):
         self.store, self.index, self.tracker, self.cfg = store, index, tracker, cfg
         self.tiers = tiers
+        self.services = services or ServiceResolver()
         self.log_sessions = log_sessions
         self.collector = collector
         # A rolling window can only look backwards, so the first files of a sweep
@@ -467,9 +579,12 @@ class Daemon:
         if self.log_sessions:
             cov = "?" if sig["coverage"] is None else f"{sig['coverage']:.2f}"
             rate = "-" if not sig["rate"] else f"{sig['rate'] / (1 << 20):.1f}MB/s"
+            who = self.services.describe(sig.get("client"), sig.get("uid"),
+                                         sig.get("uids") or ())
             logging.info(
-                "%-6s %-15s %8.1fMB cov=%-5s %5.0fs %-9s reqs=%-5d %s%s",
-                label, sig.get("client") or "?", sig["bytes"] / (1 << 20), cov,
+                "%-6s %-15s %-12s %8.1fMB cov=%-5s %5.0fs %-9s reqs=%-5d %s%s",
+                label, sig.get("client") or "?", who or "-",
+                sig["bytes"] / (1 << 20), cov,
                 sig["duration"], rate, sig["requests"],
                 path or f"<unresolved dev={sig['dev']} ino={sig['ino']}>",
                 "" if first else "  (refresh)")
@@ -489,8 +604,10 @@ class Daemon:
         self.arrivals += 1
         self.bytes_in += w.get("bytes", 0)
         if self.log_sessions:
-            logging.info("ARRIVE %-15s %8.1fMB in %4.0fs  %s",
-                         w.get("client") or "?", w.get("bytes", 0) / (1 << 20),
+            who = self.services.describe(w.get("client"), w.get("uid"))
+            logging.info("ARRIVE %-15s %-12s %8.1fMB in %4.0fs  %s",
+                         w.get("client") or "?", who or "-",
+                         w.get("bytes", 0) / (1 << 20),
                          w.get("last", 0) - w.get("first", 0),
                          path or f"<new, dev={dev} ino={ino}>")
 
@@ -541,6 +658,10 @@ class Daemon:
             "deferred_pending": len(self._pending),
             "deferred_suppressed": self.deferred_suppressed,
             "deferred_written": self.deferred_written,
+            # How much traffic can actually be named. An "unmapped:" entry is a
+            # (client, uid) pair nothing in --service covers, which is the thing
+            # to look at when attribution has a hole.
+            "services": dict(self.services.counts),
             "index_files": self.index.files,
             "index_builds": self.index.builds,
             "index_build_s": round(self.index.last_build_s, 1),
@@ -581,6 +702,11 @@ def make_handler(daemon):
                                 if sig.get("ino") is not None else None)
                         out.append({"path": path, "label": label,
                                     "client": sig.get("client"),
+                                    "uid": sig.get("uid"),
+                                    "uids": sig.get("uids") or [],
+                                    "service": daemon.services.describe(
+                                        sig.get("client"), sig.get("uid"),
+                                        sig.get("uids") or ()),
                                     "bytes": sig["bytes"],
                                     "coverage": sig["coverage"],
                                     "started": be + sig["t_first"],
@@ -647,6 +773,14 @@ def main(argv=None):
                          "/media/library/tv=/media/media-cache/tv (repeatable). "
                          "Only the fast branch is ever stat'd; absent from it means "
                          "the read came off the slow tier.")
+    ap.add_argument("--service", action="append", default=[],
+                    metavar="[CLIENT:]UID=NAME",
+                    help="name the service a client uid belongs to, e.g. "
+                         "10.0.0.11:114=lms (repeatable). The client address "
+                         "names only a HOST and several services share one, so the "
+                         "uid is what separates them; a bare UID=NAME applies to "
+                         "any client. Unmapped pairs are counted in /stats under "
+                         "'services' rather than silently dropped.")
     ap.add_argument("--db", default="/var/lib/pamts/observer.db")
     ap.add_argument("--source", choices=("bpf", "ndjson"), default="bpf")
     ap.add_argument("--bpf-object", default=os.path.join(
@@ -723,7 +857,17 @@ def main(argv=None):
     else:
         logging.info("no --tier-map given; sessions will not record a tier")
 
-    daemon = Daemon(store, index, tracker, cfg, tiers=tiers,
+    svc_triples = parse_service_specs(args.service, ap.error)
+    services = ServiceResolver(svc_triples)
+    if svc_triples:
+        for client, uid, name in svc_triples:
+            logging.info("service map: %s uid %d -> %s",
+                         client or "any client", uid, name)
+    else:
+        logging.info("no --service given; sessions still record the client uid, "
+                     "but nothing will put a service name to it")
+
+    daemon = Daemon(store, index, tracker, cfg, tiers=tiers, services=services,
                     log_sessions=not args.quiet_sessions,
                     defer=not args.no_defer)
     tracker.on_close = daemon.on_close

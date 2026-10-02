@@ -483,13 +483,16 @@ class Record:
     same code path.
     """
     __slots__ = ("ts", "kind", "xid", "fh", "offset", "length", "status",
-                 "ino", "dev", "client")
+                 "ino", "dev", "client", "uid")
 
     def __init__(self, ts, kind, xid=0, fh=0, offset=0, length=None,
-                 status=None, ino=None, dev=None, client=None):
+                 status=None, ino=None, dev=None, client=None, uid=None):
         self.ts, self.kind, self.xid = ts, kind, xid
         self.fh, self.offset, self.length, self.status = fh, offset, length, status
         self.ino, self.dev, self.client = ino, dev, client
+        # The client's RPC credential, when the collector could read one. None from
+        # ftrace captures, which never carried it.
+        self.uid = uid
 
     @property
     def key(self):
@@ -499,6 +502,11 @@ class Record:
         stops two viewers of one file merging into a nonsense session. Fall back
         to fh_hash when only ftrace-grade data is available, which is exactly
         when that merging becomes unavoidable.
+
+        uid is deliberately NOT part of this. Adding it would split a session
+        whenever a credential changed mid-read and, more to the point, would feed
+        a different key into the bulk guard -- so it would alter classification,
+        not merely annotate it. The uid is carried alongside instead; see _sig.
         """
         if self.ino is not None:
             return (self.dev, self.ino, self.client)
@@ -510,7 +518,7 @@ class Record:
                    fh=obj.get("fh", 0), offset=obj.get("offset", 0),
                    length=obj.get("len"), status=obj.get("status"),
                    ino=obj.get("ino"), dev=obj.get("dev"),
-                   client=obj.get("client"))
+                   client=obj.get("client"), uid=obj.get("uid"))
 
 
 class SessionTracker:
@@ -578,7 +586,7 @@ class SessionTracker:
             w = self._writes.get(key)
             if w is None:
                 w = {"first": rec.ts, "bytes": 0, "client": rec.client,
-                     "reported": False}
+                     "uid": rec.uid, "reported": False}
                 self._writes[key] = w
                 self.arrivals += 1
             w["last"] = rec.ts
@@ -616,9 +624,11 @@ class SessionTracker:
         st = self._open.get(key)
         if st is None:
             st = {"reqs": [], "pending": {}, "last": rec.ts,
-                  "first": rec.ts, "checkpointed": False}
+                  "first": rec.ts, "checkpointed": False, "uids": set()}
             self._open[key] = st
         st["last"] = max(st["last"], rec.ts)
+        if rec.uid is not None:
+            st["uids"].add(rec.uid)
 
         pend = st["pending"]
         cur = pend.get(rec.xid)
@@ -684,7 +694,7 @@ class SessionTracker:
                     reqs = st["reqs"] + list(st["pending"].values())
                     if not reqs:
                         continue
-                    sig = self._sig(key, reqs)
+                    sig = self._sig(key, reqs, st["uids"])
                     if classify(sig, self.cfg) == "PLAY":
                         st["checkpointed"] = True
                         self.checkpoints += 1
@@ -711,11 +721,22 @@ class SessionTracker:
             if self.on_close:
                 self.on_close(key, sig, label, first)
 
-    def _sig(self, key, reqs):
+    def _sig(self, key, reqs, uids=None):
+        """Build the session signature. `uids` is every credential seen on it.
+
+        Two fields, because one number cannot honestly answer both questions:
+        `uid` is the credential ONLY when the session had exactly one, and `uids`
+        is the full set. A session with two is real -- two processes on one host
+        reading the same file at the same time -- and reporting either of them as
+        "the" reader would be a guess. None means "do not attribute this".
+        """
         sig = signature(reqs, self.cfg)
         sig["key"] = key
         sig["dev"], sig["ino"] = key[0], key[1]
         sig["client"] = key[2] if len(key) > 2 else None
+        seen = sorted(uids or ())
+        sig["uids"] = seen
+        sig["uid"] = seen[0] if len(seen) == 1 else None
         return sig
 
     def _note(self, sig):
@@ -761,7 +782,7 @@ class SessionTracker:
         if not reqs:
             self.dropped += 1
             return None
-        sig = self._sig(key, reqs)
+        sig = self._sig(key, reqs, st["uids"])
         media = None
         if self.media_of:
             try:
@@ -790,11 +811,12 @@ class SessionTracker:
         """Sessions in flight, for a "what is playing right now" endpoint."""
         out = []
         with self._lock:
-            snapshot = [(k, st["reqs"] + list(st["pending"].values()))
+            snapshot = [(k, st["reqs"] + list(st["pending"].values()),
+                         set(st["uids"]))
                         for k, st in self._open.items()]
-        for key, reqs in snapshot:
+        for key, reqs, uids in snapshot:
             if not reqs:
                 continue
-            sig = self._sig(key, reqs)
+            sig = self._sig(key, reqs, uids)
             out.append((sig, classify(sig, self.cfg)))
         return out

@@ -20,8 +20,15 @@ import struct
 
 # Must match struct pamts_event in pamts_nfsd.bpf.c exactly. Field order is
 # chosen so there is no implicit padding anywhere but the explicit tail.
-EVENT = struct.Struct("<QQQqIIIi16sB7x")
+#
+# The size is NOT a sufficient check on its own: `uid` was added into what had
+# been tail padding, so the struct is 72 bytes both before and after. _check_abi()
+# compares against the object's own BTF instead.
+EVENT = struct.Struct("<QQQqIIIiI16sB3x")
 assert EVENT.size == 72, EVENT.size
+
+#: Matches PAMTS_UID_UNKNOWN. Not 0, because uid 0 is a real client here.
+UID_UNKNOWN = 0xFFFFFFFF
 
 KINDS = {0: "read_start", 1: "read_splice", 2: "read_vector",
          3: "read_direct", 4: "read_done", 5: "read_err",
@@ -131,12 +138,63 @@ class Collector:
         L.bpf_object__close.argtypes = [ctypes.c_void_p]
         L.libbpf_set_print.restype = ctypes.c_void_p
         L.libbpf_set_print.argtypes = [PRINT_FN]
+        # BTF, for the layout assertion in _check_abi(). Optional: an older
+        # libbpf without these is a reason to skip the check, not to refuse.
+        for name, res, args in (
+                ("bpf_object__btf", ctypes.c_void_p, [ctypes.c_void_p]),
+                ("btf__find_by_name_kind", ctypes.c_int,
+                 [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint]),
+                ("btf__resolve_size", ctypes.c_long,
+                 [ctypes.c_void_p, ctypes.c_uint])):
+            try:
+                fn = getattr(L, name)
+            except AttributeError:
+                continue
+            fn.restype, fn.argtypes = res, args
+
+    BTF_KIND_STRUCT = 4
+
+    def _check_abi(self):
+        """Refuse to run if the object emits a different struct than we unpack.
+
+        `uid` was added into bytes that used to be tail padding, so sizeof did not
+        change and the `size < EVENT.size` guard on the data path cannot see a
+        mismatch. A stale object paired with this decoder would hand back a uid
+        read from the first four bytes of the client address -- plausible-looking
+        numbers, wrong every time, and nothing would ever complain.
+
+        Compares against the object's OWN BTF, so it keeps working for whatever
+        the next field turns out to be, with no version constant to remember to
+        bump. Missing BTF is not an error: `-g` could be absent, or libbpf too
+        old to expose it, and in both cases we are no worse off than before.
+        """
+        if not hasattr(self.lib, "btf__resolve_size"):
+            return None
+        btf = self.lib.bpf_object__btf(self.obj)
+        if not btf:
+            return None
+        tid = self.lib.btf__find_by_name_kind(btf, b"pamts_event",
+                                              self.BTF_KIND_STRUCT)
+        if tid <= 0:
+            return None
+        size = self.lib.btf__resolve_size(btf, tid)
+        if size <= 0:
+            return None
+        if size != EVENT.size:
+            raise BpfError(
+                f"{self.obj_path} emits a {size}-byte struct pamts_event but this "
+                f"loader unpacks {EVENT.size} bytes. The object is out of step with "
+                f"pamts_bpf.py -- rebuild it (make -C observer) and redeploy both.")
+        return size
 
     def _open_and_load(self):
         self.obj = self.lib.bpf_object__open_file(self.obj_path.encode(), None)
         if not self.obj:
             raise BpfError(f"bpf_object__open_file failed (errno "
                            f"{ctypes.get_errno()}) for {self.obj_path}")
+        # Before load, not after: BTF is readable from the opened object and needs
+        # no privileges, so a mismatch fails cheaply instead of after the verifier.
+        self.abi_size = self._check_abi()
         rc = self.lib.bpf_object__load(self.obj)
         if rc != 0:
             raise BpfError(
@@ -210,7 +268,7 @@ class Collector:
 
     @staticmethod
     def decode(buf):
-        (ts, ino, offset, length, dev, xid, kind, status, addr, af) = \
+        (ts, ino, offset, length, dev, xid, kind, status, uid, addr, af) = \
             EVENT.unpack(buf)
         return {
             "ts": ts / 1e9,                      # ktime ns -> seconds
@@ -222,6 +280,8 @@ class Collector:
             "ino": ino,
             "dev": dev,
             "client": _fmt_addr(af, addr),
+            # None rather than the sentinel, so consumers never have to know it.
+            "uid": None if uid == UID_UNKNOWN else uid,
         }
 
     def _default_record(self, d):

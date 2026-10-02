@@ -577,4 +577,105 @@ for b in range(40):
                  9000 * MB, hit_eof=False)
 _, tr = labels_for(many, {"idle_gap": 1.5, "checkpoint_after": 0})
 check("40 bursts on ONE file are not a sweep", tr.bulk == 0, str(tr.bulk))
+
+# ---------------------------------------------------------------- client credentials
+# The collector reports the uid the read arrived under, which is what separates several
+# services sharing one host. It is carried ALONGSIDE the session key, never inside it:
+# putting it in the key would change which events group together, and so would change
+# classification -- these tests pin that down in both directions.
+print("\nclient credentials (uid)")
+
+check("a Record carries the uid the collector reported",
+      obs.Record(ts=1.0, kind="read_done", ino=1, dev=2, client="a", uid=114).uid == 114)
+check("a Record from an ftrace-grade source has uid None, not 0",
+      obs.Record(ts=1.0, kind="read_done", ino=1, dev=2, client="a").uid is None)
+check("from_json picks the uid up",
+      obs.Record.from_json({"ts": 1.0, "kind": "read_done", "ino": 1, "dev": 2,
+                            "client": "a", "uid": 7}).uid == 7)
+check("the session key does NOT include the uid",
+      obs.Record(ts=1.0, kind="read_done", ino=42, dev=7, client="a", uid=114).key
+      == (7, 42, "a"),
+      "uid in the key would re-group events and so change classification")
+check("two uids reading one file from one host still share a key",
+      obs.Record(ts=1.0, kind="read_done", ino=42, dev=7, client="a", uid=114).key
+      == obs.Record(ts=2.0, kind="read_done", ino=42, dev=7, client="a", uid=0).key)
+
+
+def one_session(uids, idle=20.0):
+    """Drive a whole-file read whose events carry `uids` in turn; -> the closed sig."""
+    got = []
+    t = obs.SessionTracker({"idle_gap": idle, "checkpoint_after": 0},
+                           on_close=lambda k, sg, l, f: got.append(sg))
+    for i, uid in enumerate(uids):
+        t.add(obs.Record(ts=1000.0 + i * 0.05, kind="read_done", xid=0x300 + i,
+                         offset=i * 131072, length=131072, ino=77, dev=7,
+                         client="10.0.0.11", uid=uid))
+    t.tick(1000.0 + len(uids) * 0.05 + idle + 1)
+    return got[0] if got else None
+
+
+_s1 = one_session([114, 114, 114])
+check("a session read entirely under one credential reports it",
+      _s1 and _s1["uid"] == 114, str(_s1 and _s1["uid"]))
+check("and lists it once", _s1 and _s1["uids"] == [114], str(_s1 and _s1["uids"]))
+
+# Two credentials on one (dev, ino, client) is real -- two processes on one host
+# reading the same file at once. Naming either of them would be a guess.
+_s2 = one_session([114, 1000, 114])
+check("a session that saw several credentials reports uid None",
+      _s2 and _s2["uid"] is None, str(_s2 and _s2["uid"]))
+check("but keeps every credential it saw, so the ambiguity is visible",
+      _s2 and _s2["uids"] == [114, 1000], str(_s2 and _s2["uids"]))
+
+_s3 = one_session([None, None])
+check("a session with no credentials at all reports uid None and an empty list",
+      _s3 and _s3["uid"] is None and _s3["uids"] == [],
+      str(_s3 and (_s3["uid"], _s3["uids"])))
+
+# uid 0 must survive every None-ish test on the way through: it is a very common
+# credential, since any container that sets no user runs as root, so treating it as
+# absent would blank most attribution.
+_s4 = one_session([0, 0])
+check("uid 0 is reported as 0, not swallowed as absent",
+      _s4 and _s4["uid"] == 0 and _s4["uids"] == [0],
+      str(_s4 and (_s4["uid"], _s4["uids"])))
+
+# in-flight sessions carry it too, which is what the /sessions endpoint serves
+_t5 = obs.SessionTracker({"idle_gap": 20.0, "checkpoint_after": 0})
+for _i in range(3):
+    _t5.add(obs.Record(ts=2000.0 + _i * 0.05, kind="read_done", xid=0x400 + _i,
+                       offset=_i * 131072, length=131072, ino=88, dev=7,
+                       client="10.0.0.11", uid=1000))
+_open = _t5.open_sessions
+check("an in-flight session reports its uid",
+      _open and _open[0][0]["uid"] == 1000, str(_open and _open[0][0].get("uid")))
+
+# Writes: the arrival callback is how a download becomes visible, and attributing it
+# matters as much as attributing a read.
+_arr = []
+_t6 = obs.SessionTracker({"idle_gap": 20.0})
+_t6.on_arrival = lambda k, w: _arr.append(w)
+_t6.add(obs.Record(ts=3000.0, kind="write_done", xid=1, offset=0, length=1 << 20,
+                   ino=99, dev=7, client="10.0.0.102", uid=1001))
+_t6.add(obs.Record(ts=3001.0, kind="commit_done", xid=2, offset=0, length=0,
+                   ino=99, dev=7, client="10.0.0.102", uid=1001))
+check("an arrival records the uid that wrote it",
+      _arr and _arr[0].get("uid") == 1001, str(_arr))
+
+# The regression that matters most: adding uid must not have moved any verdict.
+_verdicts = []
+for _uids in ([114] * 8, [None] * 8, [114, 1000] * 4):
+    _g = []
+    _t = obs.SessionTracker({"idle_gap": 20.0, "checkpoint_after": 0},
+                            on_close=lambda k, sg, l, f: _g.append(l))
+    for _i, _u in enumerate(_uids):
+        _t.add(obs.Record(ts=4000.0 + _i * 0.05, kind="read_done", xid=0x500 + _i,
+                          offset=_i * 131072, length=131072, ino=66, dev=7,
+                          client="10.0.0.11", uid=_u))
+    _t.tick(4000.0 + 8 * 0.05 + 21)
+    _verdicts.append(_g)
+check("identical traffic classifies identically whatever the credentials",
+      len(set(map(tuple, _verdicts))) == 1 and _verdicts[0],
+      str(_verdicts))
+
 summary()

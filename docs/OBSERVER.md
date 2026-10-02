@@ -58,17 +58,19 @@ Check the player adapter before concluding the estate is idle.
 
 ## What it cannot do
 
-- **No per-user history.** Exports using `all_squash` erase user identity at the
-  server; every request arrives as the anonymous uid. You get *file-level
-  demand*. That is the right signal for tiering and a poor substitute for
-  scrobbles.
+- **No per-*person* history.** The uid the collector reports is the uid of the
+  **process** that read the file, not of the human listening. A shared media
+  server reads on everyone's behalf under its own account, so you get *file-level
+  demand* attributed to a service. That is the right signal for tiering and a poor
+  substitute for scrobbles.
 - **No client attribution from ftrace alone.** The nfsd read tracepoints carry
   `xid` and `fh_hash` but no client address, so two clients reading one file at
   once merge into a single session. Recovering the client needs eBPF and
   `svc_rqst`.
-- **Co-tenanted services are indistinguishable.** If two music servers run on
-  one host, the NFS mount is per-host, so even with the client address you cannot
-  say which of them read the file. This does not hurt tiering — a play is a play.
+- **Co-tenanted services need the uid, not just the address.** The NFS mount is
+  per-host, so the client address names a host and several services can sit behind
+  one. The uid separates them — see *Attributing a read to a service* below — but
+  it cannot separate peers running as the *same* user.
 - **Local readers are invisible**, because they never become NFS requests. This
   is usually a *feature*: your own backup and maintenance jobs run on the storage
   host and so cannot be mistaken for demand.
@@ -226,7 +228,45 @@ use the eBPF collector.
 ## The eBPF collector
 
 `observer/pamts_nfsd.bpf.c` attaches to the nfsd read tracepoints and reports
-what ftrace cannot: a real **inode**, the **device**, and the **client address**.
+what ftrace cannot: a real **inode**, the **device**, the **client address** and
+the **client uid**.
+
+### Attributing a read to a service
+
+Four axes are available, in increasing order of effort:
+
+| axis | separates | cost |
+|---|---|---|
+| **client address** (`rq_addr`) | hosts | free, always recorded |
+| **client uid** (`rq_cred.cr_uid`) | services on one host, when they run as different users | free, always recorded |
+| **local address** (`rq_daddr`) | anything, including peers running as the same user | an address and an export per service; not implemented |
+| the services' own APIs | plays, authoritatively, with the user | per-service integration; see `pamts_players.py` |
+
+`--service [CLIENT:]UID=NAME` names a (client, uid) pair, repeatably. Both halves
+matter: the address alone names a host, and a uid alone means nothing, because the
+same number is a different service on the next machine. A bare `UID=NAME` applies
+to any client.
+
+Two things worth knowing:
+
+- **`all_squash` does not hide the uid.** Squashing happens in `nfsd_setuser()`,
+  which builds a fresh credential for the file operation and leaves `rq_cred`
+  alone — so the uid on the wire survives. Verified against live traffic, not
+  assumed.
+- **A containerised reader arrives idmapped.** If the NFS mount lives on a
+  container host and is bind-mounted in, the reader is the process inside the
+  container and the uid is the host-side one — `100000 + uid` for an
+  unprivileged container. That is *more* specific than the address, which covers
+  the whole node.
+
+The **uid is what gets stored**, in `sessions.uid`; the name is only an
+interpretation applied at display time. Correcting a wrong mapping therefore fixes
+the past as well as the future. Pairs that nothing maps are counted in `/stats`
+under `services` as `unmapped:<client>:<uid>`, which is where to look for a hole.
+
+A session that saw more than one credential — two processes on one host reading
+one file at once — reports `uid: null` and lists every uid it saw in `uids`.
+Naming either of them would be a guess.
 
 ### Build once, run anywhere
 

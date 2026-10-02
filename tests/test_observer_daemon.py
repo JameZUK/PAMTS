@@ -430,4 +430,226 @@ check("a cold session stores tier='cold'",
 shutil.rmtree(_troot, ignore_errors=True)
 
 
+# =====================================================================  uid / service
+# The collector now reports the client's RPC credential, which is the only thing that
+# separates services sharing one host. These tests cover the three places that can go
+# wrong independently: the wire layout, the mapping from (client, uid) to a name, and
+# the column it is stored in.
+
+print("=== UID: the event layout the decoder assumes matches the object that emits it")
+_obsdir = ROOT / "observer"
+sys.path.insert(0, str(_obsdir))
+import pamts_bpf as _bpf                                        # noqa: E402
+
+# Offsets, not just size. `uid` was added into bytes that used to be tail padding, so
+# the struct is 72 bytes before AND after -- a size check alone cannot tell the two
+# apart, and everything after uid would shift silently if the format string were wrong.
+import struct as _st                                            # noqa: E402
+_off, _seen = 0, {}
+for _c in ("Q", "Q", "Q", "q", "I", "I", "I", "i", "I", "16s", "B", "3x"):
+    _seen[_off] = _c
+    _off += _st.calcsize("<" + _c)
+check("the offsets walked here cover the whole struct", _off == 72, str(_off))
+check("EVENT is 72 bytes", _bpf.EVENT.size == 72, str(_bpf.EVENT.size))
+check("uid sits at byte 48, after status and before addr",
+      _seen.get(48) == "I", str(_seen))
+check("addr still starts at byte 52", _seen.get(52) == "16s", str(_seen))
+check("af still sits at byte 68", _seen.get(68) == "B", str(_seen))
+
+# A real buffer, with every field a DIFFERENT recognisable value: if uid were read from
+# the wrong offset it would come back as one of the neighbours rather than as 114, and
+# a buffer of zeroes or repeated values could not show that.
+_buf = _st.pack("<QQQqIIIiI16sB3x",
+                1_000_000_000,            # ts
+                4242,                     # ino
+                65536,                    # offset
+                131072,                   # len
+                0x00800011,               # dev
+                0xDEADBEEF,               # xid
+                4,                        # kind = read_done
+                0,                        # status
+                114,                      # uid -- a packaged music server
+                __import__("socket").inet_aton("10.0.0.11") + b"\0" * 12,
+                2)                        # AF_INET
+_dec = _bpf.Collector.decode(_buf)
+check("decode reads the uid", _dec["uid"] == 114, str(_dec))
+check("the client address is still decoded correctly after uid was inserted",
+      _dec["client"] == "10.0.0.11", str(_dec))
+check("and the fields before uid are untouched",
+      (_dec["ino"], _dec["xid"], _dec["kind"]) == (4242, 0xDEADBEEF, "read_done"),
+      str(_dec))
+
+# The sentinel must not surface as uid 0: uid 0 is a real client here (every *arr
+# container that sets no user), so reporting unknown as 0 would attribute whole
+# hosts to root.
+_unk = _bpf.Collector.decode(_st.pack("<QQQqIIIiI16sB3x", 1, 2, 0, 0, 0, 0, 4, 0,
+                                      _bpf.UID_UNKNOWN, b"\0" * 16, 2))
+check("an unknown credential decodes to None, not 0", _unk["uid"] is None, str(_unk))
+check("the sentinel is not zero", _bpf.UID_UNKNOWN != 0)
+
+# The strong version of the same check, against the compiled object's own BTF. Skipped
+# rather than failed when libbpf or the object is absent, because neither is needed to
+# run the rest of this suite.
+_objp = _obsdir / "pamts_nfsd.bpf.o"
+try:
+    import ctypes as _ct
+    _lib = _ct.CDLL("libbpf.so.1", use_errno=True)
+except OSError:
+    _lib = None
+if _lib is None or not _objp.exists() or not hasattr(_lib, "btf__resolve_size"):
+    skip("BTF layout assertion (needs libbpf.so.1 and a built pamts_nfsd.bpf.o)")
+else:
+    _col = _bpf.Collector.__new__(_bpf.Collector)
+    _col.obj_path, _col.lib = str(_objp), _lib
+    _col._bind()
+    _col.obj = _lib.bpf_object__open_file(str(_objp).encode(), None)
+    check("the built object's BTF agrees with EVENT", _col._check_abi() == 72,
+          str(_col._check_abi()))
+    # And prove the guard can fail. Without this the check above passes whether or
+    # not _check_abi compares anything at all.
+    _real_event = _bpf.EVENT
+    try:
+        _bpf.EVENT = _st.Struct("<QQQqIIIiI16sB7x")      # 76: deliberately wrong
+        try:
+            _col._check_abi()
+            _caught = False
+        except _bpf.BpfError:
+            _caught = True
+    finally:
+        _bpf.EVENT = _real_event
+    check("a decoder out of step with the object is refused at load", _caught,
+          "a stale object would otherwise decode uid from the client address")
+
+print("=== UID: (client, uid) -> service name")
+_sr = d.ServiceResolver([("10.0.0.11", 114, "lms"),
+                         ("10.0.0.11", 1000, "navidrome"),
+                         ("10.0.0.11", 0, "audiomuse"),
+                         (None, 1001, "get_iplayer")])
+check("a client-specific pair resolves",
+      _sr.name_for("10.0.0.11", 114) == "lms")
+check("three services behind ONE address are separated by uid",
+      (_sr.name_for("10.0.0.11", 114),
+       _sr.name_for("10.0.0.11", 1000),
+       _sr.name_for("10.0.0.11", 0)) == ("lms", "navidrome", "audiomuse"),
+      "this is the whole reason uid was added")
+check("a bare UID entry applies to any client",
+      _sr.name_for("10.0.0.102", 1001) == "get_iplayer")
+check("the same uid on a DIFFERENT host does not inherit another host's name",
+      _sr.name_for("10.0.0.102", 1000) is None,
+      "uid 1000 is navidrome on ONE host, not everywhere")
+check("an unmapped pair is None, never a guess",
+      _sr.name_for("10.9.9.9", 7) is None)
+check("no credential at all is None", _sr.name_for("10.0.0.11", None) is None)
+
+# A client-specific entry must win over a bare one for the same uid, or a fallback
+# would quietly override the precise answer.
+_sr2 = d.ServiceResolver([(None, 0, "root-somewhere"),
+                          ("10.0.0.11", 0, "audiomuse")])
+check("a client-specific entry beats a bare one for the same uid",
+      _sr2.name_for("10.0.0.11", 0) == "audiomuse",
+      str(_sr2.name_for("10.0.0.11", 0)))
+check("and the bare one still covers other clients",
+      _sr2.name_for("10.0.0.99", 0) == "root-somewhere")
+
+# Counting on a FRESH resolver: the checks above call name_for a varying number of
+# times, so tallying on _sr would drift as checks are added.
+_sr3 = d.ServiceResolver([("1.1.1.1", 5, "known")])
+_sr3.name_for("1.1.1.1", 5)
+_sr3.name_for("1.1.1.1", 6)
+_sr3.name_for("1.1.1.1", None)
+check("mapped, unmapped and credential-less traffic are counted separately",
+      _sr3.counts == {"known": 1, "unmapped:1.1.1.1:6": 1, "no-uid": 1},
+      str(dict(_sr3.counts)))
+
+check("describe() names a known service", _sr.describe("10.0.0.11", 114) == "lms")
+check("describe() falls back to the raw uid so an unmapped reader is visible",
+      _sr.describe("10.9.9.9", 7) == "uid:7", str(_sr.describe("10.9.9.9", 7)))
+check("describe() refuses to pick when a session carried several credentials",
+      _sr.describe("10.0.0.11", None, (114, 1000)) == "ambiguous(uids=114,1000)",
+      str(_sr.describe("10.0.0.11", None, (114, 1000))))
+check("describe() is None when there is nothing to say",
+      _sr.describe("10.0.0.11", None) is None)
+_empty = d.ServiceResolver()
+check("with no --service given nothing resolves, and nothing raises",
+      _empty.describe("10.0.0.11", 114) == "uid:114")
+
+print("=== UID: --service spec parsing")
+_errs = []
+_triples = d.parse_service_specs(
+    ["10.0.0.11:114=lms", "1000=navidrome", " 10.0.0.1:0 = audiomuse "],
+    _errs.append)
+check("a CLIENT:UID=NAME spec parses",
+      ("10.0.0.11", 114, "lms") in _triples, str(_triples))
+check("a bare UID=NAME spec parses with no client",
+      (None, 1000, "navidrome") in _triples, str(_triples))
+check("surrounding whitespace is stripped",
+      ("10.0.0.1", 0, "audiomuse") in _triples, str(_triples))
+check("valid specs produce no errors", _errs == [], str(_errs))
+
+# IPv6 is why the split is on the LAST colon. Partitioning on the first would read
+# "2001" as the uid and accept it silently -- a wrong mapping, not an error.
+_v6 = d.parse_service_specs(["2001:db8::5:114=lms"], _errs.append)
+check("an IPv6 client keeps its colons and the uid is the final field",
+      _v6 == [("2001:db8::5", 114, "lms")], str(_v6))
+
+for _bad, _why in (("no-equals-sign", "missing ="),
+                   ("10.0.0.11:abc=lms", "non-integer uid"),
+                   ("10.0.0.11:-5=lms", "negative uid"),
+                   ("10.0.0.11:114=", "empty name")):
+    _e = []
+    _got = d.parse_service_specs([_bad], _e.append)
+    check(f"a malformed spec is rejected ({_why})", _e and _got == [],
+          f"{_bad!r} -> {_got!r} errors={_e!r}")
+
+print("=== UID: the column is added to an existing database, and recorded")
+_uroot = pathlib.Path(tempfile.mkdtemp(prefix="pamts-uid-"))
+_udb = str(_uroot / "obs.db")
+_c = _sq.connect(_udb)
+# A database as the PREVIOUS daemon left it: sessions with tier but no uid.
+_c.executescript("""
+CREATE TABLE plays (path TEXT PRIMARY KEY, last_play REAL NOT NULL,
+  play_count INTEGER NOT NULL DEFAULT 0, last_label TEXT, last_bytes INTEGER,
+  updated REAL NOT NULL);
+CREATE TABLE sessions (ts REAL NOT NULL, path TEXT, dev INTEGER, ino INTEGER,
+  client TEXT, label TEXT NOT NULL, bytes INTEGER, coverage REAL, duration REAL,
+  rate REAL, requests INTEGER, monotonic REAL, method TEXT, tier TEXT);
+""")
+_c.execute("INSERT INTO sessions VALUES(1,'/old.mkv',1,2,'c','PLAY',1,0.5,1,1,1,1,'s','hot')")
+_c.commit(); _c.close()
+
+_ustore = d.Store(_udb)
+_ucols = {r[1] for r in _sq.connect(_udb).execute("PRAGMA table_info(sessions)")}
+check("opening an older database adds the uid column", "uid" in _ucols,
+      str(sorted(_ucols)))
+check("the tier column survives the second migration", "tier" in _ucols,
+      str(sorted(_ucols)))
+_orow = _sq.connect(_udb).execute(
+    "SELECT tier, uid FROM sessions WHERE path='/old.mkv'").fetchone()
+check("rows written before this migration keep NULL rather than uid 0",
+      _orow == ("hot", None), str(_orow))
+
+_base = {"dev": 1, "ino": 9, "client": "10.0.0.11", "bytes": 100,
+         "coverage": 1.0, "duration": 2.0, "rate": 50.0, "requests": 3,
+         "monotonic": 1.0, "method": "splice", "t_last": 0.0}
+_ustore.record_session("/media/music/a.flac", dict(_base, uid=114), "PLAY", 10.0, "hot")
+_ustore.record_session("/media/music/b.flac", dict(_base, uid=0), "PLAY", 11.0, "hot")
+# An ambiguous session: _sig leaves uid None when it saw more than one credential.
+_ustore.record_session("/media/music/c.flac", dict(_base, uid=None), "PLAY", 12.0, "hot")
+_urows = dict(_sq.connect(_udb).execute(
+    "SELECT path, uid FROM sessions WHERE ts >= 10.0"))
+check("a session's uid is stored", _urows.get("/media/music/a.flac") == 114,
+      str(_urows))
+check("uid 0 is stored as 0, not confused with absent",
+      _urows.get("/media/music/b.flac") == 0, str(_urows))
+check("an ambiguous session stores NULL", _urows.get("/media/music/c.flac") is None,
+      str(_urows))
+# A sig from an ftrace-grade source has no uid key at all; it must not raise.
+_ustore.record_session("/media/music/d.flac", dict(_base), "PLAY", 13.0, "hot")
+check("a sig with no uid key at all is stored as NULL",
+      _sq.connect(_udb).execute(
+          "SELECT uid FROM sessions WHERE path='/media/music/d.flac'"
+      ).fetchone() == (None,))
+shutil.rmtree(_uroot, ignore_errors=True)
+
+
 summary()

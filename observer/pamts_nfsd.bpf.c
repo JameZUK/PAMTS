@@ -54,8 +54,18 @@ enum pamts_kind {
 	PAMTS_W_COMMIT = 9,
 };
 
-/* Layout is fixed and must match EVENT in pamts_bpf.py: "<QQQqIIIi16sB7x".
+/* No credential on the wire, or one we could not read. NOT 0: uid 0 is a real
+ * common client -- any container that sets no user runs as root -- so a zero
+ * default would silently attribute whole hosts to root.
+ */
+#define PAMTS_UID_UNKNOWN 0xffffffffU
+
+/* Layout is fixed and must match EVENT in pamts_bpf.py: "<QQQqIIIiI16sB3x".
  * Field order avoids all implicit padding; the tail padding is explicit.
+ *
+ * Adding `uid` did not change sizeof -- it fits in what used to be tail padding
+ * -- so a size check alone cannot tell a rebuilt decoder from a stale object.
+ * That is what the BTF assertion in pamts_bpf.py is for; see _unused_abi below.
  */
 struct pamts_event {
 	__u64 ts;
@@ -66,10 +76,20 @@ struct pamts_event {
 	__u32 xid;
 	__u32 kind;
 	__s32 status;
+	__u32 uid;		/* client's RPC credential, or PAMTS_UID_UNKNOWN */
 	__u8  addr[16];
 	__u8  af;
-	__u8  _pad[7];
+	__u8  _pad[3];
 };
+
+/* struct pamts_event is otherwise reachable only through bpf_ringbuf_reserve's
+ * void *, so clang emits no BTF for it and the loader has nothing to check its
+ * layout against. One unused global of that type forces it into the object's
+ * BTF, which lets pamts_bpf.py assert the struct it is about to unpack is the
+ * struct this object actually emits -- and fail at load rather than decode
+ * every field from the wrong offset for weeks.
+ */
+const volatile struct pamts_event *_unused_abi;
 
 /* 128 MB. 16 MB held about 233,000 events, which a library scan overruns in bursts:
  * one 17-hour period dropped 40.3 MILLION events while the *sustained* rate was only
@@ -131,6 +151,7 @@ emit(struct svc_rqst *rqstp, struct svc_fh___pamts *fhp,
 	e->offset = offset;
 	e->len    = len;
 	e->status = status;
+	e->uid    = PAMTS_UID_UNKNOWN;
 
 	if (fhp) {
 		BPF_CORE_READ_INTO(&dent, fhp, fh_dentry);
@@ -158,6 +179,20 @@ emit(struct svc_rqst *rqstp, struct svc_fh___pamts *fhp,
 		 * it as bytes instead: family first, then the address at +4
 		 * (sockaddr_in) or +8 (sockaddr_in6).
 		 */
+		/* rq_cred is the credential as it arrived on the wire. The exports
+		 * all carry all_squash, but squashing happens later and elsewhere --
+		 * nfsd_setuser() builds a fresh cred for the file operation and leaves
+		 * rq_cred alone -- so this is the client's real uid, not anonuid.
+		 * cr_uid is a kuid_t, which is a struct wrapping a single `val`.
+		 *
+		 * It identifies the PROCESS that mounted and read, which is what makes
+		 * services sharing one host separable -- a packaged music server, a
+		 * containerised one and an analyser typically run as three different
+		 * users behind a single client address. It does NOT separate peers running
+		 * as the same user, so it narrows attribution rather than settling it.
+		 */
+		BPF_CORE_READ_INTO(&e->uid, rqstp, rq_cred.cr_uid.val);
+
 		if (bpf_core_read(raw, sizeof(raw), &rqstp->rq_addr) == 0) {
 			fam = *(__u16 *)raw;
 			e->af = (__u8)fam;
