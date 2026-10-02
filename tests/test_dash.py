@@ -592,6 +592,27 @@ check("a fresh cursor file proves the poller is running",
       _by["promotion poller is running"]["state"] == "ok",
       _by["promotion poller is running"]["detail"])
 
+# Database freshness must come from the newest ROW, not the file's mtime: both stores
+# are WAL, where the .db file is only touched at a checkpoint, so mtime reads stale
+# while rows arrive every second.
+_wdb = _h / "wal.db"
+_wc = _sq4.connect(str(_wdb))
+_wc.executescript(pamts_events.SCHEMA)
+_wc.execute("PRAGMA journal_mode=WAL")
+_wc.execute("INSERT INTO transfers(ts,kind,item,bytes) VALUES(?,?,?,?)",
+            (time.time(), "evict", "x", 1))
+_wc.commit()
+# Backdate the FILE while the row stays current -- what WAL does in production.
+_os2 = __import__("os")
+_os2.utime(_wdb, (time.time() - 7200, time.time() - 7200))
+_wr = dash.HealthSource({"events_db": str(_wdb)}).collect()
+_wrow = {c["name"]: c for c in _wr["checks"]}["events.db"]
+check("a WAL database with a 2h-old file but a current row reads as fresh",
+      _wrow["state"] == "ok" and "newest" in _wrow["detail"],
+      _wrow["detail"])
+check("and it reports the row count",
+      "1 transfers" in _wrow["detail"], _wrow["detail"])
+
 # The whole point of the panel: a real fault must come out as fail, not be averaged away.
 _r2 = dash.HealthSource({"url": "http://127.0.0.1:1", "state_file": str(_sf),
                          "watermarks_file": str(_h / "absent.json"),
@@ -624,17 +645,53 @@ _r4 = dash.HealthSource({"state_file": str(_bad)}).collect()
 check("an unreadable state.json is a FAIL",
       {c["name"]: c for c in _r4["checks"]}["state.json"]["state"] == "fail")
 
-# Scope. The panel must not grow checks about other people's services: a check whose
-# subject is Plex or an *arr app belongs on their dashboards, not PAMTS's.
+# Scope. Checks about things PAMTS does not touch at all do not belong here; checks
+# about PAMTS's own ADAPTERS do, even when the far end is someone else's server.
 _names = " ".join(c["name"].lower() for c in _r["checks"] + _r2["checks"])
-_foreign = [w for w in ("plex", "sonarr", "radarr", "lidarr", "readarr", "mergerfs",
+_foreign = [w for w in ("sonarr", "radarr", "lidarr", "readarr", "mergerfs",
                         "zpool", "array", "nfs") if w in _names]
-check("no check is about a service PAMTS does not own", not _foreign, str(_foreign))
-# The two plugin checks ARE PAMTS's own, and must be named so that is obvious.
-check("plugin checks name the plugin, not the host service",
-      all("plugin" in c["name"].lower() or "sidecar" in c["name"].lower()
-          for c in _r2["checks"] if c.get("group") == "Plugins"),
-      str([c["name"] for c in _r2["checks"] if c.get("group") == "Plugins"]))
+check("no check is about a service PAMTS does not talk to", not _foreign, str(_foreign))
+# Every row in Sources names PAMTS's side -- the adapter, the plugin, the sidecar --
+# so a red light points at PAMTS's component and not at someone else's server.
+_srcrows = [c["name"].lower() for c in _r2["checks"] if c.get("group") == "Sources"]
+check("every source row names PAMTS's own component",
+      _srcrows and all(any(w in n for w in ("adapter", "plugin", "sidecar"))
+                       for n in _srcrows),
+      str(_srcrows))
+
+# EVERY configured player gets a row. Listing only the two plugins PAMTS ships left
+# Plex and the observer adapter off a panel whose job is "is PAMTS working" -- and
+# PAMTS leans on Plex for every film and episode decision.
+print("\n=== HEALTH: every configured player appears, plugin or not")
+_pc = _h / "players.toml"
+_pc.write_text(
+    '[[players]]\nname="plex"\nkind="plex"\nurl="http://127.0.0.1:1"\n'
+    '[[players]]\nname="lms"\nkind="lms"\nurl="http://127.0.0.1:1"\n'
+    '[[players]]\nname="navidrome"\nkind="navidrome"\nurl="http://127.0.0.1:1"\n'
+    'history_url="http://127.0.0.1:1"\n'
+    '[[players]]\nname="storage"\nkind="observer"\nurl="http://127.0.0.1:1"\n')
+_rp = dash.HealthSource({"config_file": str(_pc)}).collect()
+_rows = [c for c in _rp["checks"] if c.get("group") == "Sources"]
+check("all four configured players produce a row", len(_rows) == 4,
+      str([c["name"] for c in _rows]))
+for _want in ("plex", "lms", "navidrome", "storage"):
+    check(f"{_want} has a row of its own",
+          any("(%s)" % _want in c["name"] for c in _rows),
+          str([c["name"] for c in _rows]))
+check("an unreachable Plex is a fail that says what PAMTS loses",
+      any(c["state"] == "fail" and "Plex adapter" in c["name"]
+          and "play history" in c["detail"] for c in _rows),
+      str([(c["name"], c["detail"][:60]) for c in _rows]))
+
+# A Plex token that cannot be read is a different fault from Plex being down, and the
+# detail has to distinguish them or the wrong thing gets investigated.
+_pc2 = _h / "plex-notoken.toml"
+_pc2.write_text('[[players]]\nname="plex"\nkind="plex"\n'
+                'url="http://127.0.0.1:1"\ntoken_file="%s/nope-token"\n' % _h)
+_rt = dash.HealthSource({"config_file": str(_pc2)}).collect()
+_prow = [c for c in _rt["checks"] if "Plex adapter" in c["name"]][0]
+check("an unreadable Plex token is reported as the token, not as Plex being down",
+      "token" in _prow["detail"] and _prow["state"] == "fail", _prow["detail"])
 
 # One broken check must not take the panel down with it.
 _boom = dash.HealthSource({})
@@ -646,6 +703,17 @@ check("a check that raises is reported, not fatal",
 check("and the rest of the panel still renders", len(_r5["checks"]) > 1)
 
 check("health is in the source registry", "health" in dash.SOURCES)
+
+# It must NOT also be swept into /api/state: the Now tab has no renderer for it, so it
+# fell through to a raw-JSON card on the front page, and its four systemctl calls were
+# paid on every 5-second poll of a completely different view.
+check("health is excluded from /api/state", dash.HealthSource.in_state is False)
+check("but ordinary sources are still included",
+      all(c.in_state for n, c in dash.SOURCES.items() if n != "health"),
+      str([n for n, c in dash.SOURCES.items() if not c.in_state]))
+_collected, _errs2 = dash.collect_all([dash.HealthSource({})])
+check("collect_all skips it entirely, data and errors both",
+      _collected == {} and _errs2 == {}, f"{_collected} {_errs2}")
 
 # The plugin probes must NOT ride the panel's TTL. The LMS query runs six COUNT(*)s
 # over a couple of hundred thousand rows on a single-threaded server that is also

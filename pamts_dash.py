@@ -36,6 +36,11 @@ class Source(abc.ABC):
     #: How stale this source's data may be before it is collected again. Scanning
     #: a filesystem is expensive; reading an HTTP endpoint is not.
     ttl = 0.0
+    #: Does collect_all() include this source? A source with its own endpoint and its
+    #: own renderer sets this False, so it is not also swept into /api/state -- where
+    #: the Now tab would have no renderer for it and would fall back to dumping it as
+    #: raw JSON, and where its cost would be paid on every poll of a different view.
+    in_state = True
 
     def __init__(self, cfg=None):
         self.cfg = cfg or {}
@@ -525,6 +530,8 @@ class HealthSource(Source):
     """
     name = "health"
     ttl = 10.0
+    #: Served by /api/health alone. See Source.in_state.
+    in_state = False
 
     #: The plugin probes get their OWN, much longer interval. The LMS query runs six
     #: COUNT(*)s over a couple of hundred thousand rows, on a server that is
@@ -759,10 +766,14 @@ class HealthSource(Source):
                      f"play cursors last advanced {_ago(age)} ago - the poller has "
                      "stopped running, whatever systemd reports"),
                     {"age_s": age}, group))
-        for label, path, stale, why in (
-                ("events.db", self.events_db, None,
-                 "transfer and utilisation history for these graphs"),
-                ("observer.db", self.observer_db, 3600,
+        # Age is taken from the NEWEST ROW, not the file's mtime. Both databases are in
+        # WAL mode, where the .db file is only touched at a checkpoint -- so mtime can
+        # read half an hour stale while rows are arriving every second, which is exactly
+        # the wrong way round for a liveness check.
+        for label, path, table, stale, why in (
+                ("events.db", self.events_db, "transfers", None,
+                 "transfer and utilisation history for the graphs"),
+                ("observer.db", self.observer_db, "sessions", 3600,
                  "sessions and play history")):
             if not path:
                 continue
@@ -771,16 +782,30 @@ class HealthSource(Source):
                 continue
             try:
                 size = os.path.getsize(path)
-                age = self._age(path)
-                state = "ok"
-                detail = f"{size / 1e6:.1f} MB, written {_ago(age)} ago"
-                if stale and age is not None and age > stale:
-                    state = "warn"
-                    detail += " - nothing has been written for a while"
-                out.append(self._check(label, state, detail,
-                                       {"bytes": size, "age_s": age}, group))
-            except OSError as e:
-                out.append(self._check(label, "warn", str(e), group=group))
+                for suffix in ("-wal", "-shm"):
+                    if os.path.exists(path + suffix):
+                        size += os.path.getsize(path + suffix)
+                con = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=5)
+                try:
+                    rows, newest = con.execute(
+                        "SELECT COUNT(*), MAX(ts) FROM %s" % table).fetchone()
+                finally:
+                    con.close()
+            except (OSError, sqlite3.Error) as e:
+                out.append(self._check(label, "warn", f"cannot be read: {e}",
+                                       group=group))
+                continue
+            age = (time.time() - newest) if newest else None
+            state, detail = "ok", f"{size / 1e6:.1f} MB, {rows:,} {table}"
+            detail += (f", newest {_ago(age)} ago" if age is not None
+                       else ", none recorded yet")
+            if stale and age is not None and age > stale:
+                state = "warn"
+                detail += " - nothing new for a while"
+            elif not rows:
+                state = "warn"
+            out.append(self._check(label, state, detail,
+                                   {"bytes": size, "rows": rows, "age_s": age}, group))
         return out
 
     def _plugin_checks(self):
@@ -796,17 +821,29 @@ class HealthSource(Source):
         return self._plugins
 
     def _probe_plugins(self):
-        """PAMTS's OWN two plugins. Not the servers that host them.
+        """Can PAMTS get what it needs from each configured source?
 
-        A failure here means PAMTS's component is not answering -- which may be because
-        the host service is down, but this panel reports only on PAMTS's side of it and
-        says so, rather than claiming to monitor Lyrion or Navidrome.
+        ONE ROW PER CONFIGURED PLAYER, whether or not PAMTS ships a plugin for it.
+        An earlier version listed only the two plugins PAMTS provides, which left Plex
+        and the observer adapter missing from a panel whose whole job is "is PAMTS
+        working" -- and PAMTS depending on Plex for every film and episode decision is
+        very much part of whether PAMTS is working.
+
+        What is reported is still PAMTS's SIDE of each integration: can this adapter
+        authenticate, reach its endpoint, and get the data PAMTS asks for. It is not a
+        health check for Plex, Lyrion or Navidrome. Where PAMTS ships the component --
+        the LMS plugin and the Navidrome sidecar -- the row names that component, so a
+        failure points at PAMTS's code rather than someone else's server.
         """
-        out, group = [], "Plugins"
+        out, group = [], "Sources"
         players = self._players()
         for p in players:
             kind = (p.get("kind") or "").lower()
-            if kind == "lms":
+            if kind == "plex":
+                out.append(self._plex_check(p, group))
+            elif kind == "observer":
+                out.append(self._observer_adapter_check(p, group))
+            elif kind == "lms":
                 url = (p.get("url") or "").rstrip("/")
                 if not url:
                     continue
@@ -860,10 +897,86 @@ class HealthSource(Source):
                     {"version": info.get("version"), "played": info.get("played"),
                      "users": users}, group))
         if not out:
-            out.append(self._check("plugins", "unknown",
-                                   "no PAMTS plugin endpoints are configured",
-                                   group=group))
+            out.append(self._check("sources", "unknown",
+                                   "no players are configured", group=group))
         return out
+
+    def _plex_check(self, p, group):
+        """PAMTS reads Plex over its HTTP API with a token -- there is no PAMTS plugin
+        for Plex, which is why this row names the ADAPTER. The probe is the same request
+        the adapter makes, including the token, so it fails if authentication is what is
+        broken rather than only if the server is down."""
+        name = f"Plex adapter ({p.get('name')})"
+        url = (p.get("url") or "").rstrip("/")
+        if not url:
+            return self._check(name, "fail", "no url configured", group=group)
+        token = None
+        tf = p.get("token_file")
+        if tf:
+            try:
+                with open(tf) as f:
+                    token = f.read().strip()
+            except OSError as e:
+                return self._check(
+                    name, "fail",
+                    f"cannot read the token at {tf} ({e}) - PAMTS cannot ask Plex "
+                    "anything without it", group=group)
+            if not token:
+                return self._check(name, "fail", f"the token file {tf} is empty",
+                                   group=group)
+        try:
+            # The token goes in a header, never the query string: a query parameter
+            # ends up in Plex's access log and any proxy's.
+            req = urllib.request.Request(
+                url + "/library/sections",
+                headers={"Accept": "application/json",
+                         **({"X-Plex-Token": token} if token else {})})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                doc = json.loads(r.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                return self._check(
+                    name, "fail",
+                    f"Plex refused the token (HTTP {e.code}) - PAMTS is getting no "
+                    "play history or sessions for film and TV", group=group)
+            return self._check(name, "fail", f"HTTP {e.code} from {url}", group=group)
+        except Exception as e:                                  # noqa: BLE001
+            return self._check(
+                name, "fail",
+                f"could not reach {url}: {e} - PAMTS is getting no play history or "
+                "sessions for film and TV", group=group)
+        secs = ((doc.get("MediaContainer") or {}).get("Directory")) or []
+        titles = [d.get("title") for d in secs if d.get("title")]
+        return self._check(
+            name, "ok" if titles else "warn",
+            (f"authenticated, {len(titles)} library section(s): "
+             + ", ".join(titles[:4]) + ("..." if len(titles) > 4 else ""))
+            if titles else "authenticated, but Plex reports no library sections",
+            {"sections": titles}, group)
+
+    def _observer_adapter_check(self, p, group):
+        """The `observer` player is PAMTS reading its OWN collector, so this row says
+        whether the adapter's endpoint answers and has play history to give. The
+        collector's internals are covered in the Collector group; this is the adapter
+        in front of it."""
+        name = f"Observer adapter ({p.get('name')})"
+        url = (p.get("url") or "").rstrip("/")
+        if not url:
+            return self._check(name, "fail", "no url configured", group=group)
+        try:
+            st = _http_json(url + "/stats", timeout=5)
+        except Exception as e:                                  # noqa: BLE001
+            return self._check(name, "fail",
+                               f"PAMTS's own collector API did not answer: {e}",
+                               group=group)
+        plays = st.get("plays")
+        return self._check(
+            name, "ok" if plays else "warn",
+            (f"{plays:,} observed play(s) available to ranking"
+             if plays else
+             "reachable, but no observed plays recorded yet - this builds up as "
+             "things are played"),
+            {"plays": plays}, group)
 
     def _players(self):
         if not self.config_file or not os.path.exists(self.config_file):
@@ -934,6 +1047,8 @@ def collect_all(sources, force=False):
     """-> (data, errors). One failing source never costs you the others."""
     data, errors = {}, {}
     for s in sources:
+        if not s.in_state:
+            continue
         try:
             if not s.available():
                 errors[s.name] = "unavailable"
