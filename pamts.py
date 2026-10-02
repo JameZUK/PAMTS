@@ -11,9 +11,11 @@ suites override those constants directly.
 """
 
 import fcntl
+import hashlib
 import json
 import logging
 import os
+import shutil
 import sys
 import time
 
@@ -41,6 +43,18 @@ DEFAULTS = {
         # history and graphs. Separate from the observer's database on purpose -- see
         # pamts_events. Set to "" to disable recording entirely.
         "events_db": "/var/lib/pamts/events.db",
+        # Per-player "I have seen plays up to here" cursors. A SEPARATE file from
+        # state.json on purpose: they advance every single pass, and keeping them
+        # beside tens of thousands of observed-play records meant rewriting a
+        # multi-megabyte file every 60 seconds to move three floats. The big file
+        # holds history and changes rarely; this one holds cursors and changes always.
+        "watermarks_file": "/var/lib/pamts/watermarks.json",
+    },
+    "events": {
+        # The store is append-only, so something has to trim it. pamts_events.prune()
+        # existed and documented itself as keeping the store bounded, but nothing ever
+        # called it. 0 disables trimming and keeps everything.
+        "retention_days": 365,
     },
     "tier": {
         "budget_gb": 400,
@@ -120,6 +134,7 @@ TIER = dict(DEFAULTS["tier"])
 PROMOTE = dict(DEFAULTS["promote"])
 PROMOTE_RULES = []        # see load_and_configure / promote_rule
 HISTORY = dict(DEFAULTS["history"])
+EVENTS = dict(DEFAULTS["events"])
 PLAYERS = []        # one config dict per configured player
 ROOTS = {}          # player path -> (fast tier path, slow tier path)
 JOBS = []           # tier and backup jobs
@@ -160,11 +175,13 @@ def configure(raw):
     configuration will move data to the wrong place, so it is far better to refuse to
     start than to guess.
     """
-    global PATHS, TIER, PROMOTE, PROMOTE_RULES, HISTORY, PLAYERS, ROOTS, JOBS
+    global PATHS, TIER, PROMOTE, PROMOTE_RULES, HISTORY, EVENTS
+    global PLAYERS, ROOTS, JOBS
     PATHS = _merge(DEFAULTS["paths"], raw.get("paths"))
     TIER = _merge(DEFAULTS["tier"], raw.get("tier"))
     PROMOTE = _merge(DEFAULTS["promote"], raw.get("promote"))
     HISTORY = _merge(DEFAULTS["history"], raw.get("history"))
+    EVENTS = _merge(DEFAULTS["events"], raw.get("events"))
 
     # Several players may serve the same files -- a music library is commonly served
     # by two or three things at once. Play history is MERGED across them, because an
@@ -618,6 +635,15 @@ def next_up(items, max_items, max_bytes, per_show=1, include_unstarted=None,
 
 
 # ------------------------------------------------------------------------- locking
+def _lock_holder(path):
+    """Whatever the lock file says about its holder, for log messages only."""
+    try:
+        with open(path) as f:
+            return f.read(200).strip() or None
+    except OSError:
+        return None
+
+
 def acquire_lock(path, shared=False, wait_seconds=0):
     """Take the shared lock file. -> the open file object, or None on failure.
 
@@ -632,8 +658,18 @@ def acquire_lock(path, shared=False, wait_seconds=0):
     blocked, and two diagnostics should be able to run at once. Only a real run needs
     exclusivity.
     """
+    def _open_lock():
+        """O_RDWR|O_CREAT, never "w".
+
+        "w" truncates AT OPEN, before flock is even attempted -- so merely trying for
+        the lock would erase the holder's recorded pid, and the diagnostic would always
+        read empty. The file is truncated only once the lock is actually held.
+        """
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        return os.fdopen(fd, "r+")
+
     try:
-        f = open(path, "w")
+        f = _open_lock()
     except OSError as e:
         logging.error(f"cannot open lock file {path}: {e}")
         return None
@@ -676,13 +712,28 @@ def acquire_lock(path, shared=False, wait_seconds=0):
                                   "rather than race")
                     return None
                 try:
-                    f = open(path, "w")
+                    f = _open_lock()
                 except OSError as e:
                     logging.error(f"cannot reopen lock file {path}: {e}")
                     return None
                 continue
             if waited:
                 logging.info("lock acquired after waiting")
+            # Leave a trace of who holds it. "another run holds the lock" was
+            # undiagnosable without this: the file was always empty, so there was
+            # nothing to tell a live holder from a crashed one. Written AFTER the
+            # lock is held, so it can never be mistaken for a claim.
+            if not shared:
+                try:
+                    f.seek(0)
+                    f.truncate(0)
+                    f.write("pid %d %s %s\n" % (
+                        os.getpid(),
+                        os.path.basename(sys.argv[0] or "?"),
+                        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
+                    f.flush()
+                except OSError:
+                    pass          # a lock that cannot be annotated is still a lock
             return f
         except OSError:
             if time.time() >= deadline:
@@ -691,35 +742,163 @@ def acquire_lock(path, shared=False, wait_seconds=0):
                                   "another run is still going")
                 return None
             if not waited:
-                logging.info(f"another run holds the lock; waiting up to {wait_seconds}s")
+                logging.info("another run holds the lock (%s); waiting up to %ss",
+                             _lock_holder(path) or "no holder recorded", wait_seconds)
                 waited = True
             time.sleep(2)
 
 
 # ------------------------------------------------------------------------ state
+#: Set when the state file existed but could not be parsed. save_state refuses to
+#: overwrite the file in that case, because the file IS the history.
+_state_corrupt = False
+
+
 def load_state():
+    """Read state.json. A missing file is normal; an unreadable one is not.
+
+    These were the same branch, and they are not the same event. state.json holds
+    every promotion-protection record AND PAMTS's own observed play history -- tens of
+    thousands of records that exist nowhere else. Treating a parse failure as "fresh
+    install" silently discarded all of it, and the next save overwrote the only copy
+    with the empty dict, so the loss was unrecoverable and unannounced.
+    """
+    global _state_corrupt
+    _state_corrupt = False
+    path = PATHS["state_file"]
     try:
-        with open(PATHS["state_file"]) as f:
+        with open(path) as f:
             s = json.load(f)
-            s.setdefault("promotions", {})
-            return s
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return {"promotions": {}}           # first run: nothing to lose
+    except (OSError, ValueError) as e:
+        _state_corrupt = True
+        logging.error(
+            "%s exists but could not be read (%s). This file holds every promotion "
+            "protection and all observed play history. Treating it as EMPTY for this "
+            "run, and REFUSING to overwrite it so it can be recovered or inspected; "
+            "a .corrupt copy has been kept. Eviction will refuse any pool this leaves "
+            "without demand data.", path, e)
+        try:
+            keep = path + ".corrupt"
+            if not os.path.exists(keep):
+                shutil.copy2(path, keep)
+                logging.error("kept the unreadable file as %s", keep)
+        except OSError as e2:
+            logging.error("could not preserve a copy of %s: %s", path, e2)
         return {"promotions": {}}
+    if not isinstance(s, dict):
+        _state_corrupt = True
+        logging.error("%s does not contain an object (got %s); refusing to overwrite "
+                      "it", path, type(s).__name__)
+        return {"promotions": {}}
+    s.setdefault("promotions", {})
+    return s
 
 
-def save_state(state, dry_run):
+def state_fingerprint(state):
+    """A cheap identity for "has this state changed". Used to skip no-op writes."""
+    return hashlib.sha256(
+        json.dumps(state, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def save_state(state, dry_run, previous=None):
+    """Write state.json atomically and durably, and only if it changed.
+
+    TWO things this now avoids.
+
+    Pointless writes. The promotion poller runs every 60 seconds and saved every
+    time, so a 4.6 MB file was rewritten 1,440 times a day -- about 6.5 GB of writes
+    to the cache SSD to persist, almost always, nothing at all. `previous` is a
+    fingerprint from load_state's value; matching it means there is nothing to do.
+
+    Losing the file to a crash. os.replace is atomic in ORDERING but says nothing
+    about durability: without fsync the rename can reach the disk while the data has
+    not, leaving a truncated or empty state.json -- and that file is the only copy of
+    PAMTS's observed play history. The data is fsynced before the rename and the
+    directory after it, which is what actually makes the swap survive a power cut.
+    """
     if dry_run:
-        return
+        return False
+    if _state_corrupt:
+        logging.warning("not writing state: the existing file could not be parsed and "
+                        "overwriting it would destroy whatever is still in it")
+        return False
+    if previous is not None and state_fingerprint(state) == previous:
+        return False
+    path = PATHS["state_file"]
     try:
-        d = os.path.dirname(PATHS["state_file"])
+        d = os.path.dirname(path)
         if d:
             os.makedirs(d, exist_ok=True)
-        tmp = PATHS["state_file"] + ".tmp"
+        tmp = path + ".tmp"
         with open(tmp, "w") as f:
             json.dump(state, f, indent=1, sort_keys=True)
-        os.replace(tmp, PATHS["state_file"])
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        if d:
+            # The rename itself needs the directory synced, or the old name can come
+            # back after a crash.
+            fd = os.open(d, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        return True
     except OSError as e:
-        logging.error(f"could not write state {PATHS['state_file']}: {e}")
+        logging.error(f"could not write state {path}: {e}")
+        return False
+
+
+def load_watermarks(state=None):
+    """Per-player play cursors. -> {player name: epoch}.
+
+    Migrates transparently: if the dedicated file does not exist yet, the cursors are
+    taken from state.json, where they used to live. Losing them is not dangerous -- a
+    missing cursor is re-baselined to now, exactly as on a first run -- so a read error
+    is not worth refusing to run over.
+    """
+    path = PATHS.get("watermarks_file")
+    if path:
+        try:
+            with open(path) as f:
+                got = json.load(f)
+            if isinstance(got, dict):
+                return {k: float(v) for k, v in got.items()
+                        if isinstance(v, (int, float))}
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError) as e:
+            logging.warning("could not read %s (%s); re-baselining play cursors", path, e)
+            return {}
+    inherited = (state or {}).get("watermarks")
+    if isinstance(inherited, dict):
+        logging.info("adopting play cursors from state.json into %s", path)
+        return {k: float(v) for k, v in inherited.items()
+                if isinstance(v, (int, float))}
+    return {}
+
+
+def save_watermarks(marks, dry_run):
+    """Write the cursors. Small, atomic, durable -- and cheap enough to do every pass."""
+    path = PATHS.get("watermarks_file")
+    if dry_run or not path:
+        return False
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(marks, f, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except OSError as e:
+        logging.error("could not write %s: %s", path, e)
+        return False
 
 
 def prune_state(state, now):

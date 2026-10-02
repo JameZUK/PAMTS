@@ -215,7 +215,10 @@ def do_backup(job, dry_run):
     # purely to learn the answer is "not zero" -- and rsync is about to walk it again.
     # One scandir entry settles it.
     try:
-        empty = not any(os.scandir(src))
+        # `with`, because os.scandir holds a directory fd that any() does not close --
+        # the previous version leaked one per backup job and emitted a ResourceWarning.
+        with os.scandir(src) as entries:
+            empty = not any(entries)
     except OSError as e:
         logging.error(f"[{name}] cannot read source {src}: {e} - refusing to run.")
         return False
@@ -329,11 +332,12 @@ def gather_views(jobs):
 
     This sweeps every configured player, which is the expensive part of a tiering run
     and produces a result that does not depend on which group is being evicted. It
-    therefore must not be repeated per group. Returns (views, items, hist_ok), or None
-    if there is no usable signal at all, in which case the caller must not evict.
+    therefore must not be repeated per group. Returns
+    (views, items, hist_ok, plays, failed), or None if there is no usable signal at
+    all, in which case the caller must not evict.
     """
     players = pamts_players.build_all(pamts.PLAYERS)
-    items, hist_ok = pamts_players.sweep(players)
+    items, hist_ok, failed = pamts_players.sweep(players)
     views = {it["fast"]: it["last_viewed"] for it in items if it.get("last_viewed")}
     plays = {it["fast"]: it["play_count"] for it in items if it.get("play_count")}
 
@@ -366,11 +370,29 @@ def gather_views(jobs):
                         "session-only players, and improves as history accumulates.")
     logging.info(f"[tier] view data: {len(views)} played item(s), "
                  f"{len(plays)} with a play count")
-    return views, items, hist_ok, plays
+    return views, items, hist_ok, plays, failed
+
+
+def covering_signal(jobs, *maps):
+    """How many demand records fall inside THIS pool's own sources.
+
+    hist_ok is one estate-wide flag, but eviction decides per budget pool, and the
+    two are not the same question. If the music history sources fail while Plex
+    answers, hist_ok is True and music would be ranked -- and evicted -- with no
+    play data of its own. This counts the signal that actually covers a pool so the
+    refusal can be scoped to the pool that lost it.
+    """
+    roots = [j["source"].rstrip("/") for j in jobs if j.get("source")]
+    n = 0
+    for m in maps:
+        for key in (m or {}):
+            if any(key == r or key.startswith(r + os.sep) for r in roots):
+                n += 1
+    return n
 
 
 def do_tier(jobs, budget, dry_run, views=_FETCH, pins=None, items=None,
-            hist_ok=True, pool=None, plays=None):
+            hist_ok=True, pool=None, plays=None, failed=()):
     now = time.time()
     protected = pamts.protected_now(now)
     if protected:
@@ -380,7 +402,7 @@ def do_tier(jobs, budget, dry_run, views=_FETCH, pins=None, items=None,
         got = gather_views(jobs)
         if got is None:
             return False
-        views, items, hist_ok, plays = got
+        views, items, hist_ok, plays, failed = got
 
     # Pins are per group: both the depth and the headroom it is derived from are
     # relative to THIS group's budget and footprint, not the estate's.
@@ -433,6 +455,34 @@ def do_tier(jobs, budget, dry_run, views=_FETCH, pins=None, items=None,
     if footprint <= target:
         logging.info("[tier] under budget - nothing to evict, destination not touched")
         return True
+
+    # A pool is about to lose content. If a history source FAILED this run and this
+    # pool has no demand data of its own, refuse -- this pool specifically, not the
+    # whole estate.
+    #
+    # The estate-wide hist_ok is the wrong granularity: it is true as soon as ANY
+    # adapter answers, so Plex answering for TV would license evicting music whose own
+    # two sources had both failed, ranking every album as never-played.
+    #
+    # Both conditions are needed. A pool with no records and NO failure is the ordinary
+    # case of content nobody has played yet; eviction on mtime is the intended
+    # behaviour there, with the grace and settle windows protecting what is new. It is
+    # only the combination -- something broke, and what broke is what covered this pool
+    # -- that makes zero records a measurement failure rather than a measurement.
+    covered = covering_signal(jobs, views, plays)
+    if failed and not covered:
+        logging.error(
+            "[tier] %s: over budget by %s, but history was unavailable from %s and NOT "
+            "ONE demand record covers this pool's sources - REFUSING to evict it. "
+            "Ranking it now would treat every item as never-played and evict the most "
+            "recently played content first. Being over budget for another cycle costs "
+            "nothing; evicting on a failed measurement costs a spin-up per mistake.",
+            pool or "shared", human(footprint - target), ", ".join(failed))
+        return False
+    if failed:
+        logging.warning("[tier] %s: history unavailable from %s, but %d demand "
+                        "record(s) still cover this pool - continuing",
+                        pool or "shared", ", ".join(failed), covered)
 
     settle = int(pamts.TIER["settle_seconds"])
     grace_days = int(pamts.TIER["new_grace_days"])
@@ -543,6 +593,26 @@ def do_tier(jobs, budget, dry_run, views=_FETCH, pins=None, items=None,
         keep = (f", keeping {len(c['pinned_rels'])} pinned item(s)"
                 if c["pinned_rels"] else "")
         logging.info(f"[tier]   {c['rel']} {human(c['evictable'])} ({when}){keep}")
+        # RE-CHECK, immediately before moving this one. Candidate selection happened
+        # once, and a full eviction pass runs for hours -- 3.1 TB took most of a night.
+        # A download that STARTED after selection, into a directory already chosen, was
+        # not reconsidered: rsync --remove-source-files would move the partial file and
+        # unlink it while the downloader still held the fd, so the download continued
+        # into an unlinked inode and finished as nothing.
+        fresh = scan_dir(c["path"])
+        if fresh["inprogress"]:
+            logging.warning(f"[tier] skipping {c['rel']}: an in-progress download "
+                            "marker appeared since candidates were chosen")
+            continue
+        # time.time(), deliberately, not the `now` captured when this pass began:
+        # that value can be hours old by the time the last candidate is reached, which
+        # is the very staleness this re-check exists to catch.
+        age = time.time() - fresh["mtime"]
+        if age < settle:
+            logging.warning(f"[tier] skipping {c['rel']}: written {int(age)}s ago, "
+                            f"inside the {settle}s settle window (it was not when "
+                            "candidates were chosen)")
+            continue
         try:
             os.makedirs(c["dst"], exist_ok=True)
         except OSError as e:
@@ -615,6 +685,14 @@ def main():
     # Telemetry only, and fail-safe: if the store cannot be opened, recording becomes a
     # no-op rather than taking the run down with it.
     pamts_events.configure(None if args.dry_run else pamts.PATHS.get("events_db"))
+    # The store is append-only, so trim it here. prune() existed and documented itself
+    # as keeping the store bounded, and nothing had ever called it.
+    _keep = int(pamts.EVENTS.get("retention_days") or 0)
+    if _keep > 0:
+        _gone = pamts_events.prune(_keep)
+        if _gone:
+            logging.info("[events] pruned %d row(s) older than %d day(s)",
+                         _gone, _keep)
     budget_gb = args.budget_gb if args.budget_gb is not None else pamts.TIER["budget_gb"]
 
     # Scheduled work waits rather than abandoning its run: losing a race with the
@@ -651,7 +729,7 @@ def main():
         if gathered is None:
             failures += 1
         else:
-            views, items, hist_ok, plays = gathered
+            views, items, hist_ok, plays, failed = gathered
             for gb, grp, is_own in budget_groups(tier_jobs, budget_gb):
                 names = ", ".join(j["name"] for j in grp)
                 logging.info(f"[tier] ----- group [{names}]: budget {gb:g} GB "
@@ -659,7 +737,7 @@ def main():
                 pool_name = grp[0]["name"] if is_own else "__shared__"
                 if not do_tier(grp, int(gb * pamts.GB), args.dry_run,
                                views=views, pins=None, items=items, hist_ok=hist_ok,
-                               pool=pool_name, plays=plays):
+                               pool=pool_name, plays=plays, failed=failed):
                     failures += 1
     for j in [j for j in jobs if j["mode"] == "backup"]:
         if not do_backup(j, args.dry_run):

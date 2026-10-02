@@ -431,7 +431,7 @@ def it_(fast_p, viewed, show="Alb", ep=1, size=100):
 
 a = HistPlayer("appA", [it_("/f/one", 1000), it_("/f/two", 5000)])
 b = HistPlayer("appB", [it_("/f/one", 9000), it_("/f/three", 100)])
-items, ok = tier.pamts_players.sweep([a, b])
+items, ok, _f = tier.pamts_players.sweep([a, b])
 byfast = {i["fast"]: i["last_viewed"] for i in items}
 check("at least one player supplied history", ok is True)
 check("all distinct items are present", set(byfast) == {"/f/one", "/f/two", "/f/three"},
@@ -447,10 +447,10 @@ class SessionOnly(HistPlayer):
     provides_history = False
 
 
-items, ok = tier.pamts_players.sweep([SessionOnly("lmslike", [])])
+items, ok, _f = tier.pamts_players.sweep([SessionOnly("lmslike", [])])
 check("no history provider means ok is False", ok is False)
 check("and no items", items == [], str(items))
-items, ok = tier.pamts_players.sweep([SessionOnly("lmslike", []), a])
+items, ok, _f = tier.pamts_players.sweep([SessionOnly("lmslike", []), a])
 check("a mixed set still reports ok from the provider that worked", ok is True)
 check("and yields that provider's items", len(items) == 2, str(len(items)))
 
@@ -1316,6 +1316,210 @@ check("a positive budget_gb on a tier job is accepted", e is None, repr(e))
 check("and it is stored as a float on the job",
       pamts.JOBS and pamts.JOBS[0].get("budget_gb") == 800.0,
       repr(pamts.JOBS[0] if pamts.JOBS else None))
+
+
+# ======================================================== per-pool history coverage
+# hist_ok is one estate-wide flag; eviction decides per budget pool. "Plex answered"
+# must not license evicting music whose own two sources both failed.
+print("\n=== COVERAGE: a pool is not evicted on another pool's history")
+
+_cv = pathlib.Path(tempfile.mkdtemp(prefix="pamts-cover-"))
+_music = _cv / "cache" / "music"
+_tv = _cv / "cache" / "tv"
+for _d in (_music, _tv):
+    _d.mkdir(parents=True)
+_jobs_music = [{"name": "music", "mode": "tier", "source": str(_music),
+                "dest": str(_cv / "slow" / "music")}]
+_jobs_tv = [{"name": "tv", "mode": "tier", "source": str(_tv),
+             "dest": str(_cv / "slow" / "tv")}]
+
+_views = {str(_tv / "Show" / "e01.mkv"): 1700000000}
+check("a view under the pool's own source counts",
+      tier.covering_signal(_jobs_tv, _views) == 1,
+      str(tier.covering_signal(_jobs_tv, _views)))
+check("the SAME view does not count for a different pool",
+      tier.covering_signal(_jobs_music, _views) == 0,
+      "this is the whole point: TV history is not music history")
+check("plays and views are both counted",
+      tier.covering_signal(_jobs_tv, _views,
+                           {str(_tv / "Show" / "e02.mkv"): 3}) == 2)
+check("a path that merely shares a prefix string does not count",
+      tier.covering_signal([{"name": "x", "source": str(_cv / "cache" / "mus")}],
+                           _views) == 0,
+      "prefix matching must be on path components, not characters")
+check("no maps at all is no coverage", tier.covering_signal(_jobs_tv) == 0)
+
+# Now the decision itself. One album, old enough to evict, in a pool over budget.
+_alb = _music / "Band" / "Album"
+_alb.mkdir(parents=True)
+(_alb / "01.flac").write_bytes(b"x" * 4096)
+_old = time.time() - 400 * 86400
+os.utime(_alb / "01.flac", (_old, _old))
+(_cv / "slow" / "music").mkdir(parents=True)
+_mjobs = [{"name": "music", "mode": "tier", "source": str(_music),
+           "dest": str(_cv / "slow" / "music")}]
+pamts.TIER["dest_fstypes"] = []
+tier.REQUIRE_DEST_MOUNT = False
+
+
+def _evicts(**kw):
+    """-> (do_tier returned ok, is the album still on the fast tier)"""
+    rc = tier.do_tier(_mjobs, 1, True, views=kw.pop("views", {}), pins={}, items=[],
+                      plays={}, pool="music", **kw)
+    return rc, (_alb / "01.flac").exists()
+
+
+# 1. A source failed AND nothing covers this pool -> refuse.
+_rc, _still = _evicts(failed=["navidrome", "lms"])
+check("with a failed source and NO coverage, the pool refuses to evict",
+      _rc is False, f"do_tier returned {_rc}")
+
+# 2. A source failed but this pool still has data -> proceed. Degraded, not blind.
+_rc2, _ = _evicts(views={str(_alb / "01.flac"): 1700000000}, failed=["lms"])
+check("with a failed source but coverage of its own, the pool proceeds",
+      _rc2 is True, f"do_tier returned {_rc2}")
+
+# 3. NOTHING failed and nothing is covered -> proceed. This is the ordinary case of
+#    content nobody has played yet, and refusing it would break eviction for every
+#    new library. An earlier version of this guard did exactly that.
+_rc3, _ = _evicts(failed=[])
+check("with no failure, zero coverage still evicts on mtime as it always has",
+      _rc3 is True,
+      "a pool nobody has played yet is a measurement, not a measurement failure")
+
+shutil.rmtree(_cv, ignore_errors=True)
+
+
+# =============================================================== state durability
+print("\n=== STATE: the file that holds all observed history")
+_st = pathlib.Path(tempfile.mkdtemp(prefix="pamts-state-"))
+pamts.PATHS["state_file"] = str(_st / "state.json")
+
+_s = {"promotions": {}, "observed": {"/a/b.flac": 111}}
+check("a first save writes", pamts.save_state(_s, False) is True)
+check("and lands valid JSON",
+      __import__("json").load(open(pamts.PATHS["state_file"]))["observed"]
+      == {"/a/b.flac": 111})
+check("no .tmp is left behind", not os.path.exists(pamts.PATHS["state_file"] + ".tmp"))
+
+# The write-amplification fix: the poller runs 1,440 times a day and saved every time.
+_fp = pamts.state_fingerprint(_s)
+_before = os.stat(pamts.PATHS["state_file"]).st_mtime_ns
+check("an unchanged save is skipped entirely",
+      pamts.save_state(_s, False, previous=_fp) is False)
+check("and the file is not touched at all",
+      os.stat(pamts.PATHS["state_file"]).st_mtime_ns == _before,
+      "same fingerprint must mean no write, not a rewrite of identical bytes")
+_s["observed"]["/c/d.flac"] = 222
+check("a changed state DOES write",
+      pamts.save_state(_s, False, previous=_fp) is True,
+      "the skip must not swallow real changes")
+
+# A corrupt file must not be silently replaced by an empty one. It is the only copy.
+open(pamts.PATHS["state_file"], "w").write("{this is not json")
+_loaded = pamts.load_state()
+check("a corrupt state file loads as empty for this run",
+      _loaded == {"promotions": {}}, str(_loaded))
+check("and is flagged as corrupt", pamts._state_corrupt is True)
+check("a copy is preserved for recovery",
+      os.path.exists(pamts.PATHS["state_file"] + ".corrupt"))
+check("and saving REFUSES, rather than overwriting the only copy",
+      pamts.save_state({"promotions": {}}, False) is False)
+check("so the unreadable content is still there",
+      "{this is not json" in open(pamts.PATHS["state_file"]).read(),
+      "overwriting it would destroy whatever was still recoverable")
+
+# A MISSING file is not corruption -- that is just a first run, and must still work.
+os.remove(pamts.PATHS["state_file"])
+os.remove(pamts.PATHS["state_file"] + ".corrupt")
+_fresh = pamts.load_state()
+check("a missing state file is a normal first run",
+      _fresh == {"promotions": {}} and pamts._state_corrupt is False)
+check("and saving works again", pamts.save_state({"promotions": {}}, False) is True)
+check("a dry run never writes",
+      pamts.save_state({"promotions": {"x": {}}}, True) is False)
+
+# Cursors live apart from the history, which is what makes the skip above effective:
+# they advance EVERY pass, so while they shared the file nothing was ever unchanged.
+print("\n=== STATE: play cursors are a separate, small file")
+pamts.PATHS["watermarks_file"] = str(_st / "watermarks.json")
+check("cursors migrate out of an old state.json",
+      pamts.load_watermarks({"watermarks": {"plex": 100.0}}) == {"plex": 100.0})
+check("writing them succeeds", pamts.save_watermarks({"plex": 200.0, "lms": 1.5}, False))
+check("and reading back prefers the dedicated file over state.json",
+      pamts.load_watermarks({"watermarks": {"plex": 100.0}})
+      == {"plex": 200.0, "lms": 1.5},
+      str(pamts.load_watermarks({"watermarks": {"plex": 100.0}})))
+check("the cursor file is small enough to write every minute",
+      os.path.getsize(pamts.PATHS["watermarks_file"]) < 4096,
+      f"{os.path.getsize(pamts.PATHS['watermarks_file'])} bytes")
+check("a dry run does not write cursors either",
+      pamts.save_watermarks({"plex": 999.0}, True) is False)
+check("so the file is unchanged",
+      pamts.load_watermarks()["plex"] == 200.0)
+# A corrupt or absent cursor file re-baselines; it must never raise, because a lost
+# cursor is harmless (the next pass adopts `now`, exactly as on a first run).
+open(pamts.PATHS["watermarks_file"], "w").write("not json")
+check("a corrupt cursor file re-baselines rather than raising",
+      pamts.load_watermarks() == {})
+os.remove(pamts.PATHS["watermarks_file"])
+check("and a missing one with no state to inherit is empty",
+      pamts.load_watermarks() == {})
+
+# The property that motivated all of this: a state dict carrying no cursors is stable
+# across passes, so the fingerprint skip actually fires.
+_s2 = {"promotions": {}, "observed": {"/x": 1}}
+check("a cursor-free state is byte-stable across passes",
+      pamts.state_fingerprint(_s2) == pamts.state_fingerprint(dict(_s2)),
+      "if cursors were still in here this would differ every pass")
+shutil.rmtree(_st, ignore_errors=True)
+
+
+# ===================================================================== the lock file
+print("\n=== LOCK: who holds it is recorded, and contending does not erase it")
+_lk = pathlib.Path(tempfile.mkdtemp(prefix="pamts-lock-"))
+_lkf = str(_lk / "p.lock")
+_held = pamts.acquire_lock(_lkf)
+check("the lock is taken", _held is not None)
+check("and names its holder",
+      ("pid %d" % os.getpid()) in open(_lkf).read(), repr(open(_lkf).read()))
+# The trap this replaced: open(path,"w") truncates AT OPEN, so merely contending wiped
+# the holder's record and the diagnostic always read empty.
+_second = pamts.acquire_lock(_lkf)
+check("a second exclusive attempt fails", _second is None)
+check("and the holder's record SURVIVES the attempt",
+      ("pid %d" % os.getpid()) in open(_lkf).read(),
+      "a contender must not truncate the file it failed to lock")
+check("_lock_holder can report it", "pid" in (pamts._lock_holder(_lkf) or ""))
+_held.close()
+check("after release it can be taken again", pamts.acquire_lock(_lkf) is not None)
+shutil.rmtree(_lk, ignore_errors=True)
+
+
+# ============================================================= the event store bound
+print("\n=== EVENTS: the append-only store is actually trimmed")
+_ev = pathlib.Path(tempfile.mkdtemp(prefix="pamts-events-"))
+import pamts_events                                              # noqa: E402
+pamts_events.configure(str(_ev / "events.db"))
+check("retention has a configured default",
+      int(pamts.DEFAULTS["events"]["retention_days"]) > 0,
+      str(pamts.DEFAULTS["events"].get("retention_days")))
+_now = time.time()
+pamts_events.record_transfer("evict", "new", 10, 1.0)
+import sqlite3 as _s3
+_c = _s3.connect(str(_ev / "events.db"))
+_c.execute("INSERT INTO transfers(ts,kind,item,bytes) VALUES(?,?,?,?)",
+           (_now - 500 * 86400, "evict", "ancient", 10))
+_c.execute("INSERT INTO samples(ts,pool,footprint,budget) VALUES(?,?,?,?)",
+           (_now - 500 * 86400, "music", 1, 2))
+_c.commit(); _c.close()
+_gone = pamts_events.prune(365)
+check("prune removes rows past the window", _gone == 2, f"removed {_gone}")
+_left = _s3.connect(str(_ev / "events.db")).execute(
+    "SELECT item FROM transfers").fetchall()
+check("and keeps the recent one", _left == [("new",)], str(_left))
+check("pruning again removes nothing", pamts_events.prune(365) == 0)
+shutil.rmtree(_ev, ignore_errors=True)
 
 
 summary()

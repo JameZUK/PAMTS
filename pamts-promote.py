@@ -308,7 +308,7 @@ def do_next_up(players, budget, budget_left, footprint, state, stats, now, dry_r
     Not speculative in the way film prefetch would be: "the next unwatched episode of
     a series you are part-way through" is the strongest predictor there is.
     """
-    items, hist_ok = pamts_players.sweep(players)
+    items, hist_ok, _failed = pamts_players.sweep(players)
     if not items:
         logging.error("[next-up] no library data from any player that provides history")
         return 1
@@ -408,6 +408,9 @@ def main():
     # Telemetry only, and fail-safe: if the store cannot be opened, recording becomes a
     # no-op rather than taking the run down with it.
     pamts_events.configure(None if args.dry_run else pamts.PATHS.get("events_db"))
+    # Trimming the event store is pamts-tier's job, not this one's: this runs every
+    # 60 seconds and a DELETE that matches nothing still opens a write transaction,
+    # so pruning here would be 1,440 needless ones a day.
     if args.simulate_recent and not args.dry_run:
         logging.error("--simulate-recent is a validation aid and requires --dry-run")
         return 2
@@ -458,6 +461,15 @@ def main():
         return 0
 
     state = pamts.load_state()
+    # Fingerprint as loaded. Every save below passes it, so a pass that changes
+    # nothing -- which is almost every one of the 1,440 a day -- does not rewrite a
+    # multi-megabyte file to say so.
+    state0 = pamts.state_fingerprint(state)
+    # Cursors live in their own small file (see pamts.load_watermarks). They advance
+    # every pass by definition, so keeping them in state.json meant state.json changed
+    # every pass, which is what defeated the no-op skip above.
+    marks = pamts.load_watermarks(state)
+    state.pop("watermarks", None)
     dropped = pamts.prune_state(state, now)
     if dropped:
         logging.info(f"released {dropped} expired protection record(s)")
@@ -477,7 +489,8 @@ def main():
                         args.dry_run)
         record_rate(state, stats)
         pamts.prune_observed(state, now)
-        pamts.save_state(state, args.dry_run)
+        pamts.save_watermarks(marks, args.dry_run)
+        pamts.save_state(state, args.dry_run, previous=state0)
         return rc
 
     # Ask every player what is playing, keeping each event paired with the adapter that
@@ -485,10 +498,18 @@ def main():
     # one. Several players may be serving different things at the same time.
     pairs, rc = [], 0
     for pl in players:
-        if not pl.provides_sessions:
-            continue
+        # available() FIRST, then the capability flag. An adapter may only discover what
+        # it can do by asking the server -- Navidrome in history-only mode turns
+        # provides_sessions off inside available() -- so reading the flag first sees its
+        # optimistic initial value. That ordering made this loop call now_playing() on an
+        # adapter with no credentials, which raised KeyError('username') and set rc=1, so
+        # pamts-promote.service exited 1 on EVERY one of its 1,440 daily runs. It was
+        # invisible because promotion still worked for the players that did answer.
+        # sweep() already does this in the right order and has a test saying why.
         if not pl.available():
             rc = 1
+            continue
+        if not pl.provides_sessions:
             continue
         try:
             evs = (pl.simulate_recent(args.simulate_count) if args.simulate_recent
@@ -504,7 +525,6 @@ def main():
         # server- and role-dependent). It also catches plays that happened between
         # runs, which a session poll inevitably misses.
         if not args.simulate_recent:
-            marks = state.setdefault("watermarks", {})
             mark = marks.get(pl.name)
             if mark is None:
                 # First sight of this player: adopt now as the baseline. Without this,
@@ -534,7 +554,8 @@ def main():
 
     if not pairs:
         pamts.prune_observed(state, now)
-        pamts.save_state(state, args.dry_run)
+        pamts.save_watermarks(marks, args.dry_run)
+        pamts.save_state(state, args.dry_run, previous=state0)
         return rc
     if args.simulate_recent:
         logging.warning("SIMULATED events - nothing will be promoted")
@@ -618,7 +639,8 @@ def main():
             rc = 1
     record_rate(state, stats)
     pamts.prune_observed(state, now)
-    pamts.save_state(state, args.dry_run)
+    pamts.save_watermarks(marks, args.dry_run)
+    pamts.save_state(state, args.dry_run, previous=state0)
     logging.info(f"promoted {human(promoted)} this pass")
     return rc
 

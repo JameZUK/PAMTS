@@ -140,6 +140,36 @@ class StateSource(Source):
         }
 
 
+#: Settings the dashboard may publish verbatim. Everything here is policy -- sizes,
+#: counts, windows -- and none of it is a secret. Anything NOT listed is reported as
+#: present-but-withheld rather than printed, so adding a key to the config can never
+#: silently publish it.
+TIER_PUBLIC = frozenset((
+    "budget_gb", "settle_seconds", "new_grace_days", "promote_protect_days",
+    "next_up_max_items", "next_up_max_gb", "next_up_include_unstarted",
+    "next_up_unstarted_days", "next_up_unstarted_max", "pin_depth_max",
+    "dest_fstypes", "inprogress_suffixes", "sidecar_suffixes",
+))
+PROMOTE_PUBLIC = frozenset((
+    "headroom_gb", "headroom_fraction", "max_items", "max_bytes_gb", "min_free_gb",
+    "min_event_items", "min_event_bytes_gb", "poll_seconds", "default_rate_mbps",
+    "rate_alpha", "time_safety",
+))
+
+#: What a withheld value is replaced with.
+WITHHELD = "(not published)"
+
+
+def _publishable(table, allowed, skip=()):
+    """Copy only allow-listed keys; name the rest without their values."""
+    out = {}
+    for k, v in (table or {}).items():
+        if k in skip:
+            continue
+        out[k] = v if k in allowed else WITHHELD
+    return out
+
+
 class ConfigSource(Source):
     """What PAMTS has been told to manage: budget, jobs, roots."""
     name = "config"
@@ -181,8 +211,14 @@ class ConfigSource(Source):
             "player_names": [p.get("name") or p.get("kind")
                              for p in (raw.get("players") or [])],
             "promote_rules": promote.get("rules") or [],
-            "tier_settings": {k: v for k, v in tier.items()},
-            "promote_settings": {k: v for k, v in promote.items() if k != "rules"},
+            # ALLOW-listed, not pass-through. This endpoint exists to be read by
+            # other people, and forwarding whole TOML tables means any key added to
+            # [tier] or [promote] later is published by default -- including one
+            # holding a credential. `players` was already narrowed this way; these
+            # two were not. Unknown keys are reported by NAME only, so a new setting
+            # is still visible without its value being broadcast.
+            "tier_settings": _publishable(tier, TIER_PUBLIC),
+            "promote_settings": _publishable(promote, PROMOTE_PUBLIC, skip=("rules",)),
             "roots": len(raw.get("roots") or []),
             "root_map": [{"player_path": r.get("player_path"), "fast": r.get("fast"),
                           "slow": r.get("slow")} for r in (raw.get("roots") or [])],
@@ -433,11 +469,23 @@ class EventsSource(Source):
 
             # Utilisation: the latest sample in each bucket, per pool. Latest rather
             # than averaged, because it is a level, not a flow.
+            #
+            # Written as an explicit join on the per-bucket MAX(ts). The previous form
+            # was `GROUP BY 1,2 HAVING ts = MAX(ts)` with footprint and budget as bare
+            # columns -- SQLite only promises those come from the row holding the
+            # extreme when the min/max is in the SELECT list, and here it was in HAVING,
+            # so the chart could plot an arbitrary sample from the bucket instead of
+            # the latest one.
             util = {}
             for pool, bucket, fp, bud in con.execute(
-                    "SELECT pool, CAST((ts - ?) / ? AS INTEGER), footprint, budget "
-                    "FROM samples WHERE ts > ? "
-                    "GROUP BY 1, 2 HAVING ts = MAX(ts)", (since, width, since)):
+                    "SELECT s.pool, CAST((s.ts - ?) / ? AS INTEGER) AS b, "
+                    "       s.footprint, s.budget "
+                    "FROM samples s JOIN ("
+                    "  SELECT pool, CAST((ts - ?) / ? AS INTEGER) AS b, MAX(ts) AS mts "
+                    "  FROM samples WHERE ts > ? GROUP BY pool, b"
+                    ") m ON m.pool = s.pool AND m.mts = s.ts "
+                    "WHERE s.ts > ?",
+                    (since, width, since, width, since, since)):
                 row = util.setdefault(pool, [None] * (buckets + 1))
                 row[min(int(bucket), buckets)] = {"footprint": fp, "budget": bud}
 

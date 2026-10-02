@@ -22,6 +22,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import pamts_dash as dash                                       # noqa: E402
+import pamts_events                                             # noqa: E402
 from _harness import check, summary                             # noqa: E402
 
 tmp = tempfile.mkdtemp()
@@ -493,4 +494,68 @@ _eo2 = dash.EventsSource({"events_db": os.path.join(tmp, "nope.db")})
 check("a missing events db is unavailable, not an error", _eo2.available() is False)
 
 srv.shutdown(); shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ===================================================== what the dashboard publishes
+print("\n=== CONFIG: settings are allow-listed, not forwarded wholesale")
+_pub = dash._publishable(
+    {"budget_gb": 400, "settle_seconds": 3600, "something_new_token": "s3cret"},
+    dash.TIER_PUBLIC)
+check("an allow-listed setting is published", _pub["budget_gb"] == 400, str(_pub))
+check("an UNKNOWN key's value is withheld",
+      _pub["something_new_token"] == dash.WITHHELD, str(_pub))
+check("but its name is still shown, so the setting is not hidden",
+      "something_new_token" in _pub,
+      "a reader should see that a setting exists without being told its value")
+check("skip= drops a key entirely",
+      "rules" not in dash._publishable({"rules": [1], "max_items": 2},
+                                             dash.PROMOTE_PUBLIC,
+                                             skip=("rules",)))
+check("no secret-looking key is on either allow-list",
+      not [k for k in (dash.TIER_PUBLIC | dash.PROMOTE_PUBLIC)
+           if any(w in k for w in ("token", "pass", "secret", "key"))],
+      str(sorted(dash.TIER_PUBLIC | dash.PROMOTE_PUBLIC)))
+
+print("\n=== EVENTS: utilisation plots the LATEST sample in each bucket")
+# Two samples in ONE bucket. The old query took bare columns alongside MAX(ts) in
+# HAVING, which SQLite only guarantees when the aggregate is in the SELECT list -- so
+# it could plot either row. Making the newer one the SMALLER footprint means picking
+# the wrong row is visible rather than a coin toss that passes half the time.
+_eu = pathlib.Path(tempfile.mkdtemp(prefix="pamts-util-"))
+_edb = str(_eu / "events.db")
+import sqlite3 as _sq3
+_c = _sq3.connect(_edb)
+_c.executescript(pamts_events.SCHEMA)
+_now = time.time()
+for _ts, _fp in ((_now - 100, 900 * (1 << 30)), (_now - 50, 100 * (1 << 30))):
+    _c.execute("INSERT INTO samples(ts,pool,footprint,budget) VALUES(?,?,?,?)",
+               (_ts, "music", _fp, 800 * (1 << 30)))
+_c.commit(); _c.close()
+_src = dash.EventsSource({"events_db": _edb})
+_out = _src.collect(window=3600, buckets=2)
+_pts = [p for p in (_out["utilisation"].get("music") or []) if p]
+check("one point is produced for the bucket", len(_pts) == 1, str(_pts))
+check("and it is the LATEST sample, not an arbitrary one in the bucket",
+      _pts and _pts[0]["footprint"] == 100 * (1 << 30),
+      f"got {_pts and _pts[0].get('footprint')}, wanted the newer 100G sample")
+shutil.rmtree(_eu, ignore_errors=True)
+
+print("\n=== PAGE: the escaper covers every character that can break out")
+_page = (ROOT / "web" / "index.html").read_text()
+_escdef = [ln for ln in _page.splitlines() if "const esc =" in ln]
+check("esc() exists", bool(_escdef), "the page must escape server data")
+check("and its character class includes the apostrophe",
+      _escdef and "'" in _escdef[0].split("replace(")[1].split(",")[0],
+      f"got {_escdef and _escdef[0].strip()!r} -- media FILENAMES reach this")
+check("the single-quote entity is in the map", "&#39;" in _page)
+# Nothing may interpolate into a single-quoted attribute; esc now covers it either way,
+# but the pattern is worth keeping out of the file.
+import re as _re
+# Strip // line comments first: the comment above esc() spells the pattern out in
+# order to warn about it, and matching that would make this check cry wolf forever.
+_code = "\n".join(_re.sub(r"\s*//.*$", "", ln) for ln in _page.splitlines())
+_bad = [ln.strip()[:80] for ln in _code.splitlines() if _re.search(r"=\'\$\{", ln)]
+check("no value is interpolated into a single-quoted attribute", not _bad, str(_bad))
+
+
 summary()

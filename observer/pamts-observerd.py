@@ -643,6 +643,12 @@ class Daemon:
         return {
             "kernel_emitted": drops.get("emitted"),
             "kernel_dropped": drops.get("dropped"),
+            # Backpressure in USERSPACE, which the kernel counters cannot show. A
+            # non-zero userspace_dropped means sessionising fell behind the ring.
+            "userspace_pending": (len(self.collector._queue)
+                                  if self.collector is not None
+                                  and hasattr(self.collector, "_queue") else None),
+            "userspace_dropped": getattr(self.collector, "queue_dropped", None),
             "uptime_s": round(time.time() - self.started, 1),
             "records": self.records,
             "sessions_closed": self.tracker.closed,

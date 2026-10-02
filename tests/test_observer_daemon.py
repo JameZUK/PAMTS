@@ -651,5 +651,38 @@ check("a sig with no uid key at all is stored as NULL",
       ).fetchone() == (None,))
 shutil.rmtree(_uroot, ignore_errors=True)
 
+print("=== UID: the ingest queue is bounded and drains in linear time")
+# ring_buffer__poll hands every pending event to the callback in one go, so the queue
+# is the only thing between a kernel burst and userspace. Two properties matter:
+# draining must not be quadratic, and it must not grow without limit -- the unit sets
+# MemoryMax=1G on the one process that must not fall over.
+import collections as _co                                        # noqa: E402
+_c2 = _bpf.Collector.__new__(_bpf.Collector)
+_c2.max_pending = 8
+_c2._queue = _co.deque(maxlen=_c2.max_pending)
+_c2.queue_dropped = 0
+_c2.lost = 0
+check("the queue is a deque, not a list",
+      isinstance(_c2._queue, _co.deque),
+      "a list drained with pop(0) is O(n) per item; one observed burst held ~233,000")
+check("and it has popleft, which is the O(1) drain", hasattr(_c2._queue, "popleft"))
+check("the collector declares a default ceiling",
+      _bpf.Collector.max_pending > 233_000,
+      f"{_bpf.Collector.max_pending} must exceed the largest burst the ring absorbs, "
+      "or normal spikes would be reported as backpressure")
+
+# Overfill it. The oldest go, and the loss is COUNTED -- "we stopped keeping up" and
+# "nothing happened" must not look the same.
+# Driven through _on_sample the way libbpf drives it: a raw address and a length.
+_ev = _st.pack("<QQQqIIIiI16sB3x", 1, 2, 0, 0, 0, 0, 4, 0, 114, b"\0" * 16, 2)
+_bufp = _ct.create_string_buffer(_ev, len(_ev))
+for _i in range(12):
+    _bpf.Collector._on_sample(_c2, None, _ct.addressof(_bufp), len(_ev))
+check("the queue never exceeds its bound", len(_c2._queue) == 8, str(len(_c2._queue)))
+check("and the overflow is counted, not silent", _c2.queue_dropped == 4,
+      f"queue_dropped={_c2.queue_dropped}, expected 12 - 8")
+check("a short buffer is still rejected before decoding",
+      (_bpf.Collector._on_sample(_c2, None, _ct.addressof(_bufp), 4), _c2.lost)[1] == 1,
+      f"lost={_c2.lost}")
 
 summary()

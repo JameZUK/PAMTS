@@ -429,6 +429,7 @@ class LmsPlayer(Player):
         # filesystem access, no schema coupling, no snapshot to keep fresh. See
         # plugins/lms/ in this repo.
         self._plugin = False
+        self._probe_failed = False
         try:
             info = self._rpc("", ["pamts", "info", "?"]) or {}
             if "played" in info:
@@ -437,12 +438,24 @@ class LmsPlayer(Player):
                 logging.info(f"[{self.name}] history plugin v{info.get('version')} "
                              f"present: {info.get('played')} played of "
                              f"{info.get('tracks')} track(s)")
-        except (urllib.error.URLError, OSError, ValueError, KeyError):
-            pass          # absence is normal, not an error
+            # A well-formed answer WITHOUT 'played' means the plugin is not installed.
+            # That is an absence, and absence is normal.
+        except (urllib.error.URLError, OSError, ValueError, KeyError) as e:
+            # But a transport failure is NOT an absence: we did not learn that the
+            # plugin is missing, we learned nothing. Treating the two the same made a
+            # dead LMS indistinguishable from an LMS without the plugin, so the
+            # adapter quietly dropped out of the sweep and never appeared in the list
+            # of sources that failed -- which is precisely the list eviction consults
+            # before ranking a pool as never-played.
+            self._probe_failed = True
+            logging.error(f"[{self.name}] could not reach the server to ask whether "
+                          f"the history plugin is installed ({e}). Reporting history "
+                          "as UNAVAILABLE, not absent.")
 
         if not self._plugin and self.cfg.get("history_db"):
             logging.info(f"[{self.name}] no history plugin; falling back to history_db")
-        self.provides_history = bool(self._plugin or self.cfg.get("history_db"))
+        self.provides_history = bool(self._plugin or self.cfg.get("history_db")
+                                     or self._probe_failed)
         if not self.provides_history:
             logging.info(f"[{self.name}] no play history available (install the "
                          "companion plugin, or set history_db) - promotion still works")
@@ -463,8 +476,17 @@ class LmsPlayer(Player):
                 "play_count": int(play_count or 0), "added": 0}
 
     def _items_from_plugin(self):
-        """Play history from the companion plugin, paged."""
-        out, offset = [], 0
+        """Play history from the companion plugin, paged.
+
+        Returns None on ANY failure, never a short answer. The plugin reports a
+        failed query as `error` in an otherwise well-formed response with no
+        history_loop, which used to read as zero rows -- indistinguishable from a
+        library nobody has ever played. sweep() would then mark history as having
+        succeeded, and eviction would rank every track as never-played. A database
+        error on the LMS side was therefore enough to put the whole music library
+        under eviction pressure, silently.
+        """
+        out, offset, expected = [], 0, None
         while True:
             try:
                 r = self._rpc("", ["pamts", "history", str(offset), str(self._page)])
@@ -472,6 +494,25 @@ class LmsPlayer(Player):
                 logging.error(f"[{self.name}] history query failed at offset "
                               f"{offset}: {e}")
                 return None
+            if not isinstance(r, dict):
+                logging.error(f"[{self.name}] history returned {type(r).__name__}, "
+                              "not an object - treating as unavailable")
+                return None
+            if r.get("error"):
+                logging.error(f"[{self.name}] the plugin reported an error at offset "
+                              f"{offset}: {r['error']}. Treating history as "
+                              "UNAVAILABLE rather than empty, so nothing is ranked "
+                              "as never-played on the strength of a failed query.")
+                return None
+            # The plugin tells us how many rows match. Hold on to the first page's
+            # figure and check it at the end: a page that comes back short for any
+            # reason other than reaching the end would otherwise truncate the
+            # history and look like a complete answer.
+            if expected is None:
+                try:
+                    expected = int(r.get("count"))
+                except (TypeError, ValueError):
+                    expected = None
             rows = r.get("history_loop") or []
             for h in rows:
                 path = self._path_from_url(h.get("url"))
@@ -484,7 +525,17 @@ class LmsPlayer(Player):
             if len(rows) < self._page:
                 break
             offset += self._page
-        logging.info(f"[{self.name}] {len(out)} played track(s) from the plugin")
+        # `out` is smaller than `expected` legitimately: rows whose url is a stream
+        # rather than a library file are skipped. So compare what the SERVER sent
+        # against what it said it had, not the filtered result.
+        if expected is not None and offset + len(rows) < expected:
+            logging.error(
+                f"[{self.name}] the plugin said {expected} played track(s) but paging "
+                f"stopped after {offset + len(rows)}. Treating history as UNAVAILABLE: "
+                "a truncated history ranks played content as never-played.")
+            return None
+        logging.info(f"[{self.name}] {len(out)} played track(s) from the plugin"
+                     + (f" ({expected} reported)" if expected is not None else ""))
         return out
 
     def _rpc(self, player_id, command):
@@ -512,7 +563,15 @@ class LmsPlayer(Player):
         LMS keeps play data in `tracks_persistent`, which deliberately survives library
         rescans -- exactly the property PAMTS wants. With neither source this returns an
         empty list: a definite "no history to give", not a failure (None).
+
+        The one case that is NOT an empty list is a server we could not reach. Then we
+        do not know whether it had history to give, and saying "none" would let the
+        caller rank content as never-played on the strength of a network error.
         """
+        if getattr(self, "_probe_failed", False) and not self.cfg.get("history_db"):
+            logging.error(f"[{self.name}] history unavailable: the server could not be "
+                          "reached to establish whether it has any")
+            return None
         if self._plugin:
             return self._items_from_plugin()
         if not self.cfg.get("history_db"):
@@ -737,6 +796,11 @@ Verified against Navidrome 0.64.0.
         # A sidecar that HANGS rather than refusing would otherwise stall the nightly
         # sweep for a minute per page. Bounded, and configurable for slow links.
         self.history_timeout = float(cfg.get("history_timeout") or 30)
+        # Filled from the sidecar's /info. A hardcoded page size is a version-skew
+        # trap: ask for 5000, get the sidecar's lower ceiling, read fewer rows than
+        # requested and conclude the history has ended. The LMS adapter already took
+        # its page size from the server; this one did not.
+        self._page = 5000
         self.all_users = bool(cfg.get("history_db") or self.history_url)
 
     def available(self):
@@ -749,6 +813,7 @@ Verified against Navidrome 0.64.0.
                 # switched off rather than failing on every call; the access observer
                 # already supplies now-playing for music.
                 self.provides_sessions = False
+                self._learn_sidecar_limits()
                 logging.info(f"[{self.name}] history-only via {self.history_url} "
                              "(no credentials configured, so no now-playing)")
                 return True
@@ -852,6 +917,21 @@ Verified against Navidrome 0.64.0.
                 "is the account that actually listens, not a fresh service account.")
         return out
 
+    def _learn_sidecar_limits(self):
+        """Ask the sidecar for its own page ceiling. Best-effort: /history reports
+        `quantity` too, so paging corrects itself even if this cannot be reached."""
+        if not self.history_url:
+            return
+        try:
+            with urllib.request.urlopen(self.history_url + "/info",
+                                        timeout=self.history_timeout) as r:
+                info = json.loads(r.read().decode())
+            mp = int(info.get("max_page"))
+        except (urllib.error.URLError, OSError, ValueError, TypeError):
+            return
+        if mp > 0:
+            self._page = max(1, min(mp, 5000))
+
     def _items_from_sidecar(self):
         """Play history for EVERY user, from the read-only sidecar.
 
@@ -861,7 +941,8 @@ Verified against Navidrome 0.64.0.
         schema. The sidecar ships as `navidrome-history`; run it on the host that
         holds navidrome.db.
         """
-        out, index, page = [], 0, 5000
+        out, index, page = [], 0, self._page
+        expected = None
         while True:
             url = f"{self.history_url}/history?index={index}&quantity={page}"
             try:
@@ -871,6 +952,28 @@ Verified against Navidrome 0.64.0.
                 logging.error(f"[{self.name}] history sidecar failed at index "
                               f"{index}: {e}")
                 return None
+            if not isinstance(doc, dict) or doc.get("error"):
+                logging.error(f"[{self.name}] the sidecar reported an error at index "
+                              f"{index}: {(doc or {}).get('error') if isinstance(doc, dict) else doc}."
+                              " Treating history as UNAVAILABLE rather than empty.")
+                return None
+            # Honour the page size the SIDECAR actually served. It clamps to its own
+            # MAX_PAGE, and a short page is how paging decides it has finished -- so
+            # a clamp smaller than our request would end the loop after one page.
+            served = doc.get("quantity")
+            try:
+                served = int(served)
+            except (TypeError, ValueError):
+                served = None
+            if served and served < page:
+                logging.info(f"[{self.name}] sidecar serves at most {served} row(s) "
+                             f"per page, not {page}; paging at its size")
+                page = served
+            if expected is None:
+                try:
+                    expected = int(doc.get("count"))
+                except (TypeError, ValueError):
+                    expected = None
             rows = doc.get("history") or []
             for h in rows:
                 full = h.get("path")
@@ -894,8 +997,17 @@ Verified against Navidrome 0.64.0.
             if len(rows) < page:
                 break
             index += page
+        # Same reasoning as the LMS adapter: compare what the sidecar SENT against
+        # what it said it had, because `out` is legitimately smaller once rows
+        # outside the configured roots are dropped.
+        if expected is not None and index + len(rows) < expected:
+            logging.error(
+                f"[{self.name}] the sidecar said {expected} played track(s) but paging "
+                f"stopped after {index + len(rows)}. Treating history as UNAVAILABLE: "
+                "a truncated history ranks played content as never-played.")
+            return None
         logging.info(f"[{self.name}] {len(out)} played track(s) from the sidecar "
-                     "(all users)")
+                     f"(all users)" + (f", {expected} reported" if expected else ""))
         return out
 
     def _items_from_db(self):
@@ -1283,11 +1395,13 @@ def build_all(cfg_list):
 
 
 def sweep(players):
-    """Sweep every adapter that can supply history. -> (items, ok).
+    """Sweep every adapter that can supply history. -> (items, ok, failed).
 
     `items` is the merged library, DE-DUPLICATED by fast-tier path, with last_viewed
     taken as the MAXIMUM across adapters. `ok` is True if at least one adapter that
-    claims to provide history actually did.
+    claims to provide history actually did. `failed` names the adapters that tried and
+    could not, which the caller needs because `ok` is a single estate-wide flag while
+    eviction decides per budget pool: "Plex answered" is not a licence to evict music.
 
     Merging by maximum is the point. A music library is commonly served by two or three
     things at once, and an album played in one app looks untouched to the others. Ranking
@@ -1298,12 +1412,18 @@ def sweep(players):
     by different ids, so without it the same album would be pinned twice under two
     different series keys and consume the pin budget twice.
     """
-    merged, ok = {}, False
+    merged, ok, failed = {}, False, []
     for p in players:
         # available() first: an adapter may only discover what it can do by asking the
         # server (e.g. whether a history plugin is installed), so its capability flags
         # are not reliable until then.
         if not p.available():
+            # Configured in pamts.toml and not usable: a missing url, an unreadable
+            # token, a server that will not answer. All of those are failures, and
+            # skipping them silently is what let the `failed` list look clean while a
+            # whole history source was down.
+            logging.error(f"[{p.name}] unavailable this run")
+            failed.append(p.name)
             continue
         if not p.provides_history:
             logging.info(f"[{p.name}] provides no play history - ranking will rely on "
@@ -1312,6 +1432,7 @@ def sweep(players):
         items = p.library_items()
         if items is None:
             logging.warning(f"[{p.name}] history unavailable this run")
+            failed.append(p.name)
             continue
         ok = True
         played = 0
@@ -1332,4 +1453,6 @@ def sweep(players):
             if it.get("last_viewed"):
                 played += 1
         logging.info(f"[{p.name}] {len(items)} item(s), {played} played")
-    return list(merged.values()), ok
+    if failed:
+        logging.warning("history unavailable from: %s", ", ".join(failed))
+    return list(merged.values()), ok, failed

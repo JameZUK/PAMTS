@@ -306,15 +306,27 @@ def main():
     con.commit()
     con.close()
 
-    # 127.0.0.1:1 refuses immediately, so the plugin probe fails fast. Capability is
+    # "No plugin installed" is a REACHABLE server that answers without `played`. This
+    # used to be simulated with a dead port (127.0.0.1:1), which conflated two different
+    # states: an answer saying there is no plugin, and no answer at all. Capability is
     # only known after available() has looked -- see the sweep() ordering test below.
-    plain = pamts_players.LmsPlayer({"name": "lms", "url": "http://127.0.0.1:1"})
+    plain = pamts_players.LmsPlayer({"name": "lms", "url": "http://unused"})
+    plain._rpc = lambda pid, cmd: {"result": "ok"}
     plain.available()
     check(plain.provides_history is False,
           "with no plugin and no history_db, LMS declares no history")
     check(plain.library_items() == [],
           "and returns [] -- a definite 'nothing', not a failure")
 
+    # A dead port is a different thing, and must NOT read as an empty history. See the
+    # "unreachable history source" block below for the full case.
+    unreachable = pamts_players.LmsPlayer({"name": "lmsgone",
+                                           "url": "http://127.0.0.1:1"})
+    unreachable.available()
+    check(unreachable.library_items() is None,
+          "an unreachable server returns None, not [] -- it told us nothing")
+
+    # history_db makes the server's reachability irrelevant: the data is local.
     withdb = pamts_players.LmsPlayer({"name": "lmsdb", "url": "http://127.0.0.1:1",
                                       "history_db": lms_db})
     withdb.available()
@@ -470,12 +482,42 @@ def main():
           "with history_db configured it still provides history")
     check(len(fallback.library_items()) == 2, "and reads it from the database")
 
+    # The same ordering rule applies to the SESSIONS loop in pamts-promote, which got it
+    # wrong: it tested provides_sessions before available() had been given a chance to
+    # turn it off, so an adapter configured history-only was asked what was playing,
+    # raised, and set a failure code -- making the unit exit 1 on all 1,440 daily runs.
+    print("\n=== an adapter may only learn its own capabilities in available()")
+    _order = []
+
+    class _LateCap:
+        name = "latecap"
+        provides_sessions = True        # optimistic, as the real adapters are
+        provides_history = False
+
+        def available(self):
+            _order.append("available")
+            self.provides_sessions = False       # only knowable after asking
+            return True
+
+        def now_playing(self):
+            _order.append("now_playing")
+            raise KeyError("username")
+
+    _lc = _LateCap()
+    # Emulate the corrected order: available() first, then the flag.
+    if _lc.available() and _lc.provides_sessions:
+        _lc.now_playing()
+    check(_order == ["available"],
+          "now_playing is not called once available() has withdrawn the capability "
+          f"(calls: {_order})")
+    check("available" in _order, "and the adapter did get asked")
+
     print("\n=== sweep() asks available() BEFORE trusting capability flags")
     # An adapter can only learn what it can do by asking the server, so a flag read
     # before available() would be wrong. lms_p starts optimistic and is confirmed.
     fresh = pamts_players.LmsPlayer({"name": "fresh", "url": "http://unused"})
     fresh._rpc = plugin_rpc
-    items_sw, ok_sw = pamts_players.sweep([fresh])
+    items_sw, ok_sw, _f = pamts_players.sweep([fresh])
     check(ok_sw is True and len(items_sw) == 2,
           f"sweep discovered the plugin and got its items (ok={ok_sw}, n={len(items_sw)})")
 
@@ -601,9 +643,211 @@ def main():
           "an unreachable sidecar returns None (history unavailable), not []")
     # None is the signal sweep() uses to skip the adapter; [] would mean "nothing has
     # ever been played", which would hand eviction a false clean slate.
-    _items, _ok = pamts_players.sweep([nd_down])
+    _items, _ok, _failed_names = pamts_players.sweep([nd_down])
     check(_ok is False and _items == [],
           "so sweep reports no usable history rather than an empty library")
+    check(_failed_names == ["nd"],
+          f"and NAMES the adapter that failed, which eviction needs per pool "
+          f"(got {_failed_names})")
+
+    # ------------------------------------------------- a FAILURE must not read as empty
+    # The whole class of bug: a source that answers but reports a problem. Zero rows and
+    # "the query failed" are the same bytes on the wire unless someone looks, and if
+    # they read as empty then sweep says history succeeded, eviction ranks every file as
+    # never-played, and a database hiccup on the music server becomes an eviction of the
+    # music library.
+    print("\n=== a reporting source that FAILS must never look like an empty library")
+
+    def err_rpc(pid, cmd):
+        if cmd[:2] == ["pamts", "info"]:
+            return {"played": 5, "tracks": 9, "max_page": 500, "version": "0.2.0"}
+        return {"error": "query failed"}            # exactly what Plugin.pm sends
+
+    lms_err = pamts_players.LmsPlayer({"name": "lmserr", "url": "http://unused"})
+    lms_err._rpc = err_rpc
+    check(lms_err.available() is True, "the plugin is still discovered")
+    check(lms_err.library_items() is None,
+          "a plugin that reports `error` returns None (unavailable), not []")
+    _i, _o, _f = pamts_players.sweep([lms_err])
+    check(_o is False and _f == ["lmserr"],
+          f"so sweep marks history unavailable and names it (ok={_o}, failed={_f})")
+
+    # Truncation is the quieter half: pages stop early and the result LOOKS complete.
+    def short_rpc(pid, cmd):
+        if cmd[:2] == ["pamts", "info"]:
+            return {"played": 9000, "tracks": 9000, "max_page": 10, "version": "0.2.0"}
+        # Claims 9000 matching rows, serves 4 and then stops.
+        off = int(cmd[2])
+        rows = [{"url": "file:///player/tv/A/%d.flac" % n, "lastplayed": 1000 + n,
+                 "playcount": 1, "filesize": 10} for n in range(off, min(off + 4, 4))]
+        return {"count": 9000, "history_loop": rows}
+
+    lms_short = pamts_players.LmsPlayer({"name": "lmsshort", "url": "http://unused"})
+    lms_short._rpc = short_rpc
+    lms_short.available()
+    check(lms_short.library_items() is None,
+          "paging that stops short of the plugin's own `count` returns None")
+
+    # And the inverse, so the check above is not just rejecting everything: a source
+    # whose count MATCHES what it served is accepted.
+    def exact_rpc(pid, cmd):
+        if cmd[:2] == ["pamts", "info"]:
+            return {"played": 2, "tracks": 2, "max_page": 500, "version": "0.2.0"}
+        return {"count": 2, "history_loop": [
+            {"url": "file:///player/tv/A/1.flac", "lastplayed": 10, "playcount": 1,
+             "filesize": 10},
+            {"url": "file:///player/tv/A/2.flac", "lastplayed": 20, "playcount": 1,
+             "filesize": 10}]}
+
+    lms_ok2 = pamts_players.LmsPlayer({"name": "lmsok", "url": "http://unused"})
+    lms_ok2._rpc = exact_rpc
+    lms_ok2.available()
+    _good = lms_ok2.library_items()
+    check(_good is not None and len(_good) == 2,
+          f"a complete answer is still accepted (got {_good and len(_good)})")
+
+    # A genuinely empty history is NOT a failure: a new library nobody has played yet
+    # must still return [] so eviction can fall back to mtime as it always has.
+    def empty_rpc(pid, cmd):
+        if cmd[:2] == ["pamts", "info"]:
+            return {"played": 0, "tracks": 50, "max_page": 500, "version": "0.2.0"}
+        return {"count": 0, "history_loop": []}
+
+    lms_empty = pamts_players.LmsPlayer({"name": "lmsempty", "url": "http://unused"})
+    lms_empty._rpc = empty_rpc
+    lms_empty.available()
+    check(lms_empty.library_items() == [],
+          "a truly empty history returns [], which is a measurement, not a failure")
+
+    # ------------------------------- an UNREACHABLE server is not a server with no data
+    # The gap this closes was found by breaking both music sources against the live
+    # config: only one appeared in `failed`. A dead LMS caught its own connection error,
+    # concluded "no plugin installed", set provides_history False, and sweep skipped it
+    # as though it were never a history source -- so the list eviction consults before
+    # ranking a pool as never-played came back clean while a source was down.
+    print("\n=== an unreachable history source must be FAILED, not absent")
+
+    def dead_rpc(pid, cmd):
+        raise OSError("connection refused")
+
+    lms_dead = pamts_players.LmsPlayer({"name": "lmsdead", "url": "http://127.0.0.1:1"})
+    lms_dead._rpc = dead_rpc
+    check(lms_dead.available() is True, "available() still returns True")
+    check(lms_dead._probe_failed is True, "but the probe is recorded as having failed")
+    check(lms_dead.provides_history is True,
+          "and it still counts as a history source, so it cannot be silently skipped")
+    check(lms_dead.library_items() is None,
+          "library_items reports unavailable, not an empty history")
+    _i, _o, _f = pamts_players.sweep([lms_dead])
+    check(_f == ["lmsdead"],
+          f"so sweep NAMES it as failed (got {_f})")
+
+    # The inverse: a reachable server that simply has no plugin is an absence, and must
+    # not be reported as a failure every single run.
+    def noplugin_rpc(pid, cmd):
+        return {"result": "ok"}            # well-formed, just no 'played'
+
+    lms_np = pamts_players.LmsPlayer({"name": "lmsnp", "url": "http://unused"})
+    lms_np._rpc = noplugin_rpc
+    lms_np.available()
+    check(lms_np._probe_failed is False, "a clean answer is not a probe failure")
+    check(lms_np.provides_history is False,
+          "no plugin and no history_db means it provides no history")
+    _i2, _o2, _f2 = pamts_players.sweep([lms_np])
+    check(_f2 == [],
+          f"and that is an absence, NOT a failure (got {_f2})")
+
+    # An adapter whose available() says no is configured-but-broken, which is a failure.
+    class _Unavailable:
+        name = "brokensrc"
+        provides_history = True
+
+        def available(self):
+            return False
+
+    _i3, _o3, _f3 = pamts_players.sweep([_Unavailable()])
+    check(_f3 == ["brokensrc"] and _o3 is False,
+          f"an unavailable adapter is counted as failed (got {_f3})")
+
+    # --------------------------------------------- the sidecar, same two failure modes
+    print("\n=== the sidecar: errors and a page ceiling smaller than we asked for")
+    _big = [{"path": "/player/tv/Band/Album/%03d.flac" % n, "size": 100,
+             "album_id": "a1", "disc": 1, "track": n, "title": str(n),
+             "last_played": 1700000000 + n, "play_count": 1, "users": 1}
+            for n in range(25)]
+    _mode = {"v": "ok", "served": 10}
+    _asked = []
+
+    class _Side2(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            from urllib.parse import urlparse as _up, parse_qs as _pq
+            q = _pq(_up(self.path).query)
+            if self.path.startswith("/info"):
+                doc = {"version": "1.0.0", "played": len(_big),
+                       "max_page": _mode["served"]}
+            elif _mode["v"] == "error":
+                doc = {"error": "database: locked"}
+            else:
+                want = int(q.get("quantity", ["5000"])[0])
+                idx = int(q.get("index", ["0"])[0])
+                served = min(want, _mode["served"])     # the sidecar's own ceiling
+                _asked.append((idx, want, served))
+                doc = {"count": len(_big), "index": idx, "quantity": served,
+                       "history": _big[idx:idx + served]}
+            body = _json.dumps(doc).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    _srv2 = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Side2)
+    threading.Thread(target=_srv2.serve_forever, daemon=True).start()
+    _url2 = "http://127.0.0.1:%d" % _srv2.server_address[1]
+    try:
+        nd_err = pamts_players.NavidromePlayer({"name": "nderr", "url": "http://unused",
+                                               "history_url": _url2,
+                                               "history_timeout": 5})
+        nd_err.available()
+        _mode["v"] = "error"
+        check(nd_err.library_items() is None,
+              "a sidecar reporting `error` in a 200 returns None, not []")
+
+        # A sidecar whose MAX_PAGE is lower than the adapter's request. The old adapter
+        # asked for 5000, got 10 back, saw 10 < 5000 and concluded the history had
+        # ended -- reading 10 of 25 plays and reporting success.
+        _mode["v"] = "ok"
+        _asked.clear()
+        nd_pg = pamts_players.NavidromePlayer({"name": "ndpg", "url": "http://unused",
+                                              "history_url": _url2,
+                                              "history_timeout": 5})
+        nd_pg.available()
+        check(nd_pg._page == 10,
+              f"the page size is taken from the sidecar's /info (got {nd_pg._page})")
+        _rows_got = nd_pg.library_items()
+        check(_rows_got is not None and len(_rows_got) == 25,
+              f"every row is read despite the ceiling (got "
+              f"{_rows_got and len(_rows_got)} of 25)")
+        check(len(_asked) >= 3,
+              f"which took several pages, not one (pages: {_asked})")
+
+        # Even with /info unreachable, the per-page `quantity` must correct the size --
+        # otherwise the fix depends on one optional request succeeding.
+        _mode["v"] = "ok"
+        nd_blind = pamts_players.NavidromePlayer({"name": "ndblind",
+                                                  "url": "http://unused",
+                                                  "history_url": _url2,
+                                                  "history_timeout": 5})
+        nd_blind._page = 5000              # as if /info had not been consulted
+        _blind = nd_blind.library_items()
+        check(_blind is not None and len(_blind) == 25,
+              f"paging corrects itself from the served `quantity` alone (got "
+              f"{_blind and len(_blind)} of 25)")
+    finally:
+        _srv2.shutdown()
 
     # --------------------------------------------------------- per-pool headroom
     print("=== HEADROOM: each budget pool is measured on its own")

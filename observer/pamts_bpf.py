@@ -13,6 +13,7 @@ Requires CAP_BPF and CAP_PERFMON (or CAP_SYS_ADMIN). It does NOT require tracefs
 because attachment is by raw tracepoint name -- so it works inside a privileged
 container without mounting debugfs or restarting anything.
 """
+import collections
 import ctypes
 import ctypes.util
 import os
@@ -74,8 +75,14 @@ class Collector:
     #: period dropped 40.3M events, so a third fewer is worth having.
     SKIP_PROGRAMS = frozenset(("pamts_read_start",))
 
+    #: Ceiling on events decoded but not yet consumed. Sized above the largest burst
+    #: the kernel ring itself holds (~233,000 observed), so reaching it means userspace
+    #: is genuinely not keeping up rather than merely absorbing a spike.
+    max_pending = 500_000
+
     def __init__(self, obj_path, map_name="events", verbose=False,
-                 poll_ms=200, record_factory=None, attach_all=False):
+                 poll_ms=200, record_factory=None, attach_all=False,
+                 max_pending=None):
         if not os.path.exists(obj_path):
             raise BpfError(
                 f"{obj_path} not found -- build it first (see observer/Makefile). "
@@ -84,7 +91,19 @@ class Collector:
         self.obj_path = obj_path
         self.poll_ms = poll_ms
         self.verbose = verbose
-        self._queue = []
+        if max_pending:
+            self.max_pending = int(max_pending)
+        # A deque, NOT a list. ring_buffer__poll drains everything the kernel has
+        # into this via the callback, and a list drained with pop(0) is O(n) per item
+        # -- one observed burst held ~233,000 events, which is ~2.7e10 element shifts
+        # to drain. popleft() is O(1).
+        #
+        # maxlen bounds it too. The kernel ring is 128 MB and userspace was unbounded,
+        # so if sessionising fell behind, memory grew until MemoryMax killed the one
+        # process that must not fall over. Past the bound the OLDEST pending events are
+        # dropped and counted, which is the same trade the kernel ring already makes.
+        self._queue = collections.deque(maxlen=self.max_pending)
+        self.queue_dropped = 0
         self._stop = False
         self._links = []
         self.attached = []
@@ -263,6 +282,10 @@ class Collector:
             self.lost += 1
             return 0
         buf = ctypes.string_at(data, EVENT.size)
+        if len(self._queue) == self._queue.maxlen:
+            # Count it rather than let it vanish: "we stopped keeping up" and "nothing
+            # happened" must not look the same.
+            self.queue_dropped += 1
         self._queue.append(self.decode(buf))
         return 0
 
@@ -308,7 +331,7 @@ class Collector:
                 if rc < 0 and rc not in (-4,):   # -EINTR is fine
                     raise BpfError(f"ring_buffer__poll returned {rc}")
                 while self._queue:
-                    yield self._record(self._queue.pop(0))
+                    yield self._record(self._queue.popleft())
         finally:
             self.close()
 

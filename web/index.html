@@ -235,8 +235,12 @@ const tierTag = t => (t === "hot" || t === "cold")
   : `<span class="sub">–</span>`;
 const base = p => { if (!p) return ""; const i = p.lastIndexOf("/"); return i < 0 ? p : p.slice(i+1); };
 const dir = p => { if (!p) return ""; const i = p.lastIndexOf("/"); return i < 0 ? "" : p.slice(0,i+1); };
-const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c =>
-  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+// Covers the apostrophe too. Nothing here interpolates into a single-quoted
+// attribute today, so it was not exploitable -- but media FILENAMES reach this
+// function, and the next person to write attr='${esc(x)}' should not have to know
+// that the helper quietly stopped one character short.
+const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
 const fmtPct = f => f == null ? "\u2013" : (f * 100).toFixed(1) + "%";
 const dirTag = k => k === "promote"

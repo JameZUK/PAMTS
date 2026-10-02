@@ -79,6 +79,9 @@ def make_handler(sources, page_path, auth_token=None):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
+            # The JSON endpoints return file paths and client addresses; stop a
+            # browser deciding for itself that any of it is HTML.
+            self.send_header("X-Content-Type-Options", "nosniff")
             # The page polls; never let a proxy or browser serve stale state.
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
@@ -143,7 +146,14 @@ def make_handler(sources, page_path, auth_token=None):
                     # window= seconds of history, buckets= how many points to return.
                     # Bucketing happens in SQL: a night of eviction is ten thousand
                     # rows and the page draws a few hundred pixels.
+                    # Clamped, and NaN-proof: float("nan") passes any comparison
+                    # test you write the obvious way, so compare the value against
+                    # itself first. An hour is the shortest useful window; ten years
+                    # is past the point where more data could mean anything.
                     window = float(q.get("window", [str(86400 * 7)])[0])
+                    if not (window == window):          # NaN
+                        window = 86400 * 7
+                    window = max(3600.0, min(window, 86400 * 3650))
                     buckets = max(2, min(400, int(q.get("buckets", ["48"])[0])))
                     limit = max(1, min(2000, int(q.get("limit", ["200"])[0])))
                     ev = next((s for s in sources if s.name == "events"), None)
