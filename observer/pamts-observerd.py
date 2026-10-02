@@ -616,6 +616,27 @@ def source_bpf(obj_path):
     return Collector(obj_path).records()
 
 
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """A ceiling on concurrent connections.
+
+    The stock class spawns an unbounded thread per connection. This API is on
+    localhost and answers in milliseconds, but a client that opens sockets without
+    sending costs a thread each, and this process is the one that must never fall over
+    -- it is the only thing watching the storage.
+    """
+    max_workers = 8
+    daemon_threads = True
+    request_queue_size = 32
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._slots = threading.BoundedSemaphore(self.max_workers)
+
+    def process_request_thread(self, request, client_address):
+        with self._slots:
+            super().process_request_thread(request, client_address)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="PAMTS access observer daemon")
     ap.add_argument("--root", action="append", required=True,
@@ -716,7 +737,7 @@ def main(argv=None):
     httpd = None
     if not args.no_http:
         host, _, port = args.listen.rpartition(":")
-        httpd = ThreadingHTTPServer((host or "127.0.0.1", int(port)),
+        httpd = BoundedHTTPServer((host or "127.0.0.1", int(port)),
                                     make_handler(daemon))
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         logging.info("serving on %s", args.listen)

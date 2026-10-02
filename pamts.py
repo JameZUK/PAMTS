@@ -30,7 +30,10 @@ MB = 1024 ** 2
 # deliberately conservative: they favour leaving content where it is over moving it.
 DEFAULTS = {
     "paths": {
-        "lock_file": "/run/pamts.lock",
+        # Under /var/lib, not /run: flock is held on an inode, so a lock file that gets
+        # deleted and recreated between runs hands two processes a "lock" each. /run is
+        # where stale files get tidied by hand.
+        "lock_file": "/var/lib/pamts/pamts.lock",
         "state_file": "/var/lib/pamts/state.json",
         "tier_log": "/var/log/pamts-tier.log",
         "promote_log": "/var/log/pamts-promote.log",
@@ -371,6 +374,14 @@ def human(n):
 
 
 def setup_logging(log_file, dry_run):
+    """Configure logging. Timestamps are UTC, always.
+
+    This estate spans hosts in two zones: the cache and Plex run UTC, the music and
+    download servers run Europe/London. Logging in local time meant correlating a
+    tiering run against a player's scan required knowing which host wrote which line
+    and whether BST was in effect. Stamping UTC everywhere removes the question, and
+    the Z suffix says so rather than leaving a reader to assume.
+    """
     handlers = [logging.StreamHandler(sys.stdout)]
     try:
         handlers.append(logging.FileHandler(log_file))
@@ -380,6 +391,13 @@ def setup_logging(log_file, dry_run):
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - " + ("[DRY-RUN] " if dry_run else "") + "%(message)s",
         handlers=handlers, force=True)
+    # converter is a class attribute on Formatter, so set it on every handler's
+    # formatter rather than trusting basicConfig to have made only one.
+    for h in logging.getLogger().handlers:
+        if h.formatter:
+            h.formatter.converter = time.gmtime
+            h.formatter.default_time_format = "%Y-%m-%d %H:%M:%S"
+            h.formatter.default_msec_format = "%s.%03dZ"
 
 
 # ----------------------------------------------------------------- path mapping
@@ -620,11 +638,49 @@ def acquire_lock(path, shared=False, wait_seconds=0):
         logging.error(f"cannot open lock file {path}: {e}")
         return None
     mode = (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB
+
+    def holds_the_named_file():
+        """Is the inode we just locked still the one this path refers to?
+
+        flock is held on an INODE, not a name. If the file is replaced between our
+        open() and our flock(), we end up holding a lock on an orphaned inode while
+        the next process locks the new one, and both believe they have it -- which
+        would let a promotion run straight into an eviction.
+
+        This closes that window by re-opening and trying again. It CANNOT help once
+        the file has simply been deleted and recreated between two runs: the second
+        process opens a new inode and has no way to know an older one was ever locked.
+        No flock scheme can. The real mitigation for that is to keep the lock file
+        somewhere nothing tidies, which is why it lives under /var/lib rather than
+        /run -- retiring the predecessor system meant deleting its stale lock by hand,
+        and that is exactly the habit that breaks this.
+        """
+        try:
+            return os.fstat(f.fileno()).st_ino == os.stat(path).st_ino
+        except OSError:
+            return False
     deadline = time.time() + max(0, wait_seconds)
     waited = False
+    reopens = 0
     while True:
         try:
             fcntl.flock(f, mode)
+            if not holds_the_named_file():
+                # Replaced underneath us. Drop the orphaned inode and take the new one.
+                logging.warning(f"the lock file {path} was replaced while acquiring it; "
+                                "re-taking the lock on the current file")
+                f.close()
+                reopens += 1
+                if reopens > 5:
+                    logging.error(f"{path} keeps being replaced - refusing to run "
+                                  "rather than race")
+                    return None
+                try:
+                    f = open(path, "w")
+                except OSError as e:
+                    logging.error(f"cannot reopen lock file {path}: {e}")
+                    return None
+                continue
             if waited:
                 logging.info("lock acquired after waiting")
             return f

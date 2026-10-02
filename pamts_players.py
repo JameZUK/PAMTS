@@ -225,10 +225,14 @@ class PlexPlayer(Player):
 
     # ---------------------------------------------------------------- transport
     def _get(self, path, **params):
-        params["X-Plex-Token"] = self._token
+        # The token goes in a HEADER, not the query string. Plex accepts either, but a
+        # query parameter is written into Plex's own access log and into any proxy's,
+        # so the credential outlives the request for no benefit.
         sep = "&" if "?" in path else "?"
-        u = f"{self.url}{path}{sep}{urllib.parse.urlencode(params, doseq=True)}"
-        req = urllib.request.Request(u, headers={"Accept": "application/json"})
+        q = urllib.parse.urlencode(params, doseq=True)
+        u = f"{self.url}{path}{sep}{q}" if q else f"{self.url}{path}"
+        req = urllib.request.Request(u, headers={"Accept": "application/json",
+                                                 "X-Plex-Token": self._token})
         with urllib.request.urlopen(req, timeout=60) as r:
             return json.loads(r.read().decode("utf-8", "replace")).get("MediaContainer", {})
 

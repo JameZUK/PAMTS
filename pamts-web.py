@@ -27,11 +27,14 @@ useful from another machine. Put a reverse proxy in front of it if it ever needs
 leave that network.
 """
 import argparse
+import hmac
 import json
 import os
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -41,7 +44,29 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PAGE = os.path.join(HERE, "web", "index.html")
 
 
-def make_handler(sources, page_path):
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a ceiling on concurrent connections.
+
+    The stock class spawns a thread per connection with no limit, so a handful of
+    clients that open sockets and never send anything will consume threads until the
+    process dies. This is a read-only telemetry page on a LAN, not a hardened service,
+    but "someone left a dashboard tab open on a flaky wifi link" is enough to want a
+    bound. Requests beyond the limit wait rather than being refused.
+    """
+    max_workers = 16
+    daemon_threads = True
+    request_queue_size = 32
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._slots = threading.BoundedSemaphore(self.max_workers)
+
+    def process_request_thread(self, request, client_address):
+        with self._slots:
+            super().process_request_thread(request, client_address)
+
+
+def make_handler(sources, page_path, auth_token=None):
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "pamts-web"
@@ -59,9 +84,25 @@ def make_handler(sources, page_path):
             self.end_headers()
             self.wfile.write(body)
 
+        def _authorised(self):
+            """No token configured -> open, as before. With one, require it.
+
+            Checked with compare_digest so a wrong token cannot be found a character at
+            a time. Accepted as a header or a query parameter: a browser can only
+            manage the latter, and this page is opened in a browser.
+            """
+            if not auth_token:
+                return True
+            given = (self.headers.get("X-PAMTS-Token")
+                     or parse_qs(urlparse(self.path).query).get("token", [""])[0])
+            return hmac.compare_digest(str(given), str(auth_token))
+
         def do_GET(self):
             u = urlparse(self.path)
             q = parse_qs(u.query)
+            if not self._authorised():
+                self._send({"error": "unauthorised"}, code=401)
+                return
             try:
                 if u.path in ("/", "/index.html"):
                     try:
@@ -171,6 +212,10 @@ def main(argv=None):
                          "trusted network")
     ap.add_argument("--page", default=PAGE)
     ap.add_argument("--history-limit", type=int, default=200)
+    ap.add_argument("--auth-token-file",
+                    help="file holding a shared secret. When set, every request must "
+                         "carry it as X-PAMTS-Token or ?token=. Unset means open, "
+                         "which is fine on localhost and a choice anywhere else.")
     ap.add_argument("--sources", default="",
                     help="comma-separated subset of "
                          + ",".join(sorted(pamts_dash.SOURCES)))
@@ -184,8 +229,18 @@ def main(argv=None):
         file=sys.stderr)
 
     host, _, port = args.listen.rpartition(":")
-    httpd = ThreadingHTTPServer((host or "127.0.0.1", int(port)),
-                                make_handler(sources, args.page))
+    token = None
+    if args.auth_token_file:
+        try:
+            token = open(args.auth_token_file).read().strip() or None
+        except OSError as e:
+            print(f"cannot read {args.auth_token_file}: {e}", file=sys.stderr)
+            return 2
+    if not token and (host not in ("127.0.0.1", "localhost", "::1")):
+        print(f"warning: listening on {host} with no --auth-token-file; anyone on the "
+              "network can read this dashboard", file=sys.stderr)
+    httpd = BoundedHTTPServer((host or "127.0.0.1", int(port)),
+                              make_handler(sources, args.page, token))
     print(f"serving on {args.listen}", file=sys.stderr)
     try:
         httpd.serve_forever()

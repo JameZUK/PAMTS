@@ -960,6 +960,75 @@ e = _suffix_err('[tier]\nsidecar_suffixes = [".nfo", ".jpg"]\n')
 check("a well-formed list is accepted", e is None, repr(e))
 
 
+# ------------------------------------------------------------------- UTC and locking
+print("=== LOGGING: timestamps are UTC wherever the host happens to be")
+_lroot = pathlib.Path(tempfile.mkdtemp(prefix="pamts-utc-"))
+_lf = str(_lroot / "t.log")
+import logging as _logging                                               # noqa: E402
+pamts.setup_logging(_lf, False)
+_logging.info("probe")
+_line = open(_lf).read().strip()
+check("the log line carries a Z suffix, so the zone is stated not assumed",
+      "Z - INFO" in _line, _line)
+_stamp = _line.split(" - ")[0].rstrip("Z")
+_logged = time.mktime(time.strptime(_stamp.split(".")[0], "%Y-%m-%d %H:%M:%S"))
+# mktime read it as local; if the stamp really is UTC the two differ by the offset.
+_skew = abs(_logged - time.mktime(time.gmtime()))
+check("and the time written is UTC, not the local clock", _skew < 5,
+      f"logged stamp is {_skew:.0f}s from UTC")
+
+print("=== LOCK: an inode swapped underneath the acquire is re-taken, not raced")
+import fcntl                                                             # noqa: E402
+_lp = str(_lroot / "lock")
+# What CAN be defended: the file being replaced between our open() and our flock().
+# Without the check we would hold a lock on an orphaned inode while the next process
+# locks the new one, and both would believe they had it.
+_real_flock = fcntl.flock
+_swapped = {"n": 0}
+
+
+def _flock_then_swap(fileobj, op):
+    # Replace the file exactly once, at the moment the lock is taken.
+    r = _real_flock(fileobj, op)
+    if _swapped["n"] == 0:
+        _swapped["n"] = 1
+        os.remove(_lp)
+        open(_lp, "w").close()
+    return r
+
+
+fcntl.flock = _flock_then_swap
+try:
+    _got = pamts.acquire_lock(_lp)
+finally:
+    fcntl.flock = _real_flock
+check("the caller still ends up with a lock", _got is not None)
+check("and it is the inode the PATH names, not the orphan it first opened",
+      _got is not None
+      and os.fstat(_got.fileno()).st_ino == os.stat(_lp).st_ino,
+      "it would be holding a lock nobody else can see")
+_got.close()
+
+# Normal contention is unaffected.
+_a = pamts.acquire_lock(_lp)
+_b = pamts.acquire_lock(_lp)
+check("normal contention still just blocks", _a is not None and _b is None)
+_a.close()
+# And deleting the file between runs is NOT defensible -- state the limit rather than
+# implying a guarantee that flock cannot give.
+_c = pamts.acquire_lock(_lp)
+os.remove(_lp)
+_d = pamts.acquire_lock(_lp)
+check("a file DELETED between runs does hand out a second lock (a known limit of "
+      "flock, which is why the lock lives where nothing tidies it)",
+      _d is not None, "this is documented behaviour, not a regression")
+_c.close()
+if _d:
+    _d.close()
+shutil.rmtree(_lroot, ignore_errors=True)
+pamts.setup_logging(os.devnull, False)
+
+
 # ------------------------------------------------------------------ dry-run plumbing
 print("=== DRY RUN: --dry-run lands after rsync, not after an ionice prefix")
 _seen = []

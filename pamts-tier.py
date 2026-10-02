@@ -210,8 +210,16 @@ def do_backup(job, dry_run):
         logging.error(f"[{name}] source {src} does not exist - refusing to run. With "
                       "--delete this would erase the replica.")
         return False
-    size = scan_dir(src)["size"]
-    if size == 0:
+    # Cheap emptiness check, not a full walk. scan_dir() recurses the whole tree to
+    # produce a byte count, which for the photos job means walking 1.5 TB of metadata
+    # purely to learn the answer is "not zero" -- and rsync is about to walk it again.
+    # One scandir entry settles it.
+    try:
+        empty = not any(os.scandir(src))
+    except OSError as e:
+        logging.error(f"[{name}] cannot read source {src}: {e} - refusing to run.")
+        return False
+    if empty:
         logging.error(f"[{name}] source {src} is empty - refusing to run. With "
                       "--delete this would erase the replica. Is it mounted?")
         return False
@@ -257,7 +265,7 @@ def do_backup(job, dry_run):
                       "max_delete for this job; if not, check the source is fully mounted.")
         return False
 
-    logging.info(f"[{name}] backup {human(size)} -> {dst}")
+    logging.info(f"[{name}] backup -> {dst}")
     cmd = base + excl + [f"--max-delete={limit}", src, dst]
     rc, out, err = run_rsync(cmd, dry_run)
     for line in out.splitlines():
