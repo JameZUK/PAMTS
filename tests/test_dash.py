@@ -557,5 +557,131 @@ _code = "\n".join(_re.sub(r"\s*//.*$", "", ln) for ln in _page.splitlines())
 _bad = [ln.strip()[:80] for ln in _code.splitlines() if _re.search(r"=\'\$\{", ln)]
 check("no value is interpolated into a single-quoted attribute", not _bad, str(_bad))
 
+# ====================================================== PAMTS's own status panel
+print("\n=== HEALTH: PAMTS reports on itself, and only on itself")
+_h = pathlib.Path(tempfile.mkdtemp(prefix="pamts-health-"))
+
+# A plausible set of PAMTS-owned files, and nothing else.
+_sf = _h / "state.json"
+_sf.write_text(json.dumps({"promotions": {"a": {"at": 1}},
+                           "observed": {"/x.flac": 1, "/y.flac": 2}}))
+_wf = _h / "watermarks.json"
+_wf.write_text(json.dumps({"plex": time.time()}))
+_edb = _h / "events.db"
+import sqlite3 as _sq4
+_cc = _sq4.connect(str(_edb)); _cc.executescript(pamts_events.SCHEMA); _cc.close()
+_cfgf = _h / "pamts.toml"
+_cfgf.write_text('[[players]]\nname="lms"\nkind="lms"\nurl="http://127.0.0.1:1"\n')
+
+_hs = dash.HealthSource({"url": "http://127.0.0.1:1", "state_file": str(_sf),
+                         "watermarks_file": str(_wf), "events_db": str(_edb),
+                         "observer_db": str(_h / "nope.db"),
+                         "config_file": str(_cfgf)})
+_r = _hs.collect()
+_by = {c["name"]: c for c in _r["checks"]}
+check("the panel produces checks", len(_r["checks"]) > 4, str(len(_r["checks"])))
+check("every check names a state", all(c["state"] in dash.HealthSource.RANK
+                                      for c in _r["checks"]),
+      str([c for c in _r["checks"] if c["state"] not in dash.HealthSource.RANK]))
+check("every check is grouped for display",
+      all(c.get("group") for c in _r["checks"]))
+check("state.json is read and summarised",
+      "2 observed play(s)" in _by["state.json"]["detail"],
+      _by["state.json"]["detail"])
+check("a fresh cursor file proves the poller is running",
+      _by["promotion poller is running"]["state"] == "ok",
+      _by["promotion poller is running"]["detail"])
+
+# The whole point of the panel: a real fault must come out as fail, not be averaged away.
+_r2 = dash.HealthSource({"url": "http://127.0.0.1:1", "state_file": str(_sf),
+                         "watermarks_file": str(_h / "absent.json"),
+                         "config_file": str(_cfgf)}).collect()
+_by2 = {c["name"]: c for c in _r2["checks"]}
+check("an unreachable collector is a FAIL, not a warning",
+      _by2["collector"]["state"] == "fail", str(_by2.get("collector")))
+check("and an unreachable PAMTS plugin is a fail too",
+      any(c["state"] == "fail" and "LMS history plugin" in c["name"]
+          for c in _r2["checks"]),
+      str([c["name"] for c in _r2["checks"]]))
+check("the overall verdict is the WORST check, not an average",
+      _r2["overall"] == "fail", _r2["overall"])
+
+# A stale cursor file means the poller has stopped, whatever systemd says. This is the
+# check that would have caught a silently dead timer.
+import os as _os
+_old = time.time() - 3600
+_wf2 = _h / "stale.json"; _wf2.write_text("{}")
+_os.utime(_wf2, (_old, _old))
+_r3 = dash.HealthSource({"watermarks_file": str(_wf2)}).collect()
+_by3 = {c["name"]: c for c in _r3["checks"]}
+check("a stale cursor file is reported as the poller having stopped",
+      _by3["promotion poller is running"]["state"] == "fail",
+      _by3["promotion poller is running"]["detail"])
+
+# Corruption of the one file that holds all observed history must be loud.
+_bad = _h / "broken.json"; _bad.write_text("{not json")
+_r4 = dash.HealthSource({"state_file": str(_bad)}).collect()
+check("an unreadable state.json is a FAIL",
+      {c["name"]: c for c in _r4["checks"]}["state.json"]["state"] == "fail")
+
+# Scope. The panel must not grow checks about other people's services: a check whose
+# subject is Plex or an *arr app belongs on their dashboards, not PAMTS's.
+_names = " ".join(c["name"].lower() for c in _r["checks"] + _r2["checks"])
+_foreign = [w for w in ("plex", "sonarr", "radarr", "lidarr", "readarr", "mergerfs",
+                        "zpool", "array", "nfs") if w in _names]
+check("no check is about a service PAMTS does not own", not _foreign, str(_foreign))
+# The two plugin checks ARE PAMTS's own, and must be named so that is obvious.
+check("plugin checks name the plugin, not the host service",
+      all("plugin" in c["name"].lower() or "sidecar" in c["name"].lower()
+          for c in _r2["checks"] if c.get("group") == "Plugins"),
+      str([c["name"] for c in _r2["checks"] if c.get("group") == "Plugins"]))
+
+# One broken check must not take the panel down with it.
+_boom = dash.HealthSource({})
+_boom._store_checks = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+_r5 = _boom.collect()
+check("a check that raises is reported, not fatal",
+      any("boom" in (c["detail"] or "") for c in _r5["checks"]),
+      str([c["detail"] for c in _r5["checks"]])[:200])
+check("and the rest of the panel still renders", len(_r5["checks"]) > 1)
+
+check("health is in the source registry", "health" in dash.SOURCES)
+
+# The plugin probes must NOT ride the panel's TTL. The LMS query runs six COUNT(*)s
+# over a couple of hundred thousand rows on a single-threaded server that is also
+# playing music; at 10 seconds that is a permanent load for an answer that barely moves.
+check("plugin probes have their own, much longer interval",
+      dash.HealthSource.plugin_ttl >= 60 and
+      dash.HealthSource.plugin_ttl > dash.HealthSource.ttl * 10,
+      f"ttl={dash.HealthSource.ttl} plugin_ttl={dash.HealthSource.plugin_ttl}")
+_calls = []
+_cs = dash.HealthSource({"plugin_ttl": 30.0})
+_cs._probe_plugins = lambda: (_calls.append(1),
+                              [_cs._check("LMS history plugin (t)", "ok", "v1",
+                                          group="Plugins")])[1]
+_cs._plugin_checks(); _cs._plugin_checks(); _cs._plugin_checks()
+check("repeated panel refreshes probe the plugins once", len(_calls) == 1,
+      f"{len(_calls)} probes for 3 refreshes")
+check("and the cached answer says how old it is",
+      "checked" in _cs._plugin_checks()[0]["detail"],
+      _cs._plugin_checks()[0]["detail"])
+_cs._plugins_at = 0.0          # force the window open
+_cs._plugin_checks()
+check("the probe does run again once its window passes", len(_calls) == 2,
+      f"{len(_calls)} probes")
+shutil.rmtree(_h, ignore_errors=True)
+
+print("\n=== HEALTH: the page shows it on every tab")
+_pg = (ROOT / "web" / "index.html").read_text()
+check("there is a status badge in the header",
+      'id="healthbadge"' in _pg and _pg.index('id="healthbadge"') < _pg.index("<main>"),
+      "the badge must be outside <main> so it shows on every tab")
+check("and a Status tab", 'id="tab-status"' in _pg and "view-status" in _pg)
+check("health is fetched outside any per-tab branch",
+      'fetch("api/health"' in _pg)
+check("the glyph is not the only carrier of state",
+      ".sr-only" in _pg and "sr-only" in _pg.split("renderHealth")[1][:1500],
+      "colour and shape alone are not accessible")
+
 
 summary()

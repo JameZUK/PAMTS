@@ -16,9 +16,11 @@ down is worse than one that shows most of the truth and says what is missing.
 Standard library only, in keeping with the rest of PAMTS.
 """
 import abc
+import collections
 import json
 import os
 import sqlite3
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -496,7 +498,416 @@ class EventsSource(Source):
             con.close()
 
 
+class HealthSource(Source):
+    """Is PAMTS itself working? Its own services, stores and plugins -- nothing else.
+
+    DELIBERATELY NARROW. This does not report on Plex, Lyrion, Navidrome, the *arr apps,
+    the array or the unions. Those have their own dashboards and their own failure modes,
+    and folding them in here would turn "is PAMTS working" into "is the estate working",
+    which is a different question with a different answer. What is checked is only what
+    PAMTS owns: the units it ships, the files it writes, the collector it loads and the
+    two plugins it provides.
+
+    The checks are chosen from things that have actually gone wrong:
+
+      * a unit that runs on a timer and exits non-zero every time, while the work it
+        does partly succeeds -- invisible for 144 consecutive runs
+      * the collector dropping events because userspace fell behind
+      * state.json unreadable, which is where all the observed play history lives
+      * a run that silently stops happening at all
+
+    That last one is why the play cursors are checked for FRESHNESS rather than just
+    existence: they advance on every poll, so a stale cursor file is direct evidence
+    that the poller is not running, independent of what systemd claims.
+
+    Every check degrades to "unknown" rather than failing the panel. A dashboard that
+    cannot tell you about one thing must still tell you about the rest.
+    """
+    name = "health"
+    ttl = 10.0
+
+    #: The plugin probes get their OWN, much longer interval. The LMS query runs six
+    #: COUNT(*)s over a couple of hundred thousand rows, on a server that is
+    #: single-threaded and is also playing music; at the panel's 10-second TTL that
+    #: would be six aggregate scans every ten seconds, for ever, to answer a question
+    #: whose answer changes slowly. The last result is reused in between and carries the
+    #: age it was taken at, so nothing is silently stale.
+    plugin_ttl = 300.0
+
+    #: state ranking, worst wins when rolling up to an overall verdict
+    RANK = {"ok": 0, "unknown": 1, "warn": 2, "fail": 3}
+
+    #: PAMTS's own units. (unit, kind, expected interval in seconds or None)
+    UNITS = (
+        ("pamts-observer.service", "daemon", None),
+        ("pamts-web.service", "daemon", None),
+        ("pamts-promote.timer", "timer", 60),
+        ("pamts-nightly.timer", "timer", 86400),
+    )
+
+    def __init__(self, cfg=None):
+        super().__init__(cfg)
+        self.observer_url = (self.cfg.get("url") or "").rstrip("/")
+        self.state_file = self.cfg.get("state_file")
+        self.events_db = self.cfg.get("events_db")
+        self.observer_db = self.cfg.get("observer_db")
+        self.config_file = self.cfg.get("config_file")
+        self.watermarks_file = self.cfg.get("watermarks_file")
+        self.units = self.cfg.get("health_units") or [u[0] for u in self.UNITS]
+        if self.cfg.get("plugin_ttl"):
+            self.plugin_ttl = float(self.cfg["plugin_ttl"])
+        self._plugins = None
+        self._plugins_at = 0.0
+
+    # -- helpers -----------------------------------------------------------
+    @staticmethod
+    def _check(name, state, detail, value=None, group="PAMTS"):
+        return {"name": name, "state": state, "detail": detail, "value": value,
+                "group": group}
+
+    @staticmethod
+    def _age(path):
+        try:
+            return time.time() - os.path.getmtime(path)
+        except OSError:
+            return None
+
+    def _systemctl(self, unit, props):
+        """-> {prop: value}, or None when systemd cannot be consulted."""
+        try:
+            out = subprocess.run(
+                ["systemctl", "show", "--no-pager",
+                 "-p", ",".join(props), unit],
+                capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if out.returncode != 0 and not out.stdout.strip():
+            return None
+        got = {}
+        for line in out.stdout.splitlines():
+            if "=" in line:
+                k, _, v = line.partition("=")
+                got[k] = v
+        return got or None
+
+    # -- the checks --------------------------------------------------------
+    def _unit_checks(self):
+        out = []
+        for unit, kind, interval in self.UNITS:
+            if unit not in self.units:
+                continue
+            if kind == "timer":
+                svc = unit[:-len("timer")] + "service"
+                info = self._systemctl(unit, ("ActiveState", "LastTriggerUSec",
+                                              "NextElapseUSecRealtime"))
+                if info is None:
+                    out.append(self._check(unit, "unknown",
+                                           "systemd could not be consulted"))
+                    continue
+                active = info.get("ActiveState")
+                if active != "active":
+                    out.append(self._check(unit, "fail",
+                                           f"timer is {active or 'unknown'}, so the "
+                                           "work it schedules is not happening"))
+                    continue
+                # How long since it last fired, against how often it should.
+                last = info.get("LastTriggerUSec") or ""
+                detail = "scheduled"
+                state = "ok"
+                svc_info = self._systemctl(svc, ("Result", "ExecMainStatus",
+                                                 "ExecMainExitTimestamp"))
+                if svc_info:
+                    status = svc_info.get("ExecMainStatus")
+                    result = svc_info.get("Result")
+                    # The failure mode this check exists for: a timer firing happily
+                    # while the service it starts exits non-zero every single time.
+                    if status not in (None, "", "0") or (result and result != "success"):
+                        state = "fail"
+                        detail = (f"last run FAILED: result={result or '?'} "
+                                  f"exit={status or '?'} at "
+                                  f"{svc_info.get('ExecMainExitTimestamp') or '?'}")
+                    else:
+                        # Kept on one line on purpose: a newline inside an f-string
+                        # expression needs Python 3.12 (PEP 701), and this runs on 3.11.
+                        when = svc_info.get("ExecMainExitTimestamp") or "no recorded exit"
+                        detail = f"last run ok ({when})"
+                out.append(self._check(unit, state, detail,
+                                       {"last_trigger": last,
+                                        "next_elapse": info.get("NextElapseUSecRealtime"),
+                                        "interval_s": interval}))
+            else:
+                info = self._systemctl(unit, ("ActiveState", "SubState",
+                                              "ActiveEnterTimestamp", "NRestarts"))
+                if info is None:
+                    out.append(self._check(unit, "unknown",
+                                           "systemd could not be consulted"))
+                    continue
+                active = info.get("ActiveState")
+                sub = info.get("SubState")
+                restarts = info.get("NRestarts")
+                if active == "active":
+                    detail = f"running since {info.get('ActiveEnterTimestamp') or '?'}"
+                    state = "ok"
+                    if restarts and restarts.isdigit() and int(restarts) > 0:
+                        detail += f", {restarts} restart(s)"
+                else:
+                    state, detail = "fail", f"{active or '?'}/{sub or '?'}"
+                out.append(self._check(unit, state, detail, {"restarts": restarts}))
+        return out
+
+    def _collector_checks(self):
+        out, group = [], "Collector"
+        if not self.observer_url:
+            return [self._check("collector", "unknown", "no observer url configured",
+                                group=group)]
+        try:
+            st = _http_json(self.observer_url + "/stats", timeout=5)
+        except Exception as e:                                  # noqa: BLE001
+            return [self._check("collector", "fail",
+                                f"the observer API did not answer: {e}", group=group)]
+        kd = st.get("kernel_dropped")
+        ud = st.get("userspace_dropped")
+        pend = st.get("userspace_pending")
+        out.append(self._check(
+            "events captured", "ok",
+            f"{st.get('records', 0):,} records in {(st.get('uptime_s') or 0) / 3600:.1f}h, "
+            f"{st.get('sessions_closed', 0):,} sessions closed",
+            {"records": st.get("records"), "uptime_s": st.get("uptime_s")}, group))
+        # Drops are the collector's own honesty check: it counts what it could not keep.
+        if kd in (None, 0) and ud in (None, 0):
+            out.append(self._check("no events dropped", "ok",
+                                   "kernel and userspace both kept up",
+                                   {"kernel": kd, "userspace": ud}, group))
+        else:
+            out.append(self._check(
+                "events dropped", "warn",
+                f"kernel dropped {kd or 0:,}, userspace dropped {ud or 0:,} "
+                f"({pend or 0:,} pending now) - ranking is working from an "
+                "incomplete view",
+                {"kernel": kd, "userspace": ud, "pending": pend}, group))
+        # The index is how an inode becomes a path; a stale one means reads cannot be
+        # attributed to files at all.
+        files = st.get("index_files") or 0
+        unres = st.get("unresolved_paths") or 0
+        if not files:
+            out.append(self._check("path index", "fail",
+                                   "the index is empty, so no read can be named",
+                                   group=group))
+        else:
+            ratio = unres / max(1, st.get("records") or 1)
+            out.append(self._check(
+                "path index", "warn" if ratio > 0.01 else "ok",
+                f"{files:,} files indexed, {unres:,} read(s) unresolved "
+                f"(built in {st.get('index_build_s')}s)",
+                {"files": files, "unresolved": unres}, group))
+        svc = st.get("services") or {}
+        unmapped = {k: v for k, v in svc.items() if str(k).startswith("unmapped:")}
+        if svc:
+            out.append(self._check(
+                "read attribution", "warn" if unmapped else "ok",
+                (f"{len(unmapped)} client/uid pair(s) not named by --service"
+                 if unmapped else
+                 "every reader seen so far resolves to a named service"),
+                svc, group))
+        return out
+
+    def _store_checks(self):
+        out, group = [], "Stores"
+        # state.json: the only copy of the observed play history.
+        if self.state_file:
+            age = self._age(self.state_file)
+            corrupt = os.path.exists(self.state_file + ".corrupt")
+            if age is None:
+                out.append(self._check("state.json", "warn",
+                                       "not written yet", group=group))
+            else:
+                try:
+                    with open(self.state_file) as f:
+                        st = json.load(f)
+                    obs = len(st.get("observed") or {})
+                    pro = len(st.get("promotions") or {})
+                    detail = (f"{obs:,} observed play(s), {pro} protected item(s), "
+                              f"written {_ago(age)} ago")
+                    state = "ok"
+                    if corrupt:
+                        state = "warn"
+                        detail += " - a .corrupt copy exists from an earlier failure"
+                    out.append(self._check("state.json", state, detail,
+                                           {"observed": obs, "promotions": pro,
+                                            "age_s": age}, group))
+                except (OSError, ValueError) as e:
+                    out.append(self._check(
+                        "state.json", "fail",
+                        f"UNREADABLE ({e}). This file holds all observed play history; "
+                        "eviction will refuse any pool it leaves uncovered",
+                        group=group))
+        # The cursors advance every poll, so their age is independent evidence that
+        # the poller is actually running -- not just that systemd thinks it is.
+        if self.watermarks_file:
+            age = self._age(self.watermarks_file)
+            if age is None:
+                out.append(self._check(
+                    "promotion poller is running", "unknown",
+                    "no cursor file yet; it appears after the first pass", group=group))
+            else:
+                limit = 5 * 60
+                out.append(self._check(
+                    "promotion poller is running",
+                    "ok" if age < limit else "fail",
+                    (f"play cursors advanced {_ago(age)} ago"
+                     if age < limit else
+                     f"play cursors last advanced {_ago(age)} ago - the poller has "
+                     "stopped running, whatever systemd reports"),
+                    {"age_s": age}, group))
+        for label, path, stale, why in (
+                ("events.db", self.events_db, None,
+                 "transfer and utilisation history for these graphs"),
+                ("observer.db", self.observer_db, 3600,
+                 "sessions and play history")):
+            if not path:
+                continue
+            if not os.path.exists(path):
+                out.append(self._check(label, "warn", f"absent ({why})", group=group))
+                continue
+            try:
+                size = os.path.getsize(path)
+                age = self._age(path)
+                state = "ok"
+                detail = f"{size / 1e6:.1f} MB, written {_ago(age)} ago"
+                if stale and age is not None and age > stale:
+                    state = "warn"
+                    detail += " - nothing has been written for a while"
+                out.append(self._check(label, state, detail,
+                                       {"bytes": size, "age_s": age}, group))
+            except OSError as e:
+                out.append(self._check(label, "warn", str(e), group=group))
+        return out
+
+    def _plugin_checks(self):
+        """Cached wrapper: probe the plugins at plugin_ttl, not at the panel's ttl."""
+        now = time.monotonic()
+        if self._plugins is not None and now - self._plugins_at < self.plugin_ttl:
+            age = time.time() - self._plugins_age
+            return [dict(c, detail=(c["detail"] + f" · checked {_ago(age)} ago")
+                         if c.get("detail") else c["detail"])
+                    for c in self._plugins]
+        self._plugins = self._probe_plugins()
+        self._plugins_at, self._plugins_age = now, time.time()
+        return self._plugins
+
+    def _probe_plugins(self):
+        """PAMTS's OWN two plugins. Not the servers that host them.
+
+        A failure here means PAMTS's component is not answering -- which may be because
+        the host service is down, but this panel reports only on PAMTS's side of it and
+        says so, rather than claiming to monitor Lyrion or Navidrome.
+        """
+        out, group = [], "Plugins"
+        players = self._players()
+        for p in players:
+            kind = (p.get("kind") or "").lower()
+            if kind == "lms":
+                url = (p.get("url") or "").rstrip("/")
+                if not url:
+                    continue
+                try:
+                    body = json.dumps({"id": 1, "method": "slim.request",
+                                       "params": ["", ["pamts", "info", "?"]]}).encode()
+                    req = urllib.request.Request(
+                        url + "/jsonrpc.js", data=body,
+                        headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=8) as r:
+                        res = (json.loads(r.read().decode("utf-8", "replace"))
+                               .get("result") or {})
+                except Exception as e:                          # noqa: BLE001
+                    out.append(self._check(
+                        f"LMS history plugin ({p.get('name')})", "fail",
+                        f"the PAMTS CLI query did not answer: {e}. Without it LMS "
+                        "supplies no play history", group=group))
+                    continue
+                if "played" not in res:
+                    out.append(self._check(
+                        f"LMS history plugin ({p.get('name')})", "fail",
+                        "the server answered but does not know the `pamts` query - "
+                        "the plugin is not loaded (check for a stray copy in the "
+                        "Plugins directory)", group=group))
+                    continue
+                out.append(self._check(
+                    f"LMS history plugin ({p.get('name')})", "ok",
+                    f"v{res.get('version')} - {res.get('played'):,} played of "
+                    f"{res.get('tracks'):,} track(s)",
+                    {"version": res.get("version"), "played": res.get("played")}, group))
+            elif kind == "navidrome" and p.get("history_url"):
+                base = p["history_url"].rstrip("/")
+                try:
+                    info = _http_json(base + "/info", timeout=8)
+                except Exception as e:                          # noqa: BLE001
+                    out.append(self._check(
+                        f"Navidrome history sidecar ({p.get('name')})", "fail",
+                        f"did not answer at {base}: {e}. Without it PAMTS sees no "
+                        "Navidrome plays", group=group))
+                    continue
+                users = info.get("users_with_plays")
+                state = "ok"
+                detail = (f"v{info.get('version')} - {info.get('played'):,} played "
+                          f"track(s) across {users} user(s)")
+                if users == 1:
+                    # The sidecar exists specifically to cover every listener, so one
+                    # user is worth pointing out without calling it broken.
+                    detail += " (only one listener has plays recorded)"
+                out.append(self._check(
+                    f"Navidrome history sidecar ({p.get('name')})", state, detail,
+                    {"version": info.get("version"), "played": info.get("played"),
+                     "users": users}, group))
+        if not out:
+            out.append(self._check("plugins", "unknown",
+                                   "no PAMTS plugin endpoints are configured",
+                                   group=group))
+        return out
+
+    def _players(self):
+        if not self.config_file or not os.path.exists(self.config_file):
+            return []
+        try:
+            import tomllib                                      # noqa: PLC0415
+            with open(self.config_file, "rb") as f:
+                return tomllib.load(f).get("players") or []
+        except Exception:                                       # noqa: BLE001
+            return []
+
+    def collect(self):
+        checks = []
+        for fn in (self._unit_checks, self._collector_checks, self._store_checks,
+                   self._plugin_checks):
+            try:
+                checks.extend(fn())
+            except Exception as e:                              # noqa: BLE001
+                # One broken check must not take the panel with it.
+                checks.append(self._check(fn.__name__, "unknown",
+                                          f"this check itself failed: {e}"))
+        worst = max((self.RANK.get(c["state"], 1) for c in checks), default=0)
+        overall = {v: k for k, v in self.RANK.items()}[worst]
+        counts = collections.Counter(c["state"] for c in checks)
+        return {"generated": time.time(), "overall": overall,
+                "counts": dict(counts), "checks": checks}
+
+
+def _ago(seconds):
+    """Short human duration, for check details."""
+    if seconds is None:
+        return "?"
+    s = int(seconds)
+    if s < 90:
+        return f"{s}s"
+    if s < 5400:
+        return f"{s // 60}m"
+    if s < 172800:
+        return f"{s // 3600}h"
+    return f"{s // 86400}d"
+
+
 SOURCES = {
+    HealthSource.name: HealthSource,
     ObserverSource.name: ObserverSource,
     StateSource.name: StateSource,
     ConfigSource.name: ConfigSource,

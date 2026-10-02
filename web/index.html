@@ -58,6 +58,25 @@ main{padding:16px;max-width:1100px;margin:0 auto}
 .bar{height:7px;background:var(--line);border-radius:4px;overflow:hidden;margin:8px 0 4px}
 .bar>i{display:block;height:100%;background:var(--accent)}
 .bar>i.warn{background:var(--warn)} .bar>i.bad{background:var(--bad)}
+/* Status badge and check rows. A dot carries the state as well as the colour, so the
+   panel is still readable without relying on colour alone. */
+.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);
+  white-space:nowrap}
+.badge{font:inherit;font-size:12px;font-weight:600;padding:3px 10px;border-radius:20px;
+  border:1px solid currentColor;background:none;cursor:pointer;white-space:nowrap}
+.badge-ok{color:var(--ok)} .badge-warn{color:var(--warn)}
+.badge-fail{color:var(--bad)} .badge-unknown{color:var(--dim)}
+.hgroup{margin:14px 0 4px;font-size:11px;font-weight:700;color:var(--dim);
+  text-transform:uppercase;letter-spacing:.05em}
+.hchk{display:flex;gap:10px;align-items:baseline;padding:6px 0;
+  border-bottom:1px solid var(--line)}
+.hchk .dot{flex:0 0 auto;font-size:11px;width:1.4em;text-align:center}
+.hchk .nm{flex:0 0 auto;min-width:16em;font-weight:600;font-size:13px}
+.hchk .dt{flex:1 1 auto;color:var(--dim);font-size:12.5px}
+.s-ok .dot{color:var(--ok)} .s-warn .dot{color:var(--warn)}
+.s-fail .dot{color:var(--bad)} .s-unknown .dot{color:var(--dim)}
+.s-fail .nm{color:var(--bad)}
+@media(max-width:620px){.hchk{flex-wrap:wrap}.hchk .nm{min-width:0}}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{text-align:left;color:var(--dim);font-weight:600;font-size:11px;
   text-transform:uppercase;letter-spacing:.05em;padding:6px 8px;
@@ -116,8 +135,13 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
 <body>
 <header>
   <h1>PAMTS <span id="sub">dashboard</span></h1>
+  <!-- Always visible, on every tab: the point of a status badge is that you do not
+       have to go looking for it. Clicking it opens the detail. -->
+  <button id="healthbadge" class="badge badge-unknown"
+          title="PAMTS's own status - click for detail">checking…</button>
   <nav>
     <button id="tab-now" aria-current="true">Now</button>
+    <button id="tab-status">Status</button>
     <button id="tab-moves">Transfers</button>
     <button id="tab-graphs">Graphs</button>
     <button id="tab-sessions">Sessions</button>
@@ -128,6 +152,18 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
 </header>
 
 <main>
+  <section id="view-status" class="hide">
+    <div class="panel">
+      <h2>Is PAMTS working? <span class="sub" id="health-note"></span></h2>
+      <p class="muted" style="margin:0 0 12px">
+        PAMTS's own services, stores, collector and plugins. This panel says nothing
+        about Plex, Lyrion, Navidrome or the *arr apps themselves — only about
+        PAMTS's side of them, so a fault here is a fault in PAMTS.
+      </p>
+      <div id="health-body"></div>
+    </div>
+  </section>
+
   <section id="view-now">
     <div class="grid" id="cards"></div>
     <div class="panel">
@@ -817,6 +853,46 @@ function liveFilter(sessions) {
   return sessions.filter(s => selected.includes(s.label));
 }
 
+// -------------------------------------------------------------------- status
+const H_SYM = {ok: "\u25cf", warn: "\u25b2", fail: "\u2716", unknown: "\u25cb"};
+const H_WORD = {ok: "all good", warn: "degraded", fail: "problem", unknown: "unknown"};
+
+function renderHealth(h) {
+  const st = (h && h.overall) || "unknown";
+  const b = $("#healthbadge");
+  const c = h && h.counts || {};
+  b.className = "badge badge-" + st;
+  // The badge says what is wrong, not just that something is: "2 failing" is
+  // actionable where a red dot is only alarming.
+  b.textContent = st === "ok"
+    ? `PAMTS ok · ${c.ok || 0} checks`
+    : `PAMTS ${H_WORD[st]}` +
+      (c.fail ? ` · ${c.fail} failing` : "") +
+      (c.warn ? ` · ${c.warn} warning` : "");
+  b.title = "PAMTS's own status - click for detail";
+
+  if (!h || !h.checks) {
+    $("#health-body").innerHTML = `<div class="muted">status unavailable</div>`;
+    return;
+  }
+  $("#health-note").textContent =
+    `${H_WORD[st]} · checked ${fmtT(h.generated)}`;
+  const groups = [];
+  h.checks.forEach(c2 => {
+    let g = groups.find(x => x[0] === (c2.group || "PAMTS"));
+    if (!g) { g = [c2.group || "PAMTS", []]; groups.push(g); }
+    g[1].push(c2);
+  });
+  $("#health-body").innerHTML = groups.map(([g, cs]) => `
+    <div class="hgroup">${esc(g)}</div>
+    ${cs.map(c2 => `<div class="hchk s-${esc(c2.state)}">
+       <span class="dot" aria-hidden="true">${H_SYM[c2.state] || "?"}</span>
+       <span class="nm">${esc(c2.name)}</span>
+       <span class="dt">${esc(c2.detail || "")}</span>
+       <span class="sr-only">${esc(c2.state)}</span>
+     </div>`).join("")}`).join("");
+}
+
 // ------------------------------------------------------------------- polling
 // Each view fetches only what it shows. Now is the one people leave open, so it is the
 // only one polled unconditionally.
@@ -838,6 +914,13 @@ async function tick() {
     failures++;
     $("#foot").innerHTML = `<span class="err">cannot reach pamts-web (${failures})</span>`;
   }
+
+  // Polled on every tick whatever the tab, because the badge is always on screen.
+  // Its own endpoint, so a slow tier scan in /api/state cannot delay it.
+  try {
+    const hr = await fetch("api/health", {cache: "no-store"});
+    renderHealth(hr.ok ? await hr.json() : null);
+  } catch (e) { renderHealth(null); }
 
   if (view === "sessions") {
     // Filter server-side: with copies outnumbering plays hundreds to one, filtering
@@ -867,8 +950,9 @@ async function tick() {
   }
 }
 
-const TABS = {now: "#view-now", moves: "#view-moves", graphs: "#view-graphs",
-              sessions: "#view-sessions", config: "#view-config"};
+const TABS = {now: "#view-now", status: "#view-status", moves: "#view-moves",
+              graphs: "#view-graphs", sessions: "#view-sessions",
+              config: "#view-config"};
 function show(which) {
   view = TABS[which] ? which : "now";
   for (const [k, sel] of Object.entries(TABS)) {
@@ -882,6 +966,7 @@ Object.keys(TABS).forEach(k => {
   const b = $("#tab-" + k);
   if (b) b.onclick = () => show(k);
 });
+$("#healthbadge").onclick = () => show("status");
 
 renderRanges();
 let startView = "now";

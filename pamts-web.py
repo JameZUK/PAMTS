@@ -14,6 +14,9 @@ no change here.
     GET /api/events?window=&buckets=&limit=
                                promotion/demotion history, throughput and
                                utilisation, bucketed for charting
+    GET /api/health            PAMTS's own status: its services, stores, collector
+                               and its two plugins. Nothing about the media servers
+                               themselves -- see the HealthSource docstring.
     GET /api/sources           what is registered and whether it is available
     GET /health
 
@@ -116,6 +119,17 @@ def make_handler(sources, page_path, auth_token=None):
                                    f"{page_path}", "text/plain", 500)
                 elif u.path == "/health":
                     self._send({"ok": True})
+                elif u.path == "/api/health":
+                    # PAMTS's own health. Deliberately its own endpoint rather than
+                    # part of /api/state: it is the one thing worth polling on its own
+                    # when something looks wrong, and it must stay answerable even if
+                    # an expensive source (a tier scan) is slow.
+                    hs = next((x for x in sources if x.name == "health"), None)
+                    if hs is None:
+                        self._send({"error": "health source not enabled"}, code=503)
+                    else:
+                        self._send(hs.get(force=q.get("force", ["0"])[0]
+                                          not in ("0", "", "false")))
                 elif u.path == "/api/sources":
                     self._send({"sources": [
                         {"name": s.name, "available": s.available(), "ttl": s.ttl}
@@ -183,6 +197,7 @@ def source_cfg(args):
         "observer_db": args.observer_db,
         "events_db": args.events_db,
         "history_limit": args.history_limit,
+        "watermarks_file": args.watermarks_file,
     }
     # The tier source needs to know which jobs are tier jobs and what the budget is.
     # Read it from the config rather than making the operator repeat it.
@@ -214,6 +229,10 @@ def main(argv=None):
     ap.add_argument("--observer-url", default="http://127.0.0.1:8621")
     ap.add_argument("--observer-db", default="/var/lib/pamts/observer.db")
     ap.add_argument("--state-file", default="/var/lib/pamts/state.json")
+    ap.add_argument("--watermarks-file", default="/var/lib/pamts/watermarks.json",
+                    help="the play-cursor file. Its freshness is how the status panel "
+                         "knows the promotion poller is actually running, independently "
+                         "of what systemd reports.")
     ap.add_argument("--events-db", default="/var/lib/pamts/events.db",
                     help="the transfer/utilisation history pamts_events writes")
     ap.add_argument("--listen", default="127.0.0.1:8622",
