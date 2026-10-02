@@ -175,7 +175,13 @@ class Player(abc.ABC):
     #   * it depends on a schema the upstream project may change
     #   * it is the only way to get history that predates PAMTS, or history belonging
     #     to other users
-    # Opening immutable means a live server is never disturbed and no lock is taken.
+    # Opened READ-ONLY, not immutable. immutable=1 tells SQLite the file cannot change,
+    # so it skips locking AND IGNORES THE WAL -- and both Lyrion's persist.db and
+    # Navidrome's navidrome.db run in WAL mode. Every play recorded since the last
+    # checkpoint would be silently missing, with no error to notice; worse, immutable
+    # on a file that is in fact being written is undefined behaviour, so the rows
+    # returned need not even be self-consistent. mode=ro disturbs a live server no more
+    # than immutable does: in WAL, readers never block the writer.
     def _read_db(self, sql, params=()):
         path = self.cfg.get("history_db")
         if not path:
@@ -184,7 +190,7 @@ class Player(abc.ABC):
             logging.error(f"[{self.name}] history_db {path} does not exist")
             return None
         try:
-            con = sqlite3.connect(f"file:{path}?immutable=1", uri=True)
+            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
             try:
                 return con.execute(sql, params).fetchall()
             finally:

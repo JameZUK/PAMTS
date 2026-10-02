@@ -212,7 +212,16 @@ const ago = ts => {
   if (s < 172800) return Math.round(s/3600) + "h ago";
   return Math.round(s/86400) + "d ago";
 };
-const tag = l => `<span class="tag" style="color:var(--${(l||"unknown").toLowerCase()},var(--unknown))">${l||"?"}</span>`;
+// Defence in depth. Verdict labels come from the observer's own fixed classifier, but
+// this same helper also renders [[promote.rules]] `match` from the config, and it drops
+// its argument into a CSS value AND into element text. Escape both, and restrict the
+// CSS part to the characters a custom-property name can legally contain, so no value
+// can ever break out of either context.
+const tag = l => {
+  const raw = (l == null || l === "") ? "?" : String(l);
+  const slug = raw.toLowerCase().replace(/[^a-z0-9-]/g, "") || "unknown";
+  return `<span class="tag" style="color:var(--${slug},var(--unknown))">${esc(raw)}</span>`;
+};
 // Which tier served the read. Recorded when it happened, not derived now: the file
 // may have moved tiers since, so a lookup today would answer a different question.
 const tierTag = t => (t === "hot" || t === "cold")

@@ -8,6 +8,7 @@ import importlib.util
 import os
 import pathlib
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
@@ -505,6 +506,33 @@ def main():
           "fake player promoted its group")
     check(all(os.path.exists(os.path.join(fast, "Show", "Season 1", f"e{i:02d}.mkv"))
               for i in (5, 6)), "both files landed on fast storage")
+
+    # ------------------------------------------------ history_db against a WAL file
+    print("=== history_db: a WAL database must be read live, not as a frozen snapshot")
+    _wd = tempfile.mkdtemp(prefix="pamts-wal-")
+    _wp = os.path.join(_wd, "hist.db")
+    _w = sqlite3.connect(_wp)
+    _w.execute("PRAGMA journal_mode=WAL")
+    _w.execute("CREATE TABLE tracks_persistent (url TEXT, lastPlayed INTEGER, "
+               "playCount INTEGER)")
+    _w.execute("INSERT INTO tracks_persistent VALUES('file:///player/tv/a.mkv',100,3)")
+    _w.commit()
+    _w.execute("INSERT INTO tracks_persistent VALUES('file:///player/tv/b.mkv',200,7)")
+    _w.commit()     # still in the WAL, not yet checkpointed into the main file
+
+    _lms = pamts_players.LmsPlayer({"name": "l", "url": "http://unused",
+                                    "history_db": _wp})
+    _rows = _lms._read_db("SELECT url, lastPlayed, playCount FROM tracks_persistent")
+    # immutable=1 ignores the WAL entirely: on a live server the schema itself can be
+    # there, so the read fails with "no such table", _read_db logs "the schema may have
+    # changed upstream" and returns None -- history silently skipped, no error raised.
+    check(_rows is not None,
+          "a WAL database is readable at all (immutable=1 could not even see the table)")
+    check(_rows is not None and len(_rows) == 2,
+          f"and every committed row is visible, including un-checkpointed ones "
+          f"(got {_rows if _rows is None else len(_rows)})")
+    _w.close()
+    shutil.rmtree(_wd, ignore_errors=True)
 
     # ------------------------------------------------- navidrome history sidecar
     print("=== NAVIDROME: history for every user, without holding anyone's password")
