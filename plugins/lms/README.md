@@ -128,3 +128,33 @@ automatically:
 Without it, the adapter reports no play history (promotion still works, ranking falls back
 to PAMTS's observed plays) unless you point `history_db` at `persist.db` — which the
 plugin exists to make unnecessary.
+
+## Installing, and the trap in it
+
+Copy the `PAMTS` directory into Lyrion's plugin directory and restart:
+
+```
+/var/lib/squeezeboxserver/Plugins/PAMTS/
+systemctl restart lyrionmusicserver
+```
+
+**Never leave an old copy beside it.** LMS scans every subdirectory of `Plugins` and
+loads a plugin by the `<module>` named in its `install.xml`, so a backup kept there —
+`PAMTS.bak-...` — is a second directory declaring the same `<id>` and the same
+`Plugins::PAMTS::Plugin`. The result is that the plugin registers **no CLI queries at
+all**: every `pamts` call returns an empty response, `perl -c` says the module is fine,
+and nothing is written to `server.log` or the journal. Keep backups somewhere else.
+
+LMS also takes **over two minutes** to open its JSON-RPC port after a restart, because it
+loads its extension list first. A verification that gives up sooner than that will report
+a failure that has not happened.
+
+Check all four queries after any upgrade:
+
+```
+["pamts","info","?"]              → version, counts
+["pamts","history",0,2]           → url, lastplayed, playcount
+["pamts","added",0,2]             → recently added, played or not
+["pamts","released",0,2]          → by release year
+["pamts","history",0,3,"since:N"] → incremental
+```
