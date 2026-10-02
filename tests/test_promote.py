@@ -506,6 +506,77 @@ def main():
     check(all(os.path.exists(os.path.join(fast, "Show", "Season 1", f"e{i:02d}.mkv"))
               for i in (5, 6)), "both files landed on fast storage")
 
+    # ------------------------------------------------- navidrome history sidecar
+    print("=== NAVIDROME: history for every user, without holding anyone's password")
+    import http.server, json as _json, threading                      # noqa: E402
+
+    _rows = [
+        # (path, play_count, users) -- two users on the first track, so the sidecar's
+        # cross-user SUM is visible rather than assumed.
+        {"path": "/player/tv/Band/Album/01.flac", "size": 100, "album_id": "a1",
+         "disc": 1, "track": 1, "title": "One", "last_played": 1700000000,
+         "play_count": 12, "users": 2},
+        {"path": "/player/tv/Band/Album/02.flac", "size": 200, "album_id": "a1",
+         "disc": 1, "track": 2, "title": "Two", "last_played": 1700000500,
+         "play_count": 1, "users": 1},
+        {"path": "/elsewhere/not-ours.flac", "size": 10, "album_id": "a2",
+         "disc": 1, "track": 1, "title": "Nope", "last_played": 1700000900,
+         "play_count": 99, "users": 1},
+    ]
+    _hits = []
+
+    class _Side(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            _hits.append(self.path)
+            body = _json.dumps(
+                {"version": "1.0.0", "played": 2}
+                if self.path.startswith("/info")
+                else {"count": len(_rows), "index": 0, "quantity": 5000,
+                      "history": _rows}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    _srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Side)
+    threading.Thread(target=_srv.serve_forever, daemon=True).start()
+    _url = "http://127.0.0.1:%d" % _srv.server_address[1]
+
+    nd = pamts_players.NavidromePlayer({"name": "nd", "url": "http://unused",
+                                        "history_url": _url})
+    check(nd.available() is True, "it is available with no username or password at all")
+    check(nd.history_timeout == 30, "the sidecar fetch is bounded by default")
+    check(nd.all_users is True, "and it reports that it covers every user")
+    check(nd.provides_sessions is False,
+          "but it does NOT claim now-playing, which still needs Subsonic")
+    items = nd.library_items()
+    check(items is not None and len(items) == 2,
+          f"only tracks under a configured root are returned (got {items and len(items)})")
+    by = {i["title"]: i for i in items}
+    check(by["One"]["play_count"] == 12,
+          "the cross-user play SUM is carried through, not the per-user count")
+    check(by["One"]["last_viewed"] == 1700000000, "and the newest play time")
+    check(by["One"]["fast"].startswith(fast), f"paths map onto the tier ({by['One']['fast']})")
+    check(all("/elsewhere/" not in i["fast"] for i in items),
+          "a path outside every root is dropped rather than guessed at")
+
+    # A sidecar that is down must not take the whole sweep down with it.
+    _srv.shutdown()
+    nd_down = pamts_players.NavidromePlayer({"name": "nd", "url": "http://unused",
+                                             "history_url": _url,
+                                             "history_timeout": 2})
+    check(nd_down.library_items() is None,
+          "an unreachable sidecar returns None (history unavailable), not []")
+    # None is the signal sweep() uses to skip the adapter; [] would mean "nothing has
+    # ever been played", which would hand eviction a false clean slate.
+    _items, _ok = pamts_players.sweep([nd_down])
+    check(_ok is False and _items == [],
+          "so sweep reports no usable history rather than an empty library")
+
     # --------------------------------------------------------- per-pool headroom
     print("=== HEADROOM: each budget pool is measured on its own")
     hp = pathlib.Path(tempfile.mkdtemp(prefix="pamts-headroom-"))

@@ -721,13 +721,27 @@ Verified against Navidrome 0.64.0.
         super().__init__(cfg)
         # With history_db set, history comes from the database and covers EVERY user.
         # Without it, the API is used and covers only the calling user.
-        self.all_users = bool(cfg.get("history_db"))
+        # History covering EVERY user comes from either the sidecar or a local
+        # database read; the Subsonic API can only ever report the calling account.
+        self.history_url = str(cfg.get("history_url") or "").rstrip("/")
+        # A sidecar that HANGS rather than refusing would otherwise stall the nightly
+        # sweep for a minute per page. Bounded, and configurable for slow links.
+        self.history_timeout = float(cfg.get("history_timeout") or 30)
+        self.all_users = bool(cfg.get("history_db") or self.history_url)
 
     def available(self):
         if not self.url:
             logging.error(f"[{self.name}] no url configured")
             return False
         if not self.cfg.get("username"):
+            if self.history_url:
+                # History-only mode. Sessions and locality need Subsonic, so they are
+                # switched off rather than failing on every call; the access observer
+                # already supplies now-playing for music.
+                self.provides_sessions = False
+                logging.info(f"[{self.name}] history-only via {self.history_url} "
+                             "(no credentials configured, so no now-playing)")
+                return True
             logging.error(f"[{self.name}] 'username' is required")
             return False
         if not self.cfg.get("music_folder"):
@@ -796,6 +810,8 @@ Verified against Navidrome 0.64.0.
         }
 
     def library_items(self):
+        if self.history_url:
+            return self._items_from_sidecar()
         if self.cfg.get("history_db"):
             return self._items_from_db()
         if not self.available():
@@ -826,6 +842,51 @@ Verified against Navidrome 0.64.0.
                 "is the account that actually listens, not a fresh service account.")
         return out
 
+    def _items_from_sidecar(self):
+        """Play history for EVERY user, from the read-only sidecar.
+
+        Same answer as _items_from_db, fetched over HTTP instead. The sidecar runs
+        where navidrome.db actually is, which is the point: PAMTS need not reach across
+        hosts, need not hold any listener's password, and need not know Navidrome's
+        schema. See scripts/mediastream/navidrome-history in the homelab repo.
+        """
+        out, index, page = [], 0, 5000
+        while True:
+            url = f"{self.history_url}/history?index={index}&quantity={page}"
+            try:
+                with urllib.request.urlopen(url, timeout=self.history_timeout) as r:
+                    doc = json.loads(r.read().decode())
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                logging.error(f"[{self.name}] history sidecar failed at index "
+                              f"{index}: {e}")
+                return None
+            rows = doc.get("history") or []
+            for h in rows:
+                full = h.get("path")
+                if not full:
+                    continue
+                m = pamts.split_root(full)
+                if not m:
+                    continue      # not under a configured root; not ours to manage
+                rel, fast_root, slow_root = m
+                out.append({
+                    "kind": "track", "show": None, "show_key": h.get("album_id"),
+                    "season": h.get("disc") or 1, "episode": h.get("track") or 0,
+                    "title": h.get("title"), "rel": rel,
+                    "fast": os.path.join(fast_root, rel),
+                    "slow": os.path.join(slow_root, rel),
+                    "size": int(h.get("size") or 0),
+                    "last_viewed": int(h.get("last_played") or 0),
+                    "play_count": int(h.get("play_count") or 0),
+                    "added": 0,
+                })
+            if len(rows) < page:
+                break
+            index += page
+        logging.info(f"[{self.name}] {len(out)} played track(s) from the sidecar "
+                     "(all users)")
+        return out
+
     def _items_from_db(self):
         """Play history for EVERY user, from navidrome.db.
 
@@ -841,16 +902,20 @@ Verified against Navidrome 0.64.0.
             logging.error(f"[{self.name}] history_db needs 'music_folder' too: the "
                           "database stores paths relative to it")
             return None
+        # play_count is SUMMED across users and play_date MAXed: two people each
+        # playing an album ten times is twenty plays of demand for it. (Across
+        # different SERVICES, sweep() merges by maximum instead, because there the same
+        # single listen is reported twice.)
         rows = self._read_db(
             "SELECT mf.path, mf.size, mf.album_id, mf.track_number, mf.disc_number, "
-            "       mf.title, MAX(a.play_date) "
+            "       mf.title, MAX(a.play_date), SUM(a.play_count) "
             "FROM annotation a JOIN media_file mf ON mf.id = a.item_id "
             "WHERE a.item_type = 'media_file' AND a.play_date IS NOT NULL "
             "GROUP BY mf.id")
         if rows is None:
             return None
         out = []
-        for path, size, album_id, track, disc, title, played in rows:
+        for path, size, album_id, track, disc, title, played, plays in rows:
             if not path:
                 continue
             full = path if path.startswith("/") else os.path.join(folder, path)
@@ -866,6 +931,7 @@ Verified against Navidrome 0.64.0.
                 "slow": os.path.join(slow_root, rel),
                 "size": int(size or 0),
                 "last_viewed": self._epoch(played),
+                "play_count": int(plays or 0),
                 "added": 0,
             })
         logging.info(f"[{self.name}] {len(out)} played file(s) from navidrome.db "

@@ -52,6 +52,42 @@ per-user history, and it only knows files that have been read, so its library vi
 partial by nature. Options: `url` (default `http://127.0.0.1:8621`), `timeout`,
 `demand_labels` (default `["PLAY", "FETCH"]`), `history_since`.
 
+### `history_url` — Navidrome history for every user
+
+Navidrome's Subsonic annotations are **per user**, and there is no admin view that
+aggregates them: a sweep reports only the calling account, and a service account sees
+nothing at all however much the library has been played. Covering a household through
+the API therefore means holding every listener's password.
+
+`history_url` points at the read-only sidecar instead
+(`scripts/mediastream/navidrome-history` in the homelab repo), which runs where
+`navidrome.db` is and serves the aggregate over HTTP:
+
+```toml
+[[players]]
+name = "navidrome"
+kind = "navidrome"
+url = "http://music.example:4533"
+history_url = "http://music.example:8623"
+history_timeout = 30
+```
+
+With it set, **no credentials are needed**: `username` and `token_file` become optional,
+PAMTS never reaches across hosts for a database file, and Navidrome's schema stays behind
+the sidecar rather than inside PAMTS.
+
+Omitting the credentials means this adapter reports **no now-playing** — `provides_sessions`
+goes False rather than failing on every call. The access observer covers that: it sees
+Navidrome's reads at the filesystem, whoever made them.
+
+`play_date` is MAXed and `play_count` **SUMMED** across users. Summing is right within one
+service — two people each playing an album ten times is twenty plays of demand for it.
+Across *different* services `sweep()` merges by maximum instead, because there the same
+single listen is being reported twice.
+
+`history_timeout` (default 30s) bounds the fetch: a sidecar that hangs rather than
+refusing would otherwise stall the nightly sweep a page at a time.
+
 ### `history_db`
 
 Neither music server's API can answer "what has *anyone* played" — LMS reports no play
