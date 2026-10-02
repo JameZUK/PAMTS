@@ -556,6 +556,24 @@ def main():
     check(hr2.left(str(mus / "a.flac")) == m_before - 100 * 1024 * 1024,
           "charging the music pool reduces exactly that pool")
 
+    # THE RESERVE MUST REMAIN USABLE. Eviction evicts down to budget - reserve; if
+    # promotion also stopped there, the two would converge and the reserve would be set
+    # aside and never spendable. That is exactly what happened in production the first
+    # night: "shared 347.4G of 400.0G (0B left)" with a 60 GB reserve, and not one item
+    # promotable. Promotion's ceiling is the BUDGET.
+    hr_res = promote.Headroom(jobs, 1.0, 512 * 1024 * 1024)      # 512 MB reserve
+    hr_none = promote.Headroom(jobs, 1.0, 0)
+    check(hr_res.left(str(vid / "Show" / "e01.mkv"))
+          == hr_none.left(str(vid / "Show" / "e01.mkv")),
+          "a reserve must not reduce what promotion may use "
+          f"({hr_res.left(str(vid / 'Show' / 'e01.mkv'))} vs "
+          f"{hr_none.left(str(vid / 'Show' / 'e01.mkv'))})")
+    check(hr_res.left(str(vid / "Show" / "e01.mkv"))
+          == hr_res.pools["__shared__"]["budget"] - hr_res.pools["__shared__"]["footprint"],
+          "promotion may fill the pool to its budget")
+    check(hr_res.pools["__shared__"]["reserve"] == 512 * 1024 * 1024,
+          "the reserve is still recorded, for reporting")
+
     # Nested sources must resolve to the most specific pool, which is how music is
     # configured in production: the tier job is on music/Organised, not all of music.
     nested = [

@@ -408,6 +408,22 @@ check("the eviction target is budget minus the reserve",
       str(byname["music"]))
 check("a pool under budget reports promotable room",
       byname["music"]["promotable_bytes"] >= 0, str(byname["music"]["promotable_bytes"]))
+# Measured against the BUDGET, not the eviction target: the reserve is the space
+# between the two lines and promotion is allowed to spend it. Measuring against the
+# target made the dashboard agree with a bug rather than with the engine.
+# The shared pool is UNDER budget here, so it is the one that shows the measure.
+_sh = byname["__shared__"]
+check("promotable room is measured against the budget, not the eviction target",
+      _sh["promotable_bytes"] == _sh["budget_bytes"] - _sh["bytes"],
+      f"{_sh['promotable_bytes']} vs {_sh['budget_bytes'] - _sh['bytes']}")
+check("and it exceeds the eviction target's slack, which is the point of the reserve",
+      _sh["promotable_bytes"] > _sh["target_bytes"] - _sh["bytes"],
+      f"promotable={_sh['promotable_bytes']} target slack="
+      f"{_sh['target_bytes'] - _sh['bytes']}")
+# An over-budget pool has none, rather than a negative figure.
+check("an over-budget pool reports zero promotable room, not a negative number",
+      byname["music"]["promotable_bytes"] == 0,
+      str(byname["music"]["promotable_bytes"]))
 # 512 bytes of budget against 1024 bytes of content. Expressed in GB because that is
 # the unit the config uses, which is also why the source must not int() it away.
 _tiny = dash.TierSource({"tier_jobs": [dict(_tj[0])], "budget_gb": 512 / 1024 ** 3,

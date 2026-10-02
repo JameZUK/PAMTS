@@ -260,8 +260,10 @@ class TierSource(Source):
             pool["used_fraction"] = (pool["bytes"] / bud) if bud else None
             pool["free_bytes"] = (bud - pool["bytes"]) if bud else None
             pool["over_budget"] = bool(bud and pool["bytes"] > bud)
-            pool["promotable_bytes"] = (max(0, pool["target_bytes"] - pool["bytes"])
-                                        if pool["target_bytes"] is not None else None)
+            # Promotion fills to the BUDGET; eviction's floor is budget - reserve.
+            # The reserve is the space between the two, so promotable room is measured
+            # against the budget, not against the eviction target.
+            pool["promotable_bytes"] = max(0, bud - pool["bytes"]) if bud else None
         ordered = sorted(pools.values(), key=lambda p: -(p["bytes"] or 0))
         return {
             "pools": ordered,

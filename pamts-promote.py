@@ -102,7 +102,22 @@ class Headroom:
         for key, pool in self.pools.items():
             live = [p for p in pool["sources"] if os.path.isdir(p)]
             pool["footprint"] = tier_footprint(live)
-            pool["left"] = pool["budget"] - reserve_bytes - pool["footprint"]
+            # Promotion may fill the pool to its BUDGET. The reserve is not subtracted
+            # here, and that is the whole point of it.
+            #
+            # Eviction evicts down to budget - reserve. If promotion then also stopped
+            # at budget - reserve, the two would converge on the same line and the
+            # reserve would be set aside and never usable. Measured in production the
+            # morning after it was introduced: "shared 347.4G of 400.0G (0B left);
+            # music-organised 739.7G of 800.0G (271.4M left)" -- 60 GB reserved in each
+            # pool, none of it available, and not one album promotable.
+            #
+            # The reserve is the working space BETWEEN the two lines: eviction keeps
+            # the floor at budget - reserve, promotion may climb to budget, and a
+            # promoted item is protected for promote_protect_days so the next eviction
+            # takes staler content rather than undoing the promotion.
+            pool["left"] = pool["budget"] - pool["footprint"]
+            pool["reserve"] = reserve_bytes
 
     def pool_of(self, fast_path):
         """Longest matching tier source wins, so nested sources resolve correctly."""
@@ -128,7 +143,7 @@ class Headroom:
 
     def describe(self):
         return "; ".join(
-            "%s %s of %s (%s left)" % (
+            "%s %s of %s (%s promotable)" % (
                 "shared" if k == "__shared__" else k,
                 human(p["footprint"]), human(p["budget"]), human(max(0, p["left"])))
             for k, p in sorted(self.pools.items()))
