@@ -278,6 +278,7 @@ class PlexPlayer(Player):
                         "slow": os.path.join(slow_root, rel),
                         "size": sz,
                         "last_viewed": it.get("lastViewedAt") or 0,
+                        "play_count": it.get("viewCount") or 0,
                         "added": it.get("addedAt") or 0,
                     })
         except (urllib.error.URLError, OSError, ValueError, KeyError) as e:
@@ -437,7 +438,7 @@ class LmsPlayer(Player):
                          "companion plugin, or set history_db) - promotion still works")
         return True
 
-    def _item(self, path, last_played, size=0):
+    def _item(self, path, last_played, size=0, play_count=0):
         m = pamts.split_root(path)
         if not m:
             return None
@@ -448,7 +449,8 @@ class LmsPlayer(Player):
                 "fast": os.path.join(fast_root, rel),
                 "slow": os.path.join(slow_root, rel),
                 "size": int(size or 0),
-                "last_viewed": int(last_played or 0), "added": 0}
+                "last_viewed": int(last_played or 0),
+                "play_count": int(play_count or 0), "added": 0}
 
     def _items_from_plugin(self):
         """Play history from the companion plugin, paged."""
@@ -465,7 +467,8 @@ class LmsPlayer(Player):
                 path = self._path_from_url(h.get("url"))
                 if not path:
                     continue          # a stream or podcast, not a library file
-                it = self._item(path, h.get("lastplayed"), h.get("filesize"))
+                it = self._item(path, h.get("lastplayed"), h.get("filesize"),
+                                h.get("playcount"))
                 if it:
                     out.append(it)
             if len(rows) < self._page:
@@ -510,7 +513,7 @@ class LmsPlayer(Player):
         if rows is None:
             return None
         out = []
-        for url, last_played, _plays in rows:
+        for url, last_played, plays in rows:
             path = self._path_from_url(url)
             if not path:
                 continue
@@ -526,6 +529,7 @@ class LmsPlayer(Player):
                 "slow": os.path.join(slow_root, rel),
                 "size": 0,
                 "last_viewed": int(last_played or 0),
+                "play_count": int(plays or 0),
                 "added": 0,
             })
         logging.info(f"[{self.name}] {len(out)} played track(s) from persist.db")
@@ -786,6 +790,7 @@ Verified against Navidrome 0.64.0.
             "slow": os.path.join(slow_root, rel),
             "size": int(s.get("size") or 0),
             "last_viewed": self._epoch(s.get("played")),
+            "play_count": int(s.get("playCount") or 0),
             "added": self._epoch(s.get("created")),
             "_path": full,
         }
@@ -1238,8 +1243,15 @@ def sweep(players):
             prev = merged.get(key)
             if prev is None:
                 merged[key] = dict(it)
-            elif (it.get("last_viewed") or 0) > (prev.get("last_viewed") or 0):
-                prev["last_viewed"] = it["last_viewed"]
+            else:
+                if (it.get("last_viewed") or 0) > (prev.get("last_viewed") or 0):
+                    prev["last_viewed"] = it["last_viewed"]
+                # Play COUNT merges by maximum for the same reason recency does: an
+                # album played fifty times in one app and never opened in another is
+                # not an album played zero times. Summing instead would double-count
+                # the same listen when two servers both saw it.
+                if (it.get("play_count") or 0) > (prev.get("play_count") or 0):
+                    prev["play_count"] = it["play_count"]
             if it.get("last_viewed"):
                 played += 1
         logging.info(f"[{p.name}] {len(items)} item(s), {played} played")

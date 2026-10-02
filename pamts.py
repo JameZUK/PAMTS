@@ -234,10 +234,11 @@ def configure(raw):
                     "deletions, so a circuit breaker is mandatory -- set it to a little "
                     "above the largest number of deletions you would consider normal.")
             if (j.get("depth") or j.get("grace") is not None
-                    or j.get("budget_gb") is not None):
+                    or j.get("budget_gb") is not None
+                    or j.get("play_weight_days") is not None):
                 raise ConfigError(
-                    f"backup job {name!r} must not set 'depth'/'grace'/'budget_gb' "
-                    "(those are tier-only settings)")
+                    f"backup job {name!r} must not set 'depth'/'grace'/'budget_gb'/"
+                    "'play_weight_days' (those are tier-only settings)")
         else:
             if j.get("max_delete"):
                 raise ConfigError(
@@ -258,6 +259,20 @@ def configure(raw):
                         f"tier job {name!r}: budget_gb must be greater than 0. Omit it "
                         "to share the global [tier] budget_gb instead.")
                 j = dict(j, budget_gb=bg)
+            # How much apparent recency a DOUBLING of the play count is worth, in days.
+            # 0 (the default) means rank on recency alone, which is right for TV.
+            pw = j.get("play_weight_days")
+            if pw is not None:
+                try:
+                    pw = float(pw)
+                except (TypeError, ValueError):
+                    raise ConfigError(
+                        f"tier job {name!r}: play_weight_days must be a number")
+                if pw < 0:
+                    raise ConfigError(
+                        f"tier job {name!r}: play_weight_days must be >= 0 "
+                        "(0 disables play-count weighting for this job)")
+                j = dict(j, play_weight_days=pw)
         JOBS.append(dict(j))
     if not JOBS:
         raise ConfigError("no [[jobs]] configured; there is nothing for PAMTS to do")

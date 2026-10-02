@@ -209,6 +209,40 @@ Patterns are passed to rsync. Excluded paths are **never deleted** on the destin
 behind an exclude is protected. A configured `exclude_from` file that has gone missing
 aborts the job, because running without it would delete what the excludes protect.
 
+### `play_weight_days` (tier jobs only)
+
+How many days of apparent recency each **doubling** of the play count is worth. `0`, the
+default, ranks on recency alone.
+
+Recency alone is the wrong measure for music. An album played two hundred times but last
+reached for five months ago ranks below one played once last week, so the best-loved
+record is evicted and the curiosity is kept — the opposite of what a cache is for.
+
+```toml
+[[jobs]]
+name = "music"
+mode = "tier"
+play_weight_days = 30
+```
+
+At 30: one play buys 30 days, three buys 60, seven buys 90, two hundred buys about 229.
+It is `log2`, so the credit is bounded and diminishing — a much-played album is favoured,
+not made immortal.
+
+**Leave it at 0 for television.** Viewing there is sequential: "what you watched last"
+genuinely does predict "what you watch next", and a rewatched favourite should not hold
+the tier against the series you are part-way through.
+
+The count is the **maximum** over the directory, not the sum: an album's play count is
+"how often this album gets played", and its most-played track estimates that far better
+than a total that merely rewards long track lists. Across adapters it merges by maximum
+too — an album played fifty times in one app and never opened in another is not an album
+played zero times, and summing would double-count a single listen seen by two servers.
+
+Sources: Plex `viewCount`, Lyrion `playcount` via the companion plugin (or `persist.db`),
+Navidrome `playCount`. The access observer contributes recency only — it sees reads, not
+per-user counts.
+
 ### `budget_gb` (tier jobs only)
 
 A tier job may carve out its own allowance instead of sharing `[tier] budget_gb`:

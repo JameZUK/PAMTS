@@ -1010,6 +1010,87 @@ finally:
     tier.run_rsync = _saved_run
 
 
+# ------------------------------------------------------------ play-count weighting
+print("=== PLAY COUNT: a much-loved old album beats a once-played recent one")
+_proot = pathlib.Path(tempfile.mkdtemp(prefix="pamts-plays-"))
+_pfast, _pslow = _proot / "fast", _proot / "slow"
+# Two albums, 1 MB each. "Loved" was last played 150 days ago but 200 times;
+# "Curio" was played once, 10 days ago. Recency alone evicts Loved. That is wrong for
+# music, and it is exactly what this weighting exists to correct.
+mkfile(_pfast / "music" / "Loved" / "01.flac", size=1024 * 1024, mtime_days=900)
+mkfile(_pfast / "music" / "Curio" / "01.flac", size=1024 * 1024, mtime_days=900)
+_pviews = {str(_pfast / "music" / "Loved" / "01.flac"): time.time() - 86400 * 150,
+           str(_pfast / "music" / "Curio" / "01.flac"): time.time() - 86400 * 10}
+_pplays = {str(_pfast / "music" / "Loved" / "01.flac"): 200,
+           str(_pfast / "music" / "Curio" / "01.flac"): 1}
+
+def _evicted(weight):
+    captured.clear()
+    tier.do_tier([job("tier", _pfast / "music", _pslow / "music", depth=1, grace=False,
+                      play_weight_days=weight)],
+                 budget=1024 * 1024, dry_run=True, views=_pviews, plays=_pplays)
+    moved = [" ".join(c) for c in captured if "--remove-source-files" in c]
+    return [n for n in ("Loved", "Curio") if any("/" + n in m for m in moved)]
+
+_no_weight = _evicted(0)
+check("with no weighting, recency alone evicts the much-played album",
+      _no_weight == ["Loved"], str(_no_weight))
+_weighted = _evicted(30)
+check("with 30-day weighting it evicts the curiosity instead",
+      _weighted == ["Curio"], str(_weighted))
+
+# The credit must be bounded: log2, so doubling the plays adds a fixed amount rather
+# than making a much-played item effectively immortal.
+_c1 = 30 * __import__("math").log2(1 + 1)
+_c200 = 30 * __import__("math").log2(1 + 200)
+check("one play buys play_weight_days", abs(_c1 - 30) < 0.001, str(_c1))
+check("200 plays buys far less than 200x that", _c200 < 30 * 8, f"{_c200:.0f}d")
+check("but still more than one play does", _c200 > _c1 * 7, f"{_c200:.0f}d")
+
+# play_count comes from scan_dir as the MAX over the directory, not the sum.
+mkfile(_pfast / "agg" / "Album" / "a.flac", size=10, mtime_days=1)
+mkfile(_pfast / "agg" / "Album" / "b.flac", size=10, mtime_days=1)
+_d = tier.scan_dir(str(_pfast / "agg" / "Album"), plays={
+    str(_pfast / "agg" / "Album" / "a.flac"): 5,
+    str(_pfast / "agg" / "Album" / "b.flac"): 9})
+check("an album's play count is its most-played track, not the sum",
+      _d["play_count"] == 9, str(_d["play_count"]))
+check("and it is 0 when nothing is known",
+      tier.scan_dir(str(_pfast / "agg" / "Album"))["play_count"] == 0)
+shutil.rmtree(_proot, ignore_errors=True)
+
+print("=== CONFIG: play_weight_days is tier-only and non-negative")
+e = _cfg_err_pw = None
+
+
+def _pw_err(frag):
+    d = pathlib.Path(tempfile.mkdtemp(prefix="pamts-pw-"))
+    f = d / "pamts.toml"
+    f.write_text('[[players]]\nname = "p"\nurl = "http://x"\ntoken_file = "/dev/null"\n'
+                 '[[roots]]\nplayer_path = "/p"\nfast = "/f"\nslow = "/s"\n' + frag)
+    try:
+        pamts.load_and_configure(str(f))
+        return None
+    except pamts.ConfigError as ex:
+        return str(ex)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+e = _pw_err('[[jobs]]\nname = "t"\nmode = "tier"\nsource = "/a"\ndest = "/b"\n'
+            'play_weight_days = -1\n')
+check("a negative play_weight_days is refused", e is not None and "play_weight_days" in e,
+      repr(e))
+e = _pw_err('[[jobs]]\nname = "b"\nmode = "backup"\nsource = "/a"\ndest = "/b"\n'
+            'max_delete = 5\nplay_weight_days = 30\n')
+check("a backup job may not set it", e is not None and "play_weight_days" in e, repr(e))
+e = _pw_err('[[jobs]]\nname = "t"\nmode = "tier"\nsource = "/a"\ndest = "/b"\n'
+            'play_weight_days = 30\n')
+check("a positive value is accepted", e is None, repr(e))
+check("and stored as a float", pamts.JOBS[0].get("play_weight_days") == 30.0,
+      repr(pamts.JOBS[0].get("play_weight_days")))
+
+
 # -------------------------------------------------------- the promotion reserve
 print("=== RESERVE: eviction leaves room for promotion, instead of filling to budget")
 _rroot = pathlib.Path(tempfile.mkdtemp(prefix="pamts-reserve-"))

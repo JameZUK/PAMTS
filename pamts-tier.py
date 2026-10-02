@@ -43,6 +43,7 @@ import collections
 import errno
 import fcntl
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -101,7 +102,7 @@ def dest_is_acceptable(path):
     return (fstype or "").lower() in allowed, mp, fstype
 
 
-def scan_dir(path, views=None, pins=None):
+def scan_dir(path, views=None, pins=None, plays=None):
     """Summarise a tree: size, newest mtime, in-progress marker, newest play, pins.
 
     atime is deliberately NOT collected -- see docs/DESIGN.md. `views` maps a fast-tier
@@ -122,10 +123,11 @@ def scan_dir(path, views=None, pins=None):
     """
     views = views or {}
     pins = pins or {}
+    plays = plays or {}
     suffixes = tuple(pamts.TIER["inprogress_suffixes"])
     sidecars = tuple(s.lower() for s in pamts.TIER["sidecar_suffixes"])
     out = {"size": 0, "mtime": 0, "mtime_any": 0, "inprogress": False, "last_view": 0,
-           "pinned_bytes": 0, "pinned_rels": []}
+           "play_count": 0, "pinned_bytes": 0, "pinned_rels": []}
     for dirpath, _dirs, files in os.walk(path, followlinks=False):
         for fn in files:
             fp = os.path.join(dirpath, fn)
@@ -140,6 +142,10 @@ def scan_dir(path, views=None, pins=None):
             if not fn.lower().endswith(sidecars):
                 out["mtime"] = max(out["mtime"], st.st_mtime)
             out["last_view"] = max(out["last_view"], views.get(fp, 0))
+            # MAX across the directory, not the sum: an album's play count is "how
+            # often this album gets played", and its most-played track is a far better
+            # estimate of that than the total, which just rewards long track lists.
+            out["play_count"] = max(out["play_count"], plays.get(fp, 0))
             if fp in pins:
                 out["pinned_bytes"] += st.st_size
                 out["pinned_rels"].append(os.path.relpath(fp, path))
@@ -265,7 +271,7 @@ def do_backup(job, dry_run):
 
 
 # ------------------------------------------------------------------------ tier
-def tier_candidates(jobs, views=None, pins=None):
+def tier_candidates(jobs, views=None, pins=None, plays=None):
     """Evictable units: one per directory at each job's configured depth."""
     out = []
     for job in jobs:
@@ -275,13 +281,15 @@ def tier_candidates(jobs, views=None, pins=None):
             continue
         depth = int(job.get("depth", 1))
         for path in pamts.dirs_at_depth(src, depth):
-            d = scan_dir(path, views, pins)
+            d = scan_dir(path, views, pins, plays)
             rel = os.path.relpath(path, src)
             parent = os.path.dirname(rel)
             dst_parent = os.path.join(job["dest"], parent) if parent else job["dest"]
             out.append({"path": path, "dst": dst_parent, "rel": rel,
                         "size": d["size"], "mtime": d["mtime"],
                         "inprogress": d["inprogress"], "last_view": d["last_view"],
+                        "play_count": d["play_count"],
+                        "play_weight_days": float(job.get("play_weight_days") or 0),
                         "pinned_bytes": d["pinned_bytes"],
                         "pinned_rels": d["pinned_rels"],
                         "evictable": d["size"] - d["pinned_bytes"],
@@ -319,6 +327,7 @@ def gather_views(jobs):
     players = pamts_players.build_all(pamts.PLAYERS)
     items, hist_ok = pamts_players.sweep(players)
     views = {it["fast"]: it["last_viewed"] for it in items if it.get("last_viewed")}
+    plays = {it["fast"]: it["play_count"] for it in items if it.get("play_count")}
 
     # PAMTS's own record of what it has seen playing. This is what lets a player
     # with no history API (e.g. LMS) still drive ranking, and it is scan-immune by
@@ -347,12 +356,13 @@ def gather_views(jobs):
         logging.warning("[tier] no player supplied play history; ranking on "
                         "PAMTS's observed plays alone. This is expected for "
                         "session-only players, and improves as history accumulates.")
-    logging.info(f"[tier] view data: {len(views)} played item(s)")
-    return views, items, hist_ok
+    logging.info(f"[tier] view data: {len(views)} played item(s), "
+                 f"{len(plays)} with a play count")
+    return views, items, hist_ok, plays
 
 
 def do_tier(jobs, budget, dry_run, views=_FETCH, pins=None, items=None,
-            hist_ok=True, pool=None):
+            hist_ok=True, pool=None, plays=None):
     now = time.time()
     protected = pamts.protected_now(now)
     if protected:
@@ -362,7 +372,7 @@ def do_tier(jobs, budget, dry_run, views=_FETCH, pins=None, items=None,
         got = gather_views(jobs)
         if got is None:
             return False
-        views, items, hist_ok = got
+        views, items, hist_ok, plays = got
 
     # Pins are per group: both the depth and the headroom it is derived from are
     # relative to THIS group's budget and footprint, not the estate's.
@@ -382,7 +392,7 @@ def do_tier(jobs, budget, dry_run, views=_FETCH, pins=None, items=None,
     if removed:
         logging.info(f"[tier] removed {removed} empty directories (fast tier only)")
 
-    cands = tier_candidates(jobs, views, pins)
+    cands = tier_candidates(jobs, views, pins, plays)
     # True footprint, not the sum of candidates: content above the candidate depth
     # still occupies the budget even though it is not individually evictable.
     footprint = sum(scan_dir(j["source"], views, pins)["size"]
@@ -452,8 +462,26 @@ def do_tier(jobs, budget, dry_run, views=_FETCH, pins=None, items=None,
     # content falls back to mtime -- also scan-immune, and for never-watched content
     # "when it arrived" is the right proxy for how long it has occupied fast storage
     # for nothing.
+    #
+    # Play COUNT then credits the item with extra apparent recency, because recency
+    # alone is the wrong measure for music. An album played two hundred times but last
+    # reached for five months ago ranks below one played once last week, so the
+    # best-loved record is evicted and the curiosity is kept -- the opposite of what a
+    # cache is for. Television does not behave that way: viewing is sequential, "what
+    # you watched last" really does predict "what you watch next", so the weight
+    # defaults to 0 and TV is unaffected unless asked.
+    #
+    # log2, not linear: each DOUBLING of the play count is worth play_weight_days. So
+    # at 30 days, one play buys 30 days, 3 plays 60, 7 plays 90, 200 plays about 229 --
+    # a bounded, diminishing credit rather than something that makes a much-played
+    # album immortal.
     def staleness(c):
-        return c["last_view"] if c["last_view"] else c["mtime"]
+        base = c["last_view"] if c["last_view"] else c["mtime"]
+        weight = c.get("play_weight_days") or 0
+        count = c.get("play_count") or 0
+        if weight <= 0 or count <= 0:
+            return base
+        return base + weight * 86400 * math.log2(1 + count)
 
     queue = sorted([c for c in cands if c["ok"]], key=staleness)
     # Grace-protected items are a LAST resort, oldest first, so a large back-catalogue
@@ -501,6 +529,9 @@ def do_tier(jobs, budget, dry_run, views=_FETCH, pins=None, items=None,
         when = (f"last played {(now - c['last_view']) / 86400:.0f}d ago"
                 if c["last_view"] else
                 f"never played, added {(now - c['mtime']) / 86400:.0f}d ago")
+        if (c.get("play_weight_days") or 0) > 0 and (c.get("play_count") or 0) > 0:
+            credit = c["play_weight_days"] * math.log2(1 + c["play_count"])
+            when += f", {c['play_count']} play(s) = +{credit:.0f}d credit"
         keep = (f", keeping {len(c['pinned_rels'])} pinned item(s)"
                 if c["pinned_rels"] else "")
         logging.info(f"[tier]   {c['rel']} {human(c['evictable'])} ({when}){keep}")
@@ -612,7 +643,7 @@ def main():
         if gathered is None:
             failures += 1
         else:
-            views, items, hist_ok = gathered
+            views, items, hist_ok, plays = gathered
             for gb, grp, is_own in budget_groups(tier_jobs, budget_gb):
                 names = ", ".join(j["name"] for j in grp)
                 logging.info(f"[tier] ----- group [{names}]: budget {gb:g} GB "
@@ -620,7 +651,7 @@ def main():
                 pool_name = grp[0]["name"] if is_own else "__shared__"
                 if not do_tier(grp, int(gb * pamts.GB), args.dry_run,
                                views=views, pins=None, items=items, hist_ok=hist_ok,
-                               pool=pool_name):
+                               pool=pool_name, plays=plays):
                     failures += 1
     for j in [j for j in jobs if j["mode"] == "backup"]:
         if not do_backup(j, args.dry_run):
