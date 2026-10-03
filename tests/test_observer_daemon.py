@@ -666,10 +666,19 @@ check("the queue is a deque, not a list",
       isinstance(_c2._queue, _co.deque),
       "a list drained with pop(0) is O(n) per item; one observed burst held ~233,000")
 check("and it has popleft, which is the O(1) drain", hasattr(_c2._queue, "popleft"))
-check("the collector declares a default ceiling",
-      _bpf.Collector.max_pending > 233_000,
-      f"{_bpf.Collector.max_pending} must exceed the largest burst the ring absorbs, "
-      "or normal spikes would be reported as backpressure")
+# The bound has to be small enough to BE a bound. At 500,000 a full queue of dicts was
+# worth roughly 250 MB -- a quarter of the daemon's ceiling -- so it could not prevent
+# the OOM it was added for. Observed pending depth is 0 even through bursts of millions,
+# because the kernel ring absorbs them and userspace drains faster than they arrive.
+check("the queue bound is small enough to bound memory",
+      _bpf.Collector.max_pending <= 150_000,
+      f"{_bpf.Collector.max_pending} entries of ~500 B is "
+      f"~{_bpf.Collector.max_pending * 500 / 1e6:.0f} MB; against a 2 GB ceiling a "
+      "bound worth hundreds of megabytes is not a safety bound")
+check("but comfortably above any observed pending depth",
+      _bpf.Collector.max_pending >= 50_000,
+      f"{_bpf.Collector.max_pending} must stay well clear of normal operation, "
+      "where measured depth is 0")
 
 # Overfill it. The oldest go, and the loss is COUNTED -- "we stopped keeping up" and
 # "nothing happened" must not look the same.

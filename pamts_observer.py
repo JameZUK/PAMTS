@@ -110,6 +110,14 @@ DEFAULTS = {
     "play_long_duration":  30.0,     # long+progressive counts even if coverage unknown
     "fetch_max_filesize": 64 * MB,   # a whole file this small, read fast, is a fetch
     "region_gap":         4 * MB,  # a jump this large starts a new region
+    # Requests held per OPEN session before the oldest are folded into an aggregate
+    # (see fold_partials). An open session kept one object per read RPC for as long
+    # as reads kept arriving, so a single sustained read grew without limit -- one
+    # burst reached 2.7 million events and OOM-killed the daemon five times in a
+    # fortnight. 20,000 is far above any genuine playback session (a 3-hour film at
+    # 128 KB per read is ~170,000 over its whole length, and it closes long before
+    # that) while capping the memory one session can hold at a few megabytes.
+    "max_open_requests": 20_000,
     # bulk sweep guard
     "bulk_window":       120.0,
     "bulk_min_files":     25,
@@ -272,13 +280,145 @@ def sessionise(requests, idle_gap=None):
     return sessions
 
 
-def signature(session, cfg=None):
-    """Per-file access signature. Pure arithmetic over one session's requests."""
+def _finalise(f, c):
+    """Turn a complete aggregate into the signature dict every caller expects."""
+    total = f["bytes"]
+    filesize = f["filesize"]
+    known = sum(f["methods"].values()) or 1
+    duration = f["t_last"] - f["t_first"]
+    return {
+        "fh":            f["fh"],
+        "t_first":       f["t_first"],
+        "t_last":        f["t_last"],
+        "duration":      duration,
+        "requests":      f["n"],
+        "bytes":         total,
+        "filesize":      filesize,
+        "coverage":      (total / filesize) if filesize else None,
+        "min_offset":    f["min_offset"] or 0,
+        "max_offset":    f["max_offset"] or 0,
+        "span":          (f["max_end"] - f["min_offset"]) if f["n"] else 0,
+        "monotonic":     (f["mono_ok"] / f["mono_n"]) if f["mono_n"] else 1.0,
+        "regions":       f["regions"],
+        "starts_at_zero": f["min_offset"] == 0,
+        "short_reads":   f["short_reads"],
+        "errors":        f["errors"],
+        "rate":          (total / duration) if duration > 0 else None,
+        "frac_splice":   f["methods"]["splice"] / known,
+        "frac_vector":   f["methods"]["vector"] / known,
+        "frac_direct":   f["methods"]["direct"] / known,
+        "method":        (max(f["methods"], key=f["methods"].get)
+                          if sum(f["methods"].values()) else None),
+        # So a consumer can tell that `regions` is approximate here.
+        "folded":        f["n_folded"],
+    }
+
+
+def _merged_signature(folded, reqs, c):
+    """Folded aggregate + the requests still held = one signature."""
+    n_folded = folded["n"]
+    f = fold_partials(dict(folded, methods=dict(folded["methods"])), reqs,
+                      c["region_gap"])
+    # max, not the tail's last: a request can arrive with a ts earlier than
+    # something already folded, and duration must not go backwards.
+    f["t_last"] = max(f["t_last"], reqs[-1].ts)
+    f["n_folded"] = n_folded
+    return _finalise(f, c)
+
+
+def _folded_only_signature(folded, c):
+    """Everything was folded away -- possible only if the cap is tiny."""
+    f = dict(folded, methods=dict(folded["methods"]))
+    f["t_last"] = f["t_first"]
+    f["n_folded"] = f["n"]
+    return _finalise(f, c)
+
+
+def fold_partials(folded, reqs, region_gap):
+    """Absorb `reqs` into a running aggregate so they need not be kept.
+
+    WHY. A session holds one Request per read RPC for as long as it stays open, and
+    nothing closed it while reads kept arriving. A sustained read of a single file --
+    a library analysis pass, a big copy -- therefore grew that list without limit:
+    one observed burst was 2.7 MILLION read events, and the daemon was OOM-killed
+    five times in a fortnight against its 1 GB ceiling, losing coverage during
+    exactly the periods generating the most events.
+
+    WHAT SURVIVES EXACTLY. Everything classification depends on except one field:
+    byte count, request count, duration, rate, coverage, filesize, offsets, span,
+    monotonicity, short reads and errors are all either sums, minima or maxima, and
+    fold without loss.
+
+    WHAT DEGRADES, and only in one circumstance. The aggregate carries prev_end and
+    last_offset across the boundary, so `regions` and `monotonic` come out EXACT for
+    requests folded in timestamp order -- verified against the unfolded signature on
+    both sequential and random access patterns. The exception is a request that
+    arrives with a timestamp EARLIER than something already folded, which happens
+    when reads interleave: signature() would have sorted it into place, and a fold
+    cannot be re-sorted. Then `monotonic` reflects arrival order rather than
+    timestamp order for that one step. `regions` is unaffected, and classify() only
+    trusts regions alongside a low monotonic score anyway.
+    """
+    reqs = sorted(reqs, key=lambda r: r.ts)
+    if not reqs:
+        return folded
+    f = folded or {
+        "n": 0, "bytes": 0, "fh": reqs[0].fh, "t_first": reqs[0].ts,
+        "t_last": reqs[0].ts,
+        "min_offset": None, "max_offset": None, "max_end": 0, "filesize": None,
+        "methods": {m: 0 for m in METHODS}, "mono_ok": 0, "mono_n": 0,
+        "regions": 0, "prev_end": None, "last_offset": None,
+        "short_reads": 0, "errors": 0,
+    }
+    for r in reqs:
+        end = r.offset + (r.delivered or r.requested or 0)
+        f["n"] += 1
+        if r.delivered:
+            f["bytes"] += r.delivered
+        f["t_first"] = min(f["t_first"], r.ts)
+        f["t_last"] = max(f["t_last"], r.ts)
+        f["min_offset"] = (r.offset if f["min_offset"] is None
+                           else min(f["min_offset"], r.offset))
+        f["max_offset"] = (r.offset if f["max_offset"] is None
+                           else max(f["max_offset"], r.offset))
+        f["max_end"] = max(f["max_end"], end)
+        if r.eof_hint is not None:
+            f["filesize"] = (r.eof_hint if f["filesize"] is None
+                             else max(f["filesize"], r.eof_hint))
+        if r.method in f["methods"]:
+            f["methods"][r.method] += 1
+        if f["last_offset"] is not None:
+            f["mono_n"] += 1
+            if r.offset >= f["last_offset"]:
+                f["mono_ok"] += 1
+        if f["prev_end"] is None:
+            f["regions"] = 1
+        elif abs(r.offset - f["prev_end"]) > region_gap:
+            f["regions"] += 1
+        f["prev_end"] = end if f["prev_end"] is None else max(f["prev_end"], end)
+        f["last_offset"] = r.offset
+        if r.short:
+            f["short_reads"] += 1
+        if r.status is not None:
+            f["errors"] += 1
+    return f
+
+
+def signature(session, cfg=None, folded=None):
+    """Per-file access signature. Pure arithmetic over one session's requests.
+
+    `folded` carries the aggregate of requests already discarded to bound memory;
+    see fold_partials. Without it this is exactly as it always was.
+    """
     c = dict(DEFAULTS)
     if cfg:
         c.update(cfg)
 
     reqs = sorted(session, key=lambda r: r.ts)
+    if folded and reqs:
+        return _merged_signature(folded, reqs, c)
+    if folded:
+        return _folded_only_signature(folded, c)
     delivered = [r for r in reqs if r.delivered]
     total = sum(r.delivered for r in delivered)
 
@@ -546,6 +686,8 @@ class SessionTracker:
         # only ever saw reads, so "when did this land" had to come from mtime.
         self._writes = {}
         self.arrivals = 0
+        #: How many held requests have been folded away, so the cost is visible.
+        self.folded_requests = 0
         self.bytes_written = 0
         self.on_arrival = None
         # Optional (dev, ino) -> "audio"/"video"/None. The tracker has no paths,
@@ -605,6 +747,23 @@ class SessionTracker:
             if self.on_arrival:
                 self.on_arrival(key, w)
 
+    def _maybe_fold(self, st):
+        """Keep an open session's held requests bounded.
+
+        Folds the OLDEST half rather than one at a time: folding on every arrival
+        past the cap would do the work once per read for the rest of the session's
+        life, which on a flood is the cost we are trying to avoid.
+        """
+        cap = int(self.cfg.get("max_open_requests")
+                  or DEFAULTS["max_open_requests"])
+        if cap <= 0 or len(st["reqs"]) <= cap:
+            return
+        keep = cap // 2
+        drop = st["reqs"][:-keep] if keep else st["reqs"]
+        st["folded"] = fold_partials(st["folded"], drop, self.cfg["region_gap"])
+        st["reqs"] = st["reqs"][-keep:] if keep else []
+        self.folded_requests += len(drop)
+
     def recent_write(self, dev, ino):
         """When was this file last written? -> ts, or None if not seen recently.
 
@@ -624,11 +783,13 @@ class SessionTracker:
         st = self._open.get(key)
         if st is None:
             st = {"reqs": [], "pending": {}, "last": rec.ts,
-                  "first": rec.ts, "checkpointed": False, "uids": set()}
+                  "first": rec.ts, "checkpointed": False, "uids": set(),
+                  "folded": None}
             self._open[key] = st
         st["last"] = max(st["last"], rec.ts)
         if rec.uid is not None:
             st["uids"].add(rec.uid)
+        self._maybe_fold(st)
 
         pend = st["pending"]
         cur = pend.get(rec.xid)
@@ -694,7 +855,7 @@ class SessionTracker:
                     reqs = st["reqs"] + list(st["pending"].values())
                     if not reqs:
                         continue
-                    sig = self._sig(key, reqs, st["uids"])
+                    sig = self._sig(key, reqs, st["uids"], st.get("folded"))
                     if classify(sig, self.cfg) == "PLAY":
                         st["checkpointed"] = True
                         self.checkpoints += 1
@@ -721,7 +882,7 @@ class SessionTracker:
             if self.on_close:
                 self.on_close(key, sig, label, first)
 
-    def _sig(self, key, reqs, uids=None):
+    def _sig(self, key, reqs, uids=None, folded=None):
         """Build the session signature. `uids` is every credential seen on it.
 
         Two fields, because one number cannot honestly answer both questions:
@@ -730,7 +891,7 @@ class SessionTracker:
         reading the same file at the same time -- and reporting either of them as
         "the" reader would be a guess. None means "do not attribute this".
         """
-        sig = signature(reqs, self.cfg)
+        sig = signature(reqs, self.cfg, folded=folded)
         sig["key"] = key
         sig["dev"], sig["ino"] = key[0], key[1]
         sig["client"] = key[2] if len(key) > 2 else None
@@ -779,10 +940,10 @@ class SessionTracker:
         if st is None:
             return None                  # another thread closed it first
         reqs = st["reqs"] + list(st["pending"].values())
-        if not reqs:
+        if not reqs and not st.get("folded"):
             self.dropped += 1
             return None
-        sig = self._sig(key, reqs, st["uids"])
+        sig = self._sig(key, reqs, st["uids"], st.get("folded"))
         media = None
         if self.media_of:
             try:
@@ -812,11 +973,11 @@ class SessionTracker:
         out = []
         with self._lock:
             snapshot = [(k, st["reqs"] + list(st["pending"].values()),
-                         set(st["uids"]))
+                         set(st["uids"]), st.get("folded"))
                         for k, st in self._open.items()]
-        for key, reqs, uids in snapshot:
+        for key, reqs, uids, folded in snapshot:
             if not reqs:
                 continue
-            sig = self._sig(key, reqs, uids)
+            sig = self._sig(key, reqs, uids, folded)
             out.append((sig, classify(sig, self.cfg)))
         return out

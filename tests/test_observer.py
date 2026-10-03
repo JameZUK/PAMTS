@@ -678,4 +678,122 @@ check("identical traffic classifies identically whatever the credentials",
       len(set(map(tuple, _verdicts))) == 1 and _verdicts[0],
       str(_verdicts))
 
+# ------------------------------------------------- bounding an open session's memory
+# An open session held one Request per read RPC for as long as reads kept arriving,
+# so one sustained read of one file grew without limit -- a 2.7-million-event burst
+# OOM-killed the daemon five times in a fortnight. The oldest are now folded into an
+# aggregate. The test that matters is that folding does not change the answer.
+print("\nfolding held requests (memory bound)")
+
+
+def _ladder(n, step=131072, start=0.0, gap=0.01, pattern="stream", seed=11):
+    import random as _rnd
+    rnd = _rnd.Random(seed)
+    out, off = [], 0
+    for i in range(n):
+        r = obs.Request(1000.0 + start + i * gap, 0xabc, off)
+        r.requested = r.delivered = step
+        r.method = "splice"
+        out.append(r)
+        off = off + step if pattern == "stream" else max(0, off + rnd.randint(-10**6, 10**7))
+    return out
+
+
+_FIELDS = ("requests", "bytes", "duration", "rate", "coverage", "filesize",
+           "min_offset", "max_offset", "span", "monotonic", "regions",
+           "short_reads", "errors", "method", "starts_at_zero", "frac_splice")
+
+for _pat in ("stream", "random"):
+    _rs = _ladder(400, pattern=_pat)
+    _full = obs.signature(_rs, {})
+    _fold = obs.fold_partials(None, _rs[:300], obs.DEFAULTS["region_gap"])
+    _merged = obs.signature(_rs[300:], {}, folded=_fold)
+    _diff = [f for f in _FIELDS
+             if not (_full[f] == _merged[f]
+                     or (isinstance(_full[f], float) and isinstance(_merged[f], float)
+                         and abs(_full[f] - _merged[f]) < 1e-9))]
+    check(f"folding 300 of 400 requests changes nothing ({_pat} access)",
+          not _diff,
+          str([(f, _full[f], _merged[f]) for f in _diff]))
+
+check("the signature says how many requests were folded",
+      obs.signature(_ladder(10)[5:], {},
+                    folded=obs.fold_partials(None, _ladder(10)[:5],
+                                             obs.DEFAULTS["region_gap"]))["folded"] == 5)
+check("an unfolded signature has no fold count",
+      "folded" not in obs.signature(_ladder(10), {}))
+
+# The one honest limit, stated rather than hidden: a request arriving with a ts
+# earlier than something already folded cannot be sorted into it.
+_ord = _ladder(3)
+_late = obs.Request(1000.005, 0xabc, 65536)
+_late.requested = _late.delivered = 131072
+_late.method = "splice"
+_f2 = obs.fold_partials(None, _ord, obs.DEFAULTS["region_gap"])
+_m2 = obs.signature([_late], {}, folded=_f2)
+_u2 = obs.signature(_ord + [_late], {})
+check("duration survives a request that arrives out of order",
+      _m2["duration"] == _u2["duration"], f"{_m2['duration']} vs {_u2['duration']}")
+check("as do bytes and request count",
+      (_m2["bytes"], _m2["requests"]) == (_u2["bytes"], _u2["requests"]))
+check("only monotonic differs, and it is the documented exception",
+      _m2["monotonic"] != _u2["monotonic"],
+      "if this ever matches, the docstring's caveat is stale and should go")
+
+# End to end through the tracker: a flood must not grow the held list without limit.
+print("\nthe tracker enforces the cap")
+_cap = 200
+_got = []
+_t = obs.SessionTracker({"idle_gap": 600.0, "checkpoint_after": 0,
+                         "max_open_requests": _cap},
+                        on_close=lambda k, sg, l, f: _got.append(sg))
+for _i in range(2000):
+    _t.add(obs.Record(ts=5000.0 + _i * 0.001, kind="read_done", xid=_i & 0xffff,
+                      offset=_i * 131072, length=131072, ino=4242, dev=7,
+                      client="10.0.0.9", uid=114))
+_st = _t._open[(7, 4242, "10.0.0.9")]
+check("held requests stay within the cap",
+      len(_st["reqs"]) <= _cap, f"{len(_st['reqs'])} held, cap {_cap}")
+check("the rest were folded, not lost",
+      _st["folded"] and _st["folded"]["n"] + len(_st["reqs"])
+      + len(_st["pending"]) == 2000,
+      f"folded={_st['folded'] and _st['folded']['n']} held={len(_st['reqs'])} "
+      f"pending={len(_st['pending'])}")
+check("and the count is exposed for the dashboard",
+      _t.folded_requests > 0, str(_t.folded_requests))
+
+_t.tick(5000.0 + 2000 * 0.001 + 601)
+check("the closed session reports every request it ever saw",
+      _got and _got[0]["requests"] == 2000,
+      str(_got and _got[0].get("requests")))
+check("and the full byte count",
+      _got and _got[0]["bytes"] == 2000 * 131072,
+      str(_got and _got[0].get("bytes")))
+
+# A cap of 0 means unbounded, for anyone who wants the old behaviour.
+_t0 = obs.SessionTracker({"idle_gap": 600.0, "max_open_requests": 0})
+for _i in range(300):
+    _t0.add(obs.Record(ts=6000.0 + _i * 0.001, kind="read_done", xid=_i,
+                       offset=_i * 1024, length=1024, ino=1, dev=1, client="c"))
+check("a cap of 0 disables folding",
+      _t0.folded_requests == 0 and _t0._open[(1, 1, "c")]["folded"] is None)
+
+# Classification must not move because of folding. Same traffic, two caps.
+print("\nfolding does not change verdicts")
+_verdicts = []
+for _c in (0, 50):
+    _lab = []
+    _tt = obs.SessionTracker({"idle_gap": 20.0, "checkpoint_after": 0,
+                              "max_open_requests": _c},
+                             on_close=lambda k, sg, l, f: _lab.append(l))
+    for _i in range(600):
+        _tt.add(obs.Record(ts=7000.0 + _i * 0.05, kind="read_done",
+                           xid=0x600 + _i, offset=_i * 131072, length=131072,
+                           ino=77, dev=7, client="10.0.0.9"))
+    _tt.tick(7000.0 + 600 * 0.05 + 21)
+    _verdicts.append(_lab)
+check("the same traffic classifies the same folded or not",
+      _verdicts[0] == _verdicts[1] and _verdicts[0],
+      str(_verdicts))
+
 summary()

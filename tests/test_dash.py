@@ -607,6 +607,40 @@ _os2 = __import__("os")
 _os2.utime(_wdb, (time.time() - 7200, time.time() - 7200))
 _wr = dash.HealthSource({"events_db": str(_wdb)}).collect()
 _wrow = {c["name"]: c for c in _wr["checks"]}["events.db"]
+# An old newest-row is NOT a fault when nothing is reading. The first version warned
+# on age alone, so the panel sat amber all morning while the estate was simply quiet --
+# which is how you teach someone to ignore a status light.
+_idle = _h / "idle.db"
+_ic = _sq4.connect(str(_idle)); _ic.executescript(pamts_events.SCHEMA)
+_ic.execute("CREATE TABLE sessions (ts REAL, path TEXT)")
+_ic.execute("INSERT INTO sessions(ts,path) VALUES(?,?)", (time.time() - 7200, "/a"))
+_ic.commit(); _ic.close()
+
+
+class _FakeStats(dash.HealthSource):
+    """Pins the observer stats so idle and stuck can be tested apart."""
+    def __init__(self, cfg, stats):
+        super().__init__(cfg)
+        self._fake = stats
+
+    def _observer_stats(self):
+        return self._fake
+
+
+_quiet = _FakeStats({"observer_db": str(_idle)}, {"sessions_open": 0}).collect()
+_qrow = {c["name"]: c for c in _quiet["checks"]}["observer.db"]
+check("a 2h-old newest row with nothing reading is OK, not a warning",
+      _qrow["state"] == "ok", f"{_qrow['state']}: {_qrow['detail']}")
+check("and it says why rather than going silent",
+      "nothing reading" in _qrow["detail"], _qrow["detail"])
+
+_stuck = _FakeStats({"observer_db": str(_idle)}, {"sessions_open": 7}).collect()
+_srow = {c["name"]: c for c in _stuck["checks"]}["observer.db"]
+check("but sessions open and nothing written for an hour IS a warning",
+      _srow["state"] == "warn", f"{_srow['state']}: {_srow['detail']}")
+check("and it names how many are stuck open",
+      "7 session(s) open" in _srow["detail"], _srow["detail"])
+
 check("a WAL database with a 2h-old file but a current row reads as fresh",
       _wrow["state"] == "ok" and "newest" in _wrow["detail"],
       _wrow["detail"])

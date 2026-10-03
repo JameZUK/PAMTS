@@ -659,6 +659,9 @@ class Daemon:
             "foreign_device_records": self.foreign,
             "non_media_sessions": self.non_media,
             "bulk_suppressed": self.tracker.bulk,
+            # Requests folded out of open sessions to bound memory. Non-zero means
+            # something read one file very hard; see pamts_observer.fold_partials.
+            "folded_requests": self.tracker.folded_requests,
             "arrivals": self.arrivals,
             "bytes_written": self.tracker.bytes_written,
             "deferred_pending": len(self._pending),

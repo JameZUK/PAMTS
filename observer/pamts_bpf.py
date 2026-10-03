@@ -75,10 +75,16 @@ class Collector:
     #: period dropped 40.3M events, so a third fewer is worth having.
     SKIP_PROGRAMS = frozenset(("pamts_read_start",))
 
-    #: Ceiling on events decoded but not yet consumed. Sized above the largest burst
-    #: the kernel ring itself holds (~233,000 observed), so reaching it means userspace
-    #: is genuinely not keeping up rather than merely absorbing a spike.
-    max_pending = 500_000
+    #: Ceiling on events decoded but not yet consumed.
+    #:
+    #: 500,000 was the first figure here and it was a poor bound: each queued event is
+    #: a dict, so a full queue was worth roughly 250 MB on its own -- a quarter of the
+    #: daemon's 1 GB ceiling, which made the bound too generous to prevent the OOM it
+    #: was added to prevent. Observed pending depth on a live server is 0 even through
+    #: bursts of millions of events, because the kernel ring absorbs them and userspace
+    #: drains faster than they arrive; 100,000 (~50 MB) is therefore still far above
+    #: anything seen, while being a limit that actually limits.
+    max_pending = 100_000
 
     def __init__(self, obj_path, map_name="events", verbose=False,
                  poll_ms=200, record_factory=None, attach_all=False,

@@ -667,11 +667,10 @@ class HealthSource(Source):
         if not self.observer_url:
             return [self._check("collector", "unknown", "no observer url configured",
                                 group=group)]
-        try:
-            st = _http_json(self.observer_url + "/stats", timeout=5)
-        except Exception as e:                                  # noqa: BLE001
+        st = getattr(self, "_stats", None)
+        if st is None:
             return [self._check("collector", "fail",
-                                f"the observer API did not answer: {e}", group=group)]
+                                "the observer API did not answer", group=group)]
         kd = st.get("kernel_dropped")
         ud = st.get("userspace_dropped")
         pend = st.get("userspace_pending")
@@ -707,6 +706,13 @@ class HealthSource(Source):
                 f"{files:,} files indexed, {unres:,} read(s) unresolved "
                 f"(built in {st.get('index_build_s')}s)",
                 {"files": files, "unresolved": unres}, group))
+        folded = st.get("folded_requests")
+        if folded:
+            out.append(self._check(
+                "held requests folded", "ok",
+                f"{folded:,} request(s) folded out of open sessions to bound memory - "
+                "something read one file very hard; byte counts and rates stay exact",
+                {"folded": folded}, group))
         svc = st.get("services") or {}
         unmapped = {k: v for k, v in svc.items() if str(k).startswith("unmapped:")}
         if svc:
@@ -720,6 +726,7 @@ class HealthSource(Source):
 
     def _store_checks(self):
         out, group = [], "Stores"
+        st = getattr(self, "_stats", None)
         # state.json: the only copy of the observed play history.
         if self.state_file:
             age = self._age(self.state_file)
@@ -799,9 +806,22 @@ class HealthSource(Source):
             state, detail = "ok", f"{size / 1e6:.1f} MB, {rows:,} {table}"
             detail += (f", newest {_ago(age)} ago" if age is not None
                        else ", none recorded yet")
+            # Age ALONE is not a fault. The first version of this warned whenever the
+            # estate was simply quiet -- nothing had been read since 06:00, so the
+            # panel sat amber all morning for correct behaviour, which is the fastest
+            # way to teach someone to ignore a status light.
+            #
+            # The real fault is sessions OPEN but never being written: reads arriving
+            # and nothing coming out the other end. With nothing open, an old newest
+            # row means the estate is idle, which is not PAMTS's problem to report.
             if stale and age is not None and age > stale:
-                state = "warn"
-                detail += " - nothing new for a while"
+                open_now = (st or {}).get("sessions_open")
+                if open_now:
+                    state = "warn"
+                    detail += (f" - {open_now} session(s) open but nothing written "
+                               "for over an hour")
+                else:
+                    detail += " - nothing reading at the moment"
             elif not rows:
                 state = "warn"
             out.append(self._check(label, state, detail,
@@ -988,8 +1008,18 @@ class HealthSource(Source):
         except Exception:                                       # noqa: BLE001
             return []
 
+    def _observer_stats(self):
+        """One fetch per panel refresh, shared by the collector and store checks."""
+        if not self.observer_url:
+            return None
+        try:
+            return _http_json(self.observer_url + "/stats", timeout=5)
+        except Exception:                                       # noqa: BLE001
+            return None
+
     def collect(self):
         checks = []
+        self._stats = self._observer_stats()
         for fn in (self._unit_checks, self._collector_checks, self._store_checks,
                    self._plugin_checks):
             try:
