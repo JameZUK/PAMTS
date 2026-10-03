@@ -8,6 +8,14 @@ pamts.toml
 *-token
 *.token
 state.json
+# Runtime state PAMTS writes next to state.json. watermarks.json is new; the rest are
+# here so a working checkout can never commit a live database by accident.
+watermarks.json
+*.corrupt
+events.db
+observer.db
+*.db-wal
+*.db-shm
 
 # Generated from the TARGET kernel's BTF and specific to it, so it must never be
 # committed: a stale vmlinux.h silently builds an object for the wrong kernel.
