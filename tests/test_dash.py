@@ -736,6 +736,85 @@ check("a check that raises is reported, not fatal",
       str([c["detail"] for c in _r5["checks"]])[:200])
 check("and the rest of the panel still renders", len(_r5["checks"]) > 1)
 
+# ---------------------------------------------------- can PAMTS still do its job?
+# The panel reported "all good" while film and TV promotion was completely inert: the
+# shared pool sat 11 G over a 400 G budget, promotable headroom was zero, and every
+# promote pass logged "promoted 0B". Services up, stores written, plugins answering --
+# and one of the two core functions dead for half the estate. Liveness is not usefulness.
+print("\n=== HEALTH: budget headroom, because liveness is not usefulness")
+_G = 2 ** 30
+
+
+class _FakeTier:
+    name = "tier"
+
+    def __init__(self, pools, boom=False):
+        self._p, self._boom = pools, boom
+
+    def get(self, force=False):
+        if self._boom:
+            raise RuntimeError("scan failed")
+        return {"pools": self._p}
+
+
+def _cap(pools, **kw):
+    h = dash.HealthSource({"_tier_source": _FakeTier(pools, **kw)})
+    return [c for c in h.collect()["checks"] if c.get("group") == "Capacity"]
+
+
+_dead = _cap([{"label": "movies + tv (shared)", "bytes": 411 * _G,
+               "budget_bytes": 400 * _G, "promotable_bytes": 0}])
+check("a pool with no promotable headroom warns", _dead[0]["state"] == "warn",
+      f"{_dead[0]['state']}: {_dead[0]['detail']}")
+check("and says what that actually costs, not just a number",
+      "inert" in _dead[0]["detail"] and "promotion" in _dead[0]["detail"],
+      _dead[0]["detail"])
+
+_ok = _cap([{"label": "movies + tv (shared)", "bytes": 411 * _G,
+             "budget_bytes": 600 * _G, "promotable_bytes": 188 * _G}])
+check("a pool with headroom is OK", _ok[0]["state"] == "ok",
+      f"{_ok[0]['state']}: {_ok[0]['detail']}")
+check("and reports the figures that matter",
+      "411.0 G of 600.0 G" in _ok[0]["detail"] and "188.0 G promotable" in _ok[0]["detail"],
+      _ok[0]["detail"])
+
+# Over budget WITH headroom left is the ordinary state after a download burst, and
+# eviction resolves it. It is worth saying, not worth alarming about beyond a warn.
+_over = _cap([{"label": "x", "bytes": 450 * _G, "budget_bytes": 400 * _G,
+               "promotable_bytes": 10 * _G}])
+check("over budget but still promotable warns, and says eviction will resolve it",
+      _over[0]["state"] == "warn" and "eviction" in _over[0]["detail"],
+      _over[0]["detail"])
+
+_multi = _cap([{"label": "a", "bytes": 1 * _G, "budget_bytes": 10 * _G,
+                "promotable_bytes": 9 * _G},
+               {"label": "b", "bytes": 10 * _G, "budget_bytes": 10 * _G,
+                "promotable_bytes": 0}])
+check("every pool gets its own row", len(_multi) == 2, str([c["name"] for c in _multi]))
+check("one healthy pool does not mask a dead one",
+      sorted(c["state"] for c in _multi) == ["ok", "warn"],
+      str([(c["name"], c["state"]) for c in _multi]))
+
+check("a pool with no budget configured is unknown, not a failure",
+      _cap([{"label": "n", "bytes": 1, "budget_bytes": 0}])[0]["state"] == "unknown")
+# The tier scan is the expensive thing this dashboard does; if it fails the panel must
+# still render everything else.
+_boom = _cap([{"label": "x", "bytes": 1, "budget_bytes": 2}], boom=True)
+check("a failing tier scan degrades to unknown rather than breaking the panel",
+      _boom and _boom[0]["state"] == "unknown", str(_boom))
+check("and with no tier source at all it is unknown",
+      [c for c in dash.HealthSource({}).collect()["checks"]
+       if c.get("group") == "Capacity"][0]["state"] == "unknown")
+
+# build() must share the TierSource instance, or the panel would scan the tier a second
+# time on its own 10-second TTL -- the most expensive call on the page, doubled.
+_built = dash.build(cfg={n: {} for n in dash.SOURCES})
+_hsrc = next(s for s in _built if s.name == "health")
+_tsrc = next(s for s in _built if s.name == "tier")
+check("build() hands the health source the live TierSource instance",
+      _hsrc.cfg.get("_tier_source") is _tsrc,
+      "a separate instance would scan the fast tier twice on different schedules")
+
 check("health is in the source registry", "health" in dash.SOURCES)
 
 # It must NOT also be swept into /api/state: the Now tab has no renderer for it, so it

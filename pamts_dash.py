@@ -1017,11 +1017,67 @@ class HealthSource(Source):
         except Exception:                                       # noqa: BLE001
             return None
 
+    def _capacity_checks(self):
+        """Can PAMTS still DO its job, per budget pool?
+
+        The panel answered "all good" while film and TV promotion was completely inert:
+        the shared pool sat 11 G over a 400 G budget, so promotable headroom was zero and
+        every pass logged "promoted 0B". Services were up, stores were written, plugins
+        answered -- and one of the two core functions was dead for half the estate.
+        Liveness is not usefulness, and this is the check that tells them apart.
+
+        A pool over budget is NOT automatically a fault. It is the ordinary state after a
+        burst of downloads, and eviction is what resolves it on the next run. What matters
+        is whether there is room to promote INTO: at zero, playback-triggered promotion
+        and next-up fetching cannot run at all.
+        """
+        out, group = [], "Capacity"
+        pools = None
+        for src in (self.cfg.get("_tier_source"),):
+            if src is not None:
+                try:
+                    pools = (src.get() or {}).get("pools")
+                except Exception:                               # noqa: BLE001
+                    pools = None
+        if pools is None:
+            return [self._check("budget headroom", "unknown",
+                                "the tier source is not available to this panel",
+                                group=group)]
+        for p in pools:
+            name = p.get("label") or p.get("pool") or "?"
+            used = p.get("bytes") or 0
+            budget = p.get("budget_bytes") or 0
+            promotable = p.get("promotable_bytes")
+            frac = (used / budget) if budget else None
+            if not budget:
+                out.append(self._check(f"headroom: {name}", "unknown",
+                                       "no budget configured", group=group))
+                continue
+            detail = (f"{used / 2**30:.1f} G of {budget / 2**30:.1f} G "
+                      f"({frac * 100:.0f}%), {(promotable or 0) / 2**30:.1f} G promotable")
+            if not promotable:
+                state = "warn"
+                detail += (" - NOTHING can be promoted into this pool, so "
+                           "playback-triggered promotion and next-up fetching are "
+                           "inert for it until eviction frees space")
+            elif frac is not None and frac > 1.0:
+                state = "warn"
+                detail += " - over budget; eviction should resolve it on the next run"
+            else:
+                state = "ok"
+            out.append(self._check(f"headroom: {name}", state, detail,
+                                   {"bytes": used, "budget_bytes": budget,
+                                    "promotable_bytes": promotable}, group))
+        if not out:
+            out.append(self._check("budget headroom", "unknown",
+                                   "no tier pools configured", group=group))
+        return out
+
     def collect(self):
         checks = []
         self._stats = self._observer_stats()
         for fn in (self._unit_checks, self._collector_checks, self._store_checks,
-                   self._plugin_checks):
+                   self._capacity_checks, self._plugin_checks):
             try:
                 checks.extend(fn())
             except Exception as e:                              # noqa: BLE001
@@ -1061,7 +1117,13 @@ SOURCES = {
 
 
 def build(names=None, cfg=None):
-    """Instantiate the named sources (all of them by default)."""
+    """Instantiate the named sources (all of them by default).
+
+    The health source is handed the TierSource INSTANCE rather than its own copy:
+    scanning the fast tier is the most expensive thing this dashboard does, and the
+    headroom check wants the same numbers the Now tab already shows. Sharing the
+    instance shares its cache, so the panel costs nothing extra.
+    """
     cfg = cfg or {}
     chosen = names or list(SOURCES)
     out = []
@@ -1070,6 +1132,13 @@ def build(names=None, cfg=None):
         if cls is None:
             raise ValueError(f"unknown source {n!r}; have: {', '.join(sorted(SOURCES))}")
         out.append(cls(cfg.get(n) or cfg))
+    # Hand the health source the live TierSource so the headroom check reads the same
+    # cached scan the rest of the page does. Built after the loop because the order of
+    # `chosen` is the caller's, not ours.
+    tier = next((s for s in out if s.name == TierSource.name), None)
+    for s in out:
+        if s.name == HealthSource.name and tier is not None:
+            s.cfg = dict(s.cfg, _tier_source=tier)
     return out
 
 
