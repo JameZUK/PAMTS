@@ -118,6 +118,25 @@ DEFAULTS = {
     # 128 KB per read is ~170,000 over its whole length, and it closes long before
     # that) while capping the memory one session can hold at a few megabytes.
     "max_open_requests": 20_000,
+    # Minimum gap between checkpoint EVALUATIONS of the same open session.
+    #
+    # Checkpointing asks "is this session a play yet?", and a session that answers no
+    # has to be asked again later, because a PROBE can become a PLAY as it grows. The
+    # loop in _sweep() had no gap at all: it re-evaluated every eligible session on
+    # every incoming record, and each evaluation copies the held requests and sorts
+    # them to build a signature. For a long-lived session that never classifies as
+    # PLAY -- a big COPY, which is most of the traffic here -- that is an O(n) rebuild
+    # per record, forever.
+    #
+    # Measured consequence: the collector pegged one core and consumed 236 events/s
+    # while the kernel delivered 1,599/s, dropping 7.68 MILLION events (more than it
+    # kept). It had been masked before by the daemon being OOM-killed every day or so,
+    # which reset the open sessions; bounding memory removed the crash and left the
+    # CPU pathology running indefinitely.
+    #
+    # 15s bounds it to ~4 evaluations a minute per session, which is far finer than
+    # checkpoint_after (60s) needs.
+    "checkpoint_retry":    15.0,
     # bulk sweep guard
     "bulk_window":       120.0,
     "bulk_min_files":     25,
@@ -784,7 +803,10 @@ class SessionTracker:
         if st is None:
             st = {"reqs": [], "pending": {}, "last": rec.ts,
                   "first": rec.ts, "checkpointed": False, "uids": set(),
-                  "folded": None}
+                  "folded": None,
+                  # Earliest time this session may be evaluated for a checkpoint.
+                  # Set so the FIRST evaluation still lands at first + checkpoint_after.
+                  "next_checkpoint": rec.ts + (self.cfg.get("checkpoint_after") or 0)}
             self._open[key] = st
         st["last"] = max(st["last"], rec.ts)
         if rec.uid is not None:
@@ -849,9 +871,18 @@ class SessionTracker:
 
             after = self.cfg.get("checkpoint_after") or 0
             if after:
+                retry = self.cfg.get("checkpoint_retry")
+                if retry is None:
+                    retry = DEFAULTS["checkpoint_retry"]
                 for key, st in list(self._open.items()):
                     if st["checkpointed"] or now - st["first"] < after:
                         continue
+                    # Rate-limit the EVALUATION, not the checkpoint. Without this the
+                    # signature below is rebuilt on every record for any session that
+                    # does not classify as PLAY -- see checkpoint_retry in DEFAULTS.
+                    if now < st.get("next_checkpoint", 0):
+                        continue
+                    st["next_checkpoint"] = now + retry
                     reqs = st["reqs"] + list(st["pending"].values())
                     if not reqs:
                         continue

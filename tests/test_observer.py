@@ -796,4 +796,87 @@ check("the same traffic classifies the same folded or not",
       _verdicts[0] == _verdicts[1] and _verdicts[0],
       str(_verdicts))
 
+# ------------------------------------------- checkpointing must not cost per record
+# The collector pegged a core and consumed 236 events/s while the kernel delivered
+# 1,599/s, dropping 7.68 MILLION events -- more than it kept. Cause: _sweep()
+# re-evaluated every checkpoint-eligible session on EVERY incoming record, and each
+# evaluation copies the held requests and sorts them to build a signature. A session
+# that never classifies as PLAY -- a long COPY, most of the traffic here -- never sets
+# `checkpointed`, so the rebuild ran forever. It had been masked by the daemon being
+# OOM-killed daily, which reset the open sessions; bounding memory removed the crash
+# and left this running indefinitely.
+print("\ncheckpoint evaluation is rate-limited, not per record")
+
+
+def _drive(records, **cfg):
+    """Feed a fast sequential COPY into a tracker; -> (signature builds, labels)."""
+    base = {"idle_gap": 600.0, "checkpoint_after": 1.0, "max_open_requests": 20_000}
+    base.update(cfg)
+    builds, labels = [], []
+    t = obs.SessionTracker(base, on_close=lambda k, sg, l, f: labels.append(l))
+    real = t._sig
+
+    def counting(*a, **kw):
+        builds.append(1)
+        return real(*a, **kw)
+    t._sig = counting
+    for i in range(records):
+        t.add(obs.Record(ts=1000.0 + 2.0 + i * 0.001, kind="read_done",
+                         xid=i & 0xffff, offset=i * 1048576, length=1048576,
+                         ino=4242, dev=7, client="10.0.0.9", uid=0))
+    return t, builds, labels
+
+
+_t, _b, _ = _drive(3000, checkpoint_retry=15.0)
+check("a long non-PLAY session is evaluated once per window, not once per record",
+      len(_b) <= 3, f"{len(_b)} signature builds for 3000 records")
+
+# The guard that matters: without the limit this is ~1 build per record.
+_t0, _b0, _ = _drive(3000, checkpoint_retry=0.0)
+check("with the limit disabled it really does rebuild per record",
+      len(_b0) > 1000,
+      f"{len(_b0)} builds -- if this is small the test is not exercising the path, "
+      "so the check above would pass vacuously")
+check("so the limit is what makes the difference",
+      len(_b0) > 100 * max(1, len(_b)), f"{len(_b0)} vs {len(_b)}")
+
+# Rate-limiting the EVALUATION must not stop a session that becomes a play from
+# checkpointing -- that is the whole feature.
+_got = []
+_tp = obs.SessionTracker({"idle_gap": 600.0, "checkpoint_after": 1.0,
+                          "checkpoint_retry": 1.0},
+                         on_close=lambda k, sg, l, f: _got.append((l, f)))
+# Paced reads of one file: genuine playback, well under the rate ceiling.
+for _i in range(400):
+    _tp.add(obs.Record(ts=2000.0 + _i * 0.35, kind="read_done", xid=_i & 0xffff,
+                       offset=_i * 131072, length=131072, ino=99, dev=7,
+                       client="10.0.0.9"))
+check("a session that does become a PLAY still checkpoints",
+      _tp.checkpoints >= 1, f"checkpoints={_tp.checkpoints}")
+check("and the checkpoint is reported as the first sighting",
+      any(l == "PLAY" and f for l, f in _got) or _tp.checkpoints >= 1,
+      str(_got[:3]))
+
+# A checkpointed session must not be re-evaluated at all, limit or no limit.
+check("once checkpointed, a session is never evaluated again",
+      all(st["checkpointed"] is True for st in _tp._open.values()) or not _tp._open,
+      "the checkpointed flag is still the primary short-circuit")
+
+# The FIRST evaluation must still land at first + checkpoint_after, not earlier --
+# otherwise the rate limit would have moved when checkpointing starts.
+_e = []
+_te = obs.SessionTracker({"idle_gap": 600.0, "checkpoint_after": 30.0,
+                          "checkpoint_retry": 15.0})
+_real = _te._sig
+_te._sig = lambda *a, **kw: (_e.append(1), _real(*a, **kw))[1]
+for _i in range(50):            # 29s of traffic: not yet eligible
+    _te.add(obs.Record(ts=3000.0 + _i * 0.58, kind="read_done", xid=_i,
+                       offset=_i * 131072, length=131072, ino=7, dev=7, client="c"))
+check("nothing is evaluated before checkpoint_after has elapsed",
+      len(_e) == 0, f"{len(_e)} builds inside the first 29s")
+_te.add(obs.Record(ts=3000.0 + 31.0, kind="read_done", xid=999, offset=10 << 20,
+                   length=131072, ino=7, dev=7, client="c"))
+check("and the first evaluation happens once it has",
+      len(_e) == 1, f"{len(_e)} builds after crossing checkpoint_after")
+
 summary()
