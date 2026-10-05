@@ -18,6 +18,7 @@ import ctypes
 import ctypes.util
 import os
 import struct
+import sys
 
 # Must match struct pamts_event in pamts_nfsd.bpf.c exactly. Field order is
 # chosen so there is no implicit padding anywhere but the explicit tail.
@@ -313,11 +314,37 @@ class Collector:
             "uid": None if uid == UID_UNKNOWN else uid,
         }
 
+    #: Resolved ONCE, lazily, and cached. See _default_record.
+    _record_factory = None
+
+    @classmethod
+    def _resolve_record_factory(cls):
+        """Import pamts_observer.Record once, not per event.
+
+        This used to do `sys.path.insert(0, ...)` and `import` inside the per-record
+        function. The import itself is cheap -- sys.modules caches it -- but the insert
+        is not: it appends to sys.path on EVERY event and inserting at index 0 of a list
+        is O(n), so the cost of handling one event grew linearly with the number of
+        events already handled. Measured in isolation, throughput fell from 79,100
+        rec/s at 50,000 events to 18,594 at 200,000, a clean 1/n curve; the live
+        collector had 8.3 MILLION entries in sys.path and was managing 159 events/s
+        against a kernel delivering 1,599, pegging a core and dropping 2.5 million
+        events. It also accounted for several hundred megabytes of RSS.
+        
+        It had been invisible because the daemon was OOM-killed roughly daily and each
+        restart reset sys.path. Bounding per-session memory removed the crash, and the
+        accumulation it had been hiding became the dominant cost.
+        """
+        if cls._record_factory is None:
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if root not in sys.path:
+                sys.path.insert(0, root)
+            import pamts_observer                                # noqa: PLC0415
+            cls._record_factory = pamts_observer.Record.from_json
+        return cls._record_factory
+
     def _default_record(self, d):
-        import sys
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        import pamts_observer as obs
-        return obs.Record.from_json(d)
+        return (self._record_factory or self._resolve_record_factory())(d)
 
     def stop(self):
         """Ask records() to return after the current poll.

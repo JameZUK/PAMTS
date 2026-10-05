@@ -694,4 +694,74 @@ check("a short buffer is still rejected before decoding",
       (_bpf.Collector._on_sample(_c2, None, _ct.addressof(_bufp), 4), _c2.lost)[1] == 1,
       f"lost={_c2.lost}")
 
+# ======================================================= per-event cost must be flat
+# Two latent accumulation bugs became the dominant cost once the daemon stopped being
+# OOM-killed daily -- the crash had been resetting the state they grew. Both are O(n)
+# in work already done, so they are quadratic over a long run and invisible over a
+# short one. These tests assert flatness, which is the only property that catches that.
+print("=== COST: handling one event must not get slower the longer it runs")
+
+_rc = _bpf.Collector.__new__(_bpf.Collector)
+_ev = {"ts": 1.0, "kind": "read_done", "xid": 1, "offset": 0, "len": 4096,
+       "status": None, "ino": 1, "dev": 1, "client": "10.0.0.1", "uid": 0}
+_before = len(sys.path)
+for _i in range(20_000):
+    _rc._default_record(_ev)
+check("building a Record does not grow sys.path",
+      len(sys.path) - _before <= 1,
+      f"sys.path grew by {len(sys.path) - _before} over 20,000 records; "
+      "it used to grow by one PER RECORD, and insert(0) is O(n), so the collector "
+      "slowed from 79,100 to 18,594 rec/s between 50k and 200k events")
+
+# Timed halves rather than an absolute rate, so the check is about the SHAPE of the
+# cost and does not fail on a slow machine.
+_t0 = time.perf_counter()
+for _i in range(40_000):
+    _rc._default_record(_ev)
+_first = time.perf_counter() - _t0
+_t0 = time.perf_counter()
+for _i in range(40_000):
+    _rc._default_record(_ev)
+_second = time.perf_counter() - _t0
+check("and the second 40,000 records cost about the same as the first",
+      _second < _first * 3 + 0.05,
+      f"first={_first:.3f}s second={_second:.3f}s -- a rising curve here is the "
+      "quadratic behaviour returning")
+
+print("=== COST: the inode index must not be rebuilt in a stampede")
+_ir = pathlib.Path(tempfile.mkdtemp(prefix="pamts-idx-"))
+(_ir / "a").mkdir()
+(_ir / "a" / "f.mkv").write_bytes(b"x")
+_idx = d.InodeIndex([str(_ir)], max_age=3600.0)
+_idx.build()
+_walks = []
+_real_build = _idx.build
+_idx.build = lambda: (_walks.append(1), _real_build())[1]
+
+# on_arrival() calls rebuild_async() directly, with no age check -- a burst of new
+# files produced EIGHT full walks in 92 seconds, each statting the cold branch over
+# NFS and waking a spun-down array.
+for _i in range(10):
+    _idx.rebuild_async()
+    time.sleep(0.05)          # let each thread finish, so _rebuilding is not the guard
+check("a burst of unthrottled rebuild requests produces at most one walk",
+      len(_walks) <= 1, f"{len(_walks)} walks for 10 requests")
+check("the floor is long enough to batch a burst",
+      d.InodeIndex.min_rebuild_interval >= 60,
+      f"{d.InodeIndex.min_rebuild_interval}s")
+_burst = len(_walks)
+
+# force=True must still work: lookup() applies max_age BEFORE asking, so the floor must
+# never be able to veto a refresh of a genuinely stale index. Compared against the burst
+# count rather than an absolute, because the floor legitimately refuses all of the burst.
+_idx.rebuild_async(force=True)
+for _ in range(200):
+    if len(_walks) > _burst:
+        break
+    time.sleep(0.02)
+check("force=True overrides the floor, so lookup() can refresh a stale index",
+      len(_walks) == _burst + 1,
+      f"{len(_walks)} walks total, {_burst} before the forced call")
+shutil.rmtree(_ir, ignore_errors=True)
+
 summary()

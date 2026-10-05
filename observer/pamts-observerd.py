@@ -158,13 +158,36 @@ class InodeIndex:
         # the ingest path -- stalling there stops draining the kernel ring buffer
         # and silently loses events. A miss now simply stays a miss until the
         # rebuild lands.
+        # force=True because this caller has ALREADY rate-limited itself, against
+        # max_age. The floor inside rebuild_async exists for callers that have not --
+        # see min_rebuild_interval -- and applying it here as well would mean a stale
+        # index could refuse to refresh whenever max_age is the shorter of the two.
         if allow_rebuild and age > self.max_age:
-            self.rebuild_async()
+            self.rebuild_async(force=True)
         return None
 
-    def rebuild_async(self):
+    #: Floor on the gap between rebuilds for callers that do NOT rate-limit themselves.
+    #:
+    #: lookup() applies max_age and so passes force=True. on_arrival() does not: a newly
+    #: arrived file with no path IS the case a rebuild exists for, so it asked for one
+    #: every time, and a burst of arrivals produced EIGHT full walks in 92 seconds. Each
+    #: walk stats the cold branch over NFS and so wakes a spun-down array, which is the
+    #: exact cost this whole system exists to avoid.
+    #:
+    #: Refusing is safe rather than lossy: lookup()'s age-based path is the backstop, so
+    #: a file that arrives during the cooldown is named a few minutes later instead of
+    #: immediately. on_arrival() already documents that it names a file "on the next
+    #: arrival instead of blocking ingest".
+    min_rebuild_interval = 300.0
+
+    def rebuild_async(self, force=False):
         with self._lock:
             if self._rebuilding:
+                return False
+            since = time.monotonic() - self._built
+            if not force and since < self.min_rebuild_interval:
+                logging.debug("index rebuild refused: last was %.0fs ago, floor is "
+                              "%.0fs", since, self.min_rebuild_interval)
                 return False
             self._rebuilding = True
             self._built = time.monotonic()   # suppress a stampede of retries
