@@ -205,6 +205,45 @@ Shows the fast tier against its budget, what is being read right now with each
 verdict, recent promotions, and the classified session log — which is the useful
 part, because it shows what was *rejected* as well as what counted.
 
+![The Now view](docs/images/01-now.png)
+
+Every read is attributed to the **service** that made it, not just to a host — several
+services usually share one address, so the client address alone cannot tell Plex from a
+music scanner. `COLD→HOT` marks a file that was promoted *while it was still being
+read*: the slow tier served the start of it, so the promotion pays off on the next open
+rather than this one.
+
+![The session log](docs/images/04-sessions.png)
+
+Transfers answer the question that matters about a promotion — **was it any use?** A
+promotion exists to make the next open fast, so the test is whether anything has read
+the file since. Here the 5.5G copy was read afterwards; the 3.5G transcoded duplicate
+never was, and a different file was being read at the time, which is how a wrong-file
+promotion shows itself.
+
+![Promotions and demotions](docs/images/03-transfers.png)
+
+The status panel covers PAMTS's own services, stores, collector and plugins — and
+nothing else, so a fault here is a fault in PAMTS.
+
+![The status panel](docs/images/02-status.png)
+
+<details>
+<summary>More views: graphs, configuration, and the phone layout</summary>
+
+![Graphs](docs/images/05-graphs.png)
+
+![Configuration](docs/images/06-config.png)
+
+Below 700px the wide tables stop being tables: the file name takes its own line and the
+rest wraps beneath it, so everything is read by scrolling down rather than sideways.
+
+<img src="docs/images/07-mobile.png" alt="The phone layout" width="390">
+
+</details>
+
+*(Screenshots are generated from synthetic data — see `tools/demo_dashboard.py`.)*
+
 Adding a data source is one class and one registry line, and **the page renders it
 without being changed**: an unrecognised source is shown as raw JSON rather than
 hidden. See [DASHBOARD.md](docs/DASHBOARD.md).

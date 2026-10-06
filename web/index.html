@@ -70,7 +70,14 @@ main{padding:16px;max-width:1100px;margin:0 auto}
 .sub{color:var(--dim);font-size:12px}
 .row{display:flex;justify-content:space-between;gap:10px;padding:3px 0}
 .row span:last-child{font-variant-numeric:tabular-nums}
-.bar{height:7px;background:var(--line);border-radius:4px;overflow:hidden;margin:8px 0 4px}
+/* display:block because hBars() renders the track as a <span>, and an inline
+   element ignores height -- which is why the "reads by verdict" bars were
+   invisible: the markup was right, the track had simply collapsed. */
+.bar{display:block;height:7px;background:var(--line);border-radius:4px;
+  overflow:hidden;margin:8px 0 4px}
+/* Label left, value right, bar taking the slack. Used by hBars() and by the pool
+   headings; it had no rule at all, so both were falling back to inline flow. */
+.kv{display:flex;justify-content:space-between;align-items:center;gap:10px}
 .bar>i{display:block;height:100%;background:var(--accent)}
 .bar>i.warn{background:var(--warn)} .bar>i.bad{background:var(--bad)}
 /* Status badge and check rows. A dot carries the state as well as the colour, so the
