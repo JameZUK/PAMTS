@@ -49,7 +49,10 @@
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);
-  font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  /* Safari on a phone inflates text in wide blocks unless told not to, which
+     breaks the numeric alignment in every table. */
+  -webkit-text-size-adjust:100%}
 header{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
   padding:16px;border-bottom:1px solid var(--line)}
 h1{font-size:17px;margin:0;letter-spacing:-.01em}
@@ -141,7 +144,92 @@ th.n,td.n{text-align:right}
   color:#fff;font-weight:600}
 pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:9px;
   overflow-x:auto;font-size:12px;margin:0}
-@media (max-width:560px){ main{padding:12px 16px} h1{font-size:16px} .big{font-size:22px} }
+/* ------------------------------------------------------------------ mobile
+   One breakpoint at 700px, which is where the 9-column Sessions table stops
+   fitting a phone in portrait. Three things happen:
+
+   1. the wide tables drop their secondary columns and show the .fold line
+      instead, so the content is read by scrolling DOWN, not sideways;
+   2. the tab strip becomes one non-wrapping scrollable row, because wrapping
+      it put three lines of buttons inside a sticky header and left barely any
+      screen for the content it was heading;
+   3. touch targets grow. 30px-tall tab buttons were the original complaint.   */
+@media (max-width:700px){
+  main{padding:12px}
+  header{padding:9px 12px;gap:9px;row-gap:7px}
+  h1{font-size:16px}
+  .big{font-size:22px}
+
+  /* h1 + badge + theme on the first row, the tabs full-width underneath. */
+  .spacer{display:none}
+  #theme{margin-left:auto}
+  nav{order:2;flex:1 0 100%;margin-left:0;flex-wrap:nowrap;overflow-x:auto;
+      -webkit-overflow-scrolling:touch;scrollbar-width:none;
+      /* A phone has no pointer to reveal a scrollbar with, and the strip is
+         obviously scrollable from the clipped last tab. */
+      padding-bottom:1px}
+  nav::-webkit-scrollbar{display:none}
+  nav button{white-space:nowrap;padding:8px 13px;flex:0 0 auto}
+
+  .panel{padding:11px 12px}
+  th,td{padding:6px 6px}
+
+  /* The two wide tables (Sessions is 9 columns, Transfers 7) stop being grids.
+     Hiding the secondary columns was not enough: with Time unwrappable and
+     every tag at its own natural width, the FILE column -- the one you are
+     actually looking for -- was squeezed to 41px while the table still
+     overflowed. So each row becomes a block instead: the filename on its own
+     line, everything else wrapping underneath it as one dotted sentence. No
+     column is dropped and nothing scrolls sideways. */
+  #sessions,#moves{width:100%}
+  #sessions thead,#moves thead{display:none}
+  #sessions tr,#moves tr{display:flex;flex-wrap:wrap;align-items:baseline;
+    gap:1px 7px;padding:8px 0;border-bottom:1px solid var(--line)}
+  #sessions td,#moves td{display:block;border:0;padding:0;white-space:normal}
+  #sessions td.n,#moves td.n{text-align:left}
+  /* break-all is right for a long unbroken path in a narrow COLUMN; here the
+     cell is full width, so break at the spaces first and only split a word
+     when it genuinely cannot fit. */
+  #sessions td.path,#moves td.path{order:-1;flex:1 1 100%;
+    word-break:normal;overflow-wrap:anywhere}
+  /* The headers are gone, so separate the values the way prose would. :empty
+     covers a cell whose value was the empty string, which would otherwise
+     leave a stray dot. */
+  /* A non-breaking space, so the dot always stays with the value it
+     introduces rather than being left at the end of a wrapped line. */
+  #sessions td:not(:first-child):not(.path)::before,
+  #moves td:not(:first-child):not(.path)::before{content:"\00b7\00a0";color:var(--dim)}
+  #sessions td:empty,#moves td:empty{display:none}
+  #sessions td.c2,#moves td.c2{color:var(--dim);font-size:12px}
+  /* The Config tab's reference tables stay real tables -- their values
+     ("max_delete", a grace period) mean nothing without the column heading,
+     and they are a handful of rows each. They overflowed by ~40px, which this
+     recovers, so they fit rather than needing a sideways swipe. */
+  main table:not(#sessions):not(#moves){font-size:12px}
+  main table:not(#sessions):not(#moves) th,
+  main table:not(#sessions):not(#moves) td{padding:5px 4px;
+    /* Long values (a mount path, a list of protecting rules) must be allowed
+       to wrap, including the right-aligned numeric cells, or one of them sets
+       a minimum width the phone does not have. */
+    white-space:normal;overflow-wrap:anywhere}
+
+  /* The placeholder row for "nothing matches" is a single full-width cell. */
+  #sessions td[colspan],#moves td[colspan]{flex:1 1 100%}
+  #sessions td[colspan]::before,#moves td[colspan]::before{content:""}
+
+  /* Live reads: let the byte figures drop below the path rather than squeeze
+     it into a column two words wide. */
+  #live .row{flex-wrap:wrap}
+  #live .row>span:first-child{flex:1 1 100%;min-width:0}
+  #live .row>span:last-child{text-align:left}
+}
+
+/* Independent of width: a finger needs a bigger target than a mouse. Kept
+   separate so a narrow desktop window does not get chunky controls. */
+@media (pointer:coarse){
+  nav button,.iconbtn,.badge{min-height:38px}
+  .filter button,.ranges button{min-height:32px;padding:6px 12px}
+}
 </style>
 </head>
 <body>
@@ -194,8 +282,8 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
       <div class="filter" id="move-filter"></div>
       <div class="tblwrap">
         <table id="moves"><thead><tr>
-          <th>Time</th><th>Direction</th><th>Pool</th><th class="n">Size</th>
-          <th class="n">Rate</th><th>Why</th><th>Item</th>
+          <th>Time</th><th>Direction</th><th class="c2">Pool</th><th class="n">Size</th>
+          <th class="n c2">Rate</th><th class="c2">Why</th><th>Item</th>
         </tr></thead><tbody></tbody></table>
       </div>
     </div>
@@ -225,8 +313,9 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
       <div class="filter" id="filter"></div>
       <div class="tblwrap">
         <table id="sessions"><thead><tr>
-          <th>Time</th><th>Verdict</th><th>Tier</th><th>By</th><th>Client</th><th class="n">Size</th>
-          <th class="n">Cov</th><th class="n">Rate</th><th>File</th>
+          <th>Time</th><th>Verdict</th><th class="c2">Tier</th><th>By</th>
+          <th class="c2">Client</th><th class="n">Size</th>
+          <th class="n c2">Cov</th><th class="n c2">Rate</th><th>File</th>
         </tr></thead><tbody></tbody></table>
       </div>
     </div>
@@ -550,12 +639,12 @@ function renderHistory(h) {
     `<tr>
        <td class="sub" style="white-space:nowrap">${fmtT(s.ts)}</td>
        <td>${tag(s.label)}</td>
-       <td>${tierTag(s.tier)}</td>
+       <td class="c2">${tierTag(s.tier)}</td>
        <td>${svcTag(s.service, s.uid)}</td>
-       <td class="sub">${esc(s.client||"")}</td>
+       <td class="c2 sub">${esc(s.client||"")}</td>
        <td class="n">${fmtB(s.bytes)}</td>
-       <td class="n sub">${s.coverage != null ? (s.coverage*100).toFixed(0)+"%" : "–"}</td>
-       <td class="n sub">${s.rate ? fmtB(s.rate)+"/s" : "–"}</td>
+       <td class="n sub c2">${s.coverage != null ? (s.coverage*100).toFixed(0)+"%" : "–"}</td>
+       <td class="n sub c2">${s.rate ? fmtB(s.rate)+"/s" : "–"}</td>
        <td class="path"><b>${esc(base(s.path) || "unresolved")}</b></td>
      </tr>`).join("")
     || `<tr><td colspan="9" class="muted">no sessions match this filter</td></tr>`;
@@ -653,10 +742,10 @@ function renderMoves(d) {
   $("#moves tbody").innerHTML = rs.length ? rs.map(r => `<tr>
       <td class="sub" style="white-space:nowrap">${fmtT(r.ts)}</td>
       <td>${dirTag(r.kind)}</td>
-      <td class="sub">${esc(poolLabel(r.pool))}</td>
+      <td class="sub c2">${esc(poolLabel(r.pool))}</td>
       <td class="n">${fmtB(r.bytes)}</td>
-      <td class="n sub">${r.rate ? fmtB(r.rate) + "/s" : "\u2013"}</td>
-      <td class="sub">${esc(r.reason || "")}</td>
+      <td class="n sub c2">${r.rate ? fmtB(r.rate) + "/s" : "\u2013"}</td>
+      <td class="sub c2">${esc(r.reason || "")}</td>
       <td class="path">${esc(r.label || r.item || "")}</td>
     </tr>`).join("") : `<tr><td colspan="7" class="muted">nothing matches this filter</td></tr>`;
 }
