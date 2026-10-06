@@ -416,14 +416,17 @@ class HistorySource(Source):
             # uid was added after tier, so guard it the same way: a database written by
             # an older daemon has neither, and one failed query would empty the view.
             uid_col = "uid" if "uid" in cols else "NULL AS uid"
+            # tier0 -- where the session STARTED -- came last. Guarded the same way,
+            # and NULL on an older row means "not recorded", not "did not change".
+            tier0_col = "tier0" if "tier0" in cols else "NULL AS tier0"
             sessions = [
                 {"ts": r[0], "label": r[1], "client": r[2], "bytes": r[3],
                  "coverage": r[4], "duration": r[5], "rate": r[6], "path": r[7],
-                 "tier": r[8], "uid": r[9],
+                 "tier": r[8], "uid": r[9], "tier0": r[10],
                  "service": self._name_for(r[2], r[9])}
                 for r in con.execute(
                     f"SELECT ts,label,client,bytes,coverage,duration,rate,path,"
-                    f"{tier_col},{uid_col} "
+                    f"{tier_col},{uid_col},{tier0_col} "
                     f"FROM sessions WHERE {where} ORDER BY ts DESC LIMIT ?",
                     (*params, limit))]
             plays = [
@@ -479,12 +482,132 @@ class EventsSource(Source):
     def __init__(self, cfg=None):
         super().__init__(cfg)
         self.path = self.cfg.get("events_db")
+        # The observer's store, for answering "was this promotion any use?". A
+        # DIFFERENT database written by a different process, so it is opened
+        # separately and read-only, and its absence degrades the answer rather
+        # than failing the view.
+        self.observer_db = self.cfg.get("observer_db")
+
+    #: How far before a promotion to look for reads of the same file. A track is read
+    #: in full when it starts playing, and the promoter's gate is 30s, so the read
+    #: that explains an "unread" promotion is usually minutes old.
+    read_before_window = 3600.0
+
+    #: How close in time another file's read has to be to count as "what was actually
+    #: being read instead". Wide enough to cover the promoter's poll interval and the
+    #: transfer itself, narrow enough that an unrelated play does not get blamed.
+    concurrent_window = 300.0
+
+    #: Only a read of the SAME KIND of media can be what was read instead. Without
+    #: this, a film promoted while somebody was listening to music named the track --
+    #: true, and useless, because music plays nearly all the time on this estate, so
+    #: every unread film promotion would have named one.
+    KINDS = {"audio": (".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".wma",
+                       ".aac", ".alac", ".dsf", ".aiff"),
+             "video": (".mkv", ".mp4", ".m4v", ".avi", ".ts", ".mov", ".wmv",
+                       ".mpg", ".mpeg", ".webm")}
+
+    @classmethod
+    def media_kind(cls, path):
+        ext = os.path.splitext(str(path or ""))[1].lower()
+        for kind, exts in cls.KINDS.items():
+            if ext in exts:
+                return kind
+        return None
 
     def available(self):
         return bool(self.path) and os.path.exists(self.path)
 
     def _conn(self):
         return sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, timeout=5)
+
+    @staticmethod
+    def match_key(path):
+        """The last two components of a path, lowercased.
+
+        A transfer records an item RELATIVE to the tier root ("Film (2016)/Film
+        (2016) WEBDL-1080p.mkv"); the observer records the absolute union path the
+        client read. There is no stored mapping between them -- the roots table
+        maps a union to its branches, not a job's item prefix -- so the two are
+        joined on the deepest part they are guaranteed to share.
+
+        Two components rather than one, because a bare basename collides constantly
+        (every season has an "S01E01", every album a "cover.jpg"). Also emitted for
+        a single-component item, so a file promoted at the root of a job still
+        matches.
+        """
+        if not path:
+            return None
+        parts = [x for x in str(path).replace("\\", "/").split("/") if x]
+        if not parts:
+            return None
+        return "/".join(parts[-2:]).lower()
+
+    def _reads_since(self, rows):
+        """For each promotion in `rows`, what has actually READ the file since.
+
+        This is the difference between "PAMTS moved 3.5G" and "PAMTS moved 3.5G to
+        no purpose". A promotion exists to make the NEXT open fast; one that is
+        never read again spent fast tier on nothing, and until now that was only
+        visible by querying two databases by hand.
+
+        Demand reads only (PLAY/FETCH). A backup sweep copying the file afterwards
+        is not evidence the promotion helped -- and COPY outnumbers PLAY by
+        thousands to one, so counting it would make every promotion look used.
+        """
+        promotes = [r for r in rows if r.get("kind") == "promote" and r.get("item")]
+        if not promotes or not self.observer_db:
+            return
+        # Reach back BEFORE the earliest promotion too. "Nothing read it since" has
+        # two very different causes, and only the reads that came first separate them:
+        # a small file is read in full the moment it starts playing, so a promotion
+        # 30s later is simply late, not wrong.
+        earliest = min(r["ts"] for r in promotes) - self.read_before_window
+        try:
+            con = sqlite3.connect(f"file:{self.observer_db}?mode=ro", uri=True,
+                                  timeout=5)
+        except sqlite3.Error:
+            return
+        try:
+            seen = {}
+            qs = ",".join("?" * len(DEMAND_LABELS))
+            for path, ts, nbytes in con.execute(
+                    f"SELECT path, ts, bytes FROM sessions WHERE ts > ? "
+                    f"AND label IN ({qs}) AND path IS NOT NULL",
+                    (earliest, *DEMAND_LABELS)):
+                k = self.match_key(path)
+                if k:
+                    seen.setdefault(k, []).append((ts, nbytes or 0))
+        except sqlite3.Error:
+            return
+        finally:
+            con.close()
+        for r in promotes:
+            mine = seen.get(self.match_key(r["item"]), [])
+            hits = [h for h in mine if h[0] > r["ts"]]
+            before = [h for h in mine if h[0] <= r["ts"]]
+            # Distinguish "nothing read it" from "we cannot tell": a row older than
+            # the observer's retained sessions would look unread whatever happened.
+            r["read_since"] = {"n": len(hits),
+                               "bytes": sum(h[1] for h in hits),
+                               "last": max((h[0] for h in hits), default=None),
+                               "before": len(before)}
+            # The diagnostic case, and the reason any of this exists: PAMTS promoted
+            # something because it believed it was PLAYING, nothing ever read it, and
+            # it had not been read beforehand either. Then the useful question is what
+            # WAS being read at that moment -- if it was a different file, the
+            # now-playing lookup resolved to the wrong one. Reported as a fact (here
+            # is what was being read) rather than as a verdict.
+            if hits or before or "playing now" not in (r.get("reason") or "").lower():
+                continue
+            lo, hi = r["ts"] - self.concurrent_window, r["ts"] + self.concurrent_window
+            kind = self.media_kind(r["item"])
+            others = sorted({k for k, hs in seen.items()
+                             if k != self.match_key(r["item"])
+                             and self.media_kind(k) == kind
+                             and any(lo <= h[0] <= hi for h in hs)})
+            if others:
+                r["read_since"]["instead"] = others[:3]
 
     def collect(self, since=None, limit=200, buckets=48, window=86400 * 7):
         now = time.time()
@@ -544,6 +667,8 @@ class EventsSource(Source):
                     (since, width, since, width, since, since)):
                 row = util.setdefault(pool, [None] * (buckets + 1))
                 row[min(int(bucket), buckets)] = {"footprint": fp, "budget": bud}
+
+            self._reads_since(recent)
 
             return {"available": True, "recent": recent, "totals": totals,
                     "window_s": now - since, "bucket_s": width, "buckets": buckets,

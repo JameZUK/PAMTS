@@ -240,26 +240,44 @@ class TierResolver:
         self.counts = {"hot": 0, "cold": 0, "unknown": 0}
 
     def tier_of(self, path):
+        return self.tier_detail(path)[0]
+
+    def tier_detail(self, path):
+        """(tier, hot_since) -- when the fast copy appeared, where that is knowable.
+
+        hot_since is the fast copy's st_ctime, which is when THIS host created it.
+        A promotion is an rsync, and rsync preserves mtime but cannot preserve
+        ctime, so ctime is the moment the file landed on the fast tier -- verified
+        against the transfer log, where it matches the recorded promotion to the
+        second.
+
+        That is what makes "cold at the start, hot at the end" tellable. Without
+        it a session that began on the slow tier and was promoted while it was
+        still being read is stamped `hot`, because the tier is one stat taken when
+        the row is written -- which reads as though the fast tier served it.
+
+        It costs nothing: lstat instead of lexists is the same syscall.
+        """
         if not path:
             self.counts["unknown"] += 1
-            return None
+            return None, None
         # Read directly off the fast tier, not through a union.
         for f in self.fast:
             if path == f or path.startswith(f + "/"):
                 self.counts["hot"] += 1
-                return "hot"
+                return "hot", None
         for union, fast in self.unions:
             if path.startswith(union + "/"):
                 candidate = fast + path[len(union):]
                 try:
-                    hot = os.path.lexists(candidate)
+                    hot_since = os.lstat(candidate).st_ctime
                 except OSError:
-                    hot = False
-                key = "hot" if hot else "cold"
+                    hot_since = None
+                key = "hot" if hot_since is not None else "cold"
                 self.counts[key] += 1
-                return key
+                return key, hot_since
         self.counts["unknown"] += 1
-        return None
+        return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +426,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     bytes    INTEGER, coverage REAL, duration REAL, rate REAL,
     requests INTEGER, monotonic REAL, method TEXT,
     tier     TEXT,
-    uid      INTEGER
+    uid      INTEGER,
+    tier0    TEXT              -- the tier when the session STARTED; see tier_detail
 );
 CREATE INDEX IF NOT EXISTS sessions_ts ON sessions(ts);
 """
@@ -449,6 +468,11 @@ class Store:
                 c.execute("ALTER TABLE sessions ADD COLUMN uid INTEGER")
                 logging.info("sessions: added the 'uid' column (existing rows keep "
                              "NULL -- the collector did not report a credential yet)")
+            if "tier0" not in have:
+                c.execute("ALTER TABLE sessions ADD COLUMN tier0 TEXT")
+                logging.info("sessions: added the 'tier0' column (existing rows keep "
+                             "NULL -- where they started was not recorded, so they "
+                             "are shown with their closing tier alone)")
 
     def _conn(self):
         c = getattr(self._local, "c", None)
@@ -459,24 +483,28 @@ class Store:
             self._local.c = c
         return c
 
-    def record_session(self, path, sig, label, epoch_ts, tier=None):
+    def record_session(self, path, sig, label, epoch_ts, tier=None, tier0=None):
         """Log the session. Always happens, immediately, whatever the verdict.
 
         `tier` is recorded AT ACCESS TIME on purpose. Which tier served a read is a
         property of the moment, not of the file: tonight's eviction will move
         thousands of albums, and deriving the tier later would then report where the
         file is now rather than where it was read from.
+
+        `tier0` is where the session STARTED. The two differ when a promotion landed
+        while the file was still being read, which is common and invisible without
+        it -- the promoter's whole point is to react to a play in progress.
         """
         c = self._conn()
         with c:
             cur = c.execute(
                 "INSERT INTO sessions(ts,path,dev,ino,client,label,bytes,coverage,"
-                "duration,rate,requests,monotonic,method,tier,uid) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "duration,rate,requests,monotonic,method,tier,uid,tier0) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (epoch_ts, path, s64(sig.get("dev")), s64(sig.get("ino")),
                  sig.get("client"), label, sig["bytes"], sig["coverage"],
                  sig["duration"], sig["rate"], sig["requests"], sig["monotonic"],
-                 sig["method"], tier, sig.get("uid")))
+                 sig["method"], tier, sig.get("uid"), tier0))
             return cur.lastrowid
 
     def relabel_session(self, rowid, label):
@@ -602,8 +630,16 @@ class Daemon:
         # play history. The session is still logged, so nothing is hidden.
         if path is not None and not obs.is_media(path):
             self.non_media += 1
-        tier = self.tiers.tier_of(path) if self.tiers else None
-        rowid = self.store.record_session(path, sig, label, epoch, tier)
+        tier, hot_since = (self.tiers.tier_detail(path) if self.tiers
+                           else (None, None))
+        # Hot now, but the fast copy was created after this session's first read:
+        # it was promoted underneath a reader, so the slow tier is what answered
+        # the early part of it. Saying "hot" alone would credit the fast tier with
+        # a read it never served.
+        started = epoch - (sig.get("duration") or 0.0)
+        tier0 = ("cold" if (tier == "hot" and hot_since is not None
+                            and hot_since > started) else tier)
+        rowid = self.store.record_session(path, sig, label, epoch, tier, tier0)
 
         is_demand = bool(path) and label in DEMAND and obs.is_media(path)
         if not is_demand:
@@ -750,6 +786,22 @@ def make_handler(daemon):
                 elif u.path == "/sessions":
                     now = time.clock_gettime(time.CLOCK_MONOTONIC)
                     be = boot_epoch()
+
+                    # A session in flight never carried a tier at all, so the Now
+                    # view showed "-" for every live read. It is the one place the
+                    # answer changes while you watch: promotion reacts to a play in
+                    # progress, so a row that starts COLD and turns COLD->HOT is
+                    # the promoter working, live.
+                    def tiering(path, started):
+                        if not daemon.tiers:
+                            return {}
+                        tier, hot_since = daemon.tiers.tier_detail(path)
+                        return {"tier": tier,
+                                "tier0": ("cold" if (tier == "hot"
+                                                     and hot_since is not None
+                                                     and hot_since > started)
+                                          else tier)}
+
                     out = []
                     for sig, label in daemon.tracker.open_sessions:
                         path = (daemon.index.lookup(sig["dev"], sig["ino"], False)
@@ -764,7 +816,8 @@ def make_handler(daemon):
                                     "bytes": sig["bytes"],
                                     "coverage": sig["coverage"],
                                     "started": be + sig["t_first"],
-                                    "idle_s": round(now - sig["t_last"], 1)})
+                                    "idle_s": round(now - sig["t_last"], 1),
+                                    **tiering(path, be + sig["t_first"])})
                     self._send({"sessions": out})
                 else:
                     self._send({"error": "not found"}, 404)

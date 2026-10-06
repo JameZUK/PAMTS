@@ -373,21 +373,23 @@ check("counts are tallied, one per call",
 # The whole point: answering "cold" must never stat the slow branch, or the question
 # would wake the array that the system exists to keep asleep.
 _statted = []
-_real_lexists = os.path.lexists
+_real_lstat = os.lstat
 try:
-    def _spy(p):
+    def _spy(p, **kw):
         _statted.append(p)
-        return _real_lexists(p)
-    # The resolver calls os.path.lexists, so that is what has to be patched -- an
-    # earlier version of this test patched os.lexists and silently observed nothing,
-    # which made the assertion vacuous rather than failing.
-    os.path.lexists = _spy
+        return _real_lstat(p, **kw)
+    # The resolver calls os.lstat -- it needs the fast copy's ctime to tell a file
+    # that was already hot from one promoted mid-read, and lstat costs no more than
+    # the lexists this used to be. Patch exactly what the resolver calls: an earlier
+    # version of this test patched os.lexists while the code called os.path.lexists
+    # and silently observed nothing, which made the assertion vacuous.
+    os.lstat = _spy
     tr2 = d.TierResolver([(str(_union), str(_fast))])
     tr2.tier_of(str(_union / "Cold Show" / "e01.mkv"))
 finally:
-    os.path.lexists = _real_lexists
+    os.lstat = _real_lstat
 check("resolving a COLD read stats only the fast branch",
-      _statted and all(str(_slow) not in p for p in _statted), str(_statted))
+      _statted and all(str(_slow) not in str(p) for p in _statted), str(_statted))
 check("and it stats exactly once", len(_statted) == 1, str(_statted))
 
 # No map configured must mean no tier, not a crash.
@@ -763,5 +765,82 @@ check("force=True overrides the floor, so lookup() can refresh a stale index",
       len(_walks) == _burst + 1,
       f"{len(_walks)} walks total, {_burst} before the forced call")
 shutil.rmtree(_ir, ignore_errors=True)
+
+print("=== TIER0: a file promoted UNDERNEATH a reader is not credited to the fast tier")
+# The case this exists for, from the live estate: a film began playing off the slow
+# tier at 16:15:48, PAMTS promoted it at 16:21:26 because it was playing, and the
+# session closed at 16:30:56. One stat at close says "hot", which reads as though the
+# fast tier served it -- but the array answered the first six minutes, and the NFS
+# client holds the file open for the whole stream, so the promotion cannot have helped
+# this read at all. It helps the NEXT open.
+_w = tempfile.mkdtemp()
+_wu, _wf = pathlib.Path(_w) / "union", pathlib.Path(_w) / "fast"
+(_wu / "Film").mkdir(parents=True); (_wf / "Film").mkdir(parents=True)
+(_wu / "Film" / "a.mkv").write_text("x")
+_tw = d.TierResolver([(str(_wu), str(_wf))])
+
+check("a file absent from the fast branch is cold, with no hot_since",
+      _tw.tier_detail(str(_wu / "Film" / "a.mkv")) == ("cold", None))
+
+# Promote it: the fast copy's ctime is NOW, which is what makes this tellable.
+(_wf / "Film" / "a.mkv").write_text("x")
+_tier, _hot_since = _tw.tier_detail(str(_wu / "Film" / "a.mkv"))
+check("once the fast copy exists the read resolves hot", _tier == "hot")
+check("and hot_since reports when the fast copy appeared",
+      _hot_since is not None and abs(_hot_since - time.time()) < 60,
+      str(_hot_since))
+
+# rsync preserves mtime but cannot preserve ctime, which is exactly why ctime is the
+# promotion time. If this ever stops holding, tier0 silently becomes wrong.
+os.utime(str(_wf / "Film" / "a.mkv"), (1000000.0, 1000000.0))
+_t2, _h2 = _tw.tier_detail(str(_wu / "Film" / "a.mkv"))
+check("an old mtime does not drag hot_since back with it",
+      _h2 is not None and _h2 > 1000000.0 + 86400,
+      f"mtime 1000000, ctime {_h2}")
+
+check("a path already under the fast branch is hot with no stat at all",
+      _tw.tier_detail(str(_wf / "Film" / "a.mkv")) == ("hot", None))
+check("an unmapped path is still unknown", _tw.tier_detail("/nowhere/x") == (None, None))
+check("tier_of still returns just the tier, for every existing caller",
+      _tw.tier_of(str(_wu / "Film" / "a.mkv")) == "hot")
+
+# ... and the column it feeds.
+_wdb = str(pathlib.Path(_w) / "w.db")
+_ws = d.Store(_wdb)
+_sig = {"dev": 1, "ino": 2, "client": "c", "bytes": 10, "coverage": 0.5,
+        "duration": 900.0, "rate": 1.0, "requests": 5, "monotonic": 1.0,
+        "method": "splice", "uid": 1000}
+_ws.record_session("/u/a.mkv", _sig, "PLAY", 2000.0, tier="hot", tier0="cold")
+_ws.record_session("/u/b.mkv", _sig, "PLAY", 2000.0, tier="hot", tier0="hot")
+_c2 = _sq.connect(_wdb)
+_rows = dict(_c2.execute("SELECT path, tier0 FROM sessions").fetchall())
+_c2.close()
+check("the tier it STARTED on is stored alongside the tier it ended on",
+      _rows == {"/u/a.mkv": "cold", "/u/b.mkv": "hot"}, str(_rows))
+
+# A database written by the previous daemon has tier and uid but not tier0.
+_odb = str(pathlib.Path(_w) / "old.db")
+_c3 = _sq.connect(_odb)
+_c3.executescript("""
+CREATE TABLE plays (path TEXT PRIMARY KEY, last_play REAL NOT NULL,
+  play_count INTEGER NOT NULL DEFAULT 0, last_label TEXT, last_bytes INTEGER,
+  updated REAL NOT NULL);
+CREATE TABLE sessions (ts REAL NOT NULL, path TEXT, dev INTEGER, ino INTEGER,
+  client TEXT, label TEXT NOT NULL, bytes INTEGER, coverage REAL, duration REAL,
+  rate REAL, requests INTEGER, monotonic REAL, method TEXT, tier TEXT, uid INTEGER);
+""")
+_c3.execute("INSERT INTO sessions VALUES(1,'/old.mkv',1,2,'c','PLAY',1,0.5,1,1,1,1,"
+            "'s','hot',0)")
+_c3.commit(); _c3.close()
+d.Store(_odb)
+_c3 = _sq.connect(_odb)
+check("tier0 is added to an existing database rather than recreating it",
+      "tier0" in {r[1] for r in _c3.execute("PRAGMA table_info(sessions)")})
+check("and the rows that predate it are kept",
+      _c3.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1)
+check("an older row keeps NULL, which means 'not recorded', not 'did not change'",
+      _c3.execute("SELECT tier0 FROM sessions").fetchone()[0] is None)
+_c3.close()
+shutil.rmtree(_w, ignore_errors=True)
 
 summary()

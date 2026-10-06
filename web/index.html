@@ -104,6 +104,8 @@ td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
   word-break:break-all;color:var(--dim)}
 .path b{color:var(--ink);font-weight:500}
 .err{color:var(--error);font-size:12px}
+/* The promotion a live read caused, shown under that read. */
+.caused{color:var(--promote);font-size:12px}
 .muted{color:var(--dim)}
 details.raw{margin-top:8px}
 details.raw summary{cursor:pointer;color:var(--dim);font-size:12px}
@@ -283,7 +285,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
       <div class="tblwrap">
         <table id="moves"><thead><tr>
           <th>Time</th><th>Direction</th><th class="c2">Pool</th><th class="n">Size</th>
-          <th class="n c2">Rate</th><th class="c2">Why</th><th>Item</th>
+          <th class="n c2">Rate</th><th class="c2">Why</th><th>Used</th><th>Item</th>
         </tr></thead><tbody></tbody></table>
       </div>
     </div>
@@ -365,11 +367,26 @@ const tag = l => {
 };
 // Which tier served the read. Recorded when it happened, not derived now: the file
 // may have moved tiers since, so a lookup today would answer a different question.
-const tierTag = t => (t === "hot" || t === "cold")
-  ? `<span class="tag" style="color:var(--${t})" title="${t === "hot"
-      ? "served from the fast tier"
-      : "served from the slow tier - this read woke the array"}">${t.toUpperCase()}</span>`
-  : `<span class="sub">–</span>`;
+const tierTag = (t, t0) => {
+  // Promoted underneath a reader: it began on the slow tier and a promotion landed
+  // while it was still being read. Saying "HOT" alone -- which is all the tier
+  // column used to say, because it is one stat taken when the row is written --
+  // credits the fast tier with bytes the slow array actually served.
+  if (t === "hot" && t0 === "cold")
+    return `<span class="tag" style="color:var(--warn)" title="started on the slow \
+tier and was promoted while it was still being read. The early part of this read came \
+off the array; the benefit lands on the next open.">COLD\u2192HOT</span>`;
+  return (t === "hot" || t === "cold")
+    ? `<span class="tag" style="color:var(--${t})" title="${t === "hot"
+        ? "served from the fast tier"
+        : "served from the slow tier - this read woke the array"}">${t.toUpperCase()}</span>`
+    : `<span class="sub">\u2013</span>`;
+};
+// Join key between a TRANSFER (item, relative to the tier root) and a SESSION
+// (absolute union path). Must match EventsSource.match_key server-side.
+const keyOf = p => { if (!p) return null;
+  const parts = String(p).split("/").filter(Boolean);
+  return parts.length ? parts.slice(-2).join("/").toLowerCase() : null; };
 const base = p => { if (!p) return ""; const i = p.lastIndexOf("/"); return i < 0 ? p : p.slice(i+1); };
 const dir = p => { if (!p) return ""; const i = p.lastIndexOf("/"); return i < 0 ? "" : p.slice(0,i+1); };
 // Covers the apostrophe too. Nothing here interpolates into a single-quoted
@@ -386,6 +403,40 @@ const dirTag = k => k === "promote"
   ? `<span class="tag" style="color:var(--evict)" title="moved out to the slow tier">DEMOTE</span>`
   : tag(k);
 const poolLabel = p => p === "__shared__" ? "shared" : (p || "\u2013");
+// Did the promotion do any good? A promotion exists to make the NEXT open fast, so
+// the test is whether anything has read the file SINCE it landed. One that is never
+// read again spent fast tier on nothing -- which is how a mis-promotion shows
+// itself, and it is otherwise invisible without querying two databases by hand.
+//
+// "too soon" matters: a promotion three minutes old has not had the chance to be
+// read, and flagging it would make every fresh promotion look wasted.
+const TOO_SOON = 1800;
+const usedTag = r => {
+  if (r.kind !== "promote" || !r.read_since) return "";
+  const u = r.read_since;
+  if (u.n) return `<span class="tag" style="color:var(--ok)" title="read ${u.n} time\
+(s) since it was promoted, ${fmtB(u.bytes)} in total">READ ${fmtB(u.bytes)}</span>`;
+  if ((Date.now() / 1000 - r.ts) < TOO_SOON)
+    return `<span class="sub" title="promoted too recently to judge">too soon</span>`;
+  // Read in full BEFORE the promotion landed. Normal, and not a fault: a 5MB track
+  // is read the moment it starts playing, while the promoter's gate is 30s, so the
+  // copy arrives after the only read it will ever get. The promotion still pays off
+  // on a re-listen; it just cannot show up as a read "since".
+  if (u.before)
+    return `<span class="sub" title="read in full before the promotion landed, so \
+nothing has needed to read it since - expected for a small file">late</span>`;
+  // Nothing read it, and a DIFFERENT file was being read at that moment. This is the
+  // case worth looking at: PAMTS promoted what it believed was playing, and something
+  // else was. Stated as what was observed, not as a verdict.
+  if (u.instead && u.instead.length)
+    return `<span class="tag" style="color:var(--warn)" title="nothing has ever read \
+this. What was being read at the time: ${esc(u.instead.join(", "))}">OTHER FILE \
+READ</span>`;
+  // Everything else: unread, and nothing to say about why. A lookahead that did not
+  // pay off is an expected cost, not a fault, so it is stated quietly.
+  return `<span class="sub" title="nothing has read this since it was promoted${
+    r.reason ? " (" + esc(r.reason) + ")" : ""}">not read</span>`;
+};
 // Who did it. The whole point of the uid work: a read is attributable to a service,
 // not just to a host, because several services share one address. An unmapped reader
 // shows as its raw uid rather than vanishing -- that is a gap in --service, and
@@ -612,13 +663,31 @@ function renderNow(payload) {
 
   const all = (d.observer && d.observer.sessions) || [];
   const live = liveFilter(all);
+  // Promotions caused by what is playing RIGHT NOW. The promoter reacts to a play
+  // in progress, so by the time you notice the tier flip the cause has scrolled off
+  // the Transfers tab -- this puts the two next to each other while it happens.
+  // Keyed exactly as the server keys read_since, so the two views agree.
+  const promos = new Map();
+  for (const r of ((d.events || {}).recent || [])) {
+    if (r.kind !== "promote") continue;
+    const k = keyOf(r.item);
+    if (k && !promos.has(k)) promos.set(k, r);   // recent list is newest-first
+  }
+  const promoFor = s => {
+    const r = promos.get(keyOf(s.path));
+    // Only if it landed DURING this read. An older promotion is why the file is
+    // hot, not something this play caused.
+    return (r && s.started && r.ts >= s.started - 60) ? r : null;
+  };
   const hidden = all.length - live.length;
   $("#live-note").textContent = hidden > 0
     ? `${hidden} hidden by filter` : "";
   $("#live").innerHTML = live.length ? live.map(s =>
     `<div class="row" style="align-items:flex-start">
-       <span>${tag(s.label)} ${tierTag(s.tier)} ${svcTag(s.service, s.uid)}
-         <span class="path"><b>${esc(base(s.path) || "unresolved")}</b><br>${esc(dir(s.path))}</span>
+       <span>${tag(s.label)} ${tierTag(s.tier, s.tier0)} ${svcTag(s.service, s.uid)}
+         <span class="path"><b>${esc(base(s.path) || "unresolved")}</b><br>${esc(dir(s.path))}</span>${
+         (p => p ? `<br><span class="caused">\u21b3 promoted ${fmtB(p.bytes)} onto the \
+fast tier at ${fmtT(p.ts)}${p.reason ? " \u00b7 " + esc(p.reason) : ""}</span>` : "")(promoFor(s))}
        </span>
        <span class="n">${fmtB(s.bytes)}<br>
          <span class="sub">${s.coverage != null ? (s.coverage*100).toFixed(0)+"% · " : ""}${
@@ -639,7 +708,7 @@ function renderHistory(h) {
     `<tr>
        <td class="sub" style="white-space:nowrap">${fmtT(s.ts)}</td>
        <td>${tag(s.label)}</td>
-       <td class="c2">${tierTag(s.tier)}</td>
+       <td class="c2">${tierTag(s.tier, s.tier0)}</td>
        <td>${svcTag(s.service, s.uid)}</td>
        <td class="c2 sub">${esc(s.client||"")}</td>
        <td class="n">${fmtB(s.bytes)}</td>
@@ -707,7 +776,7 @@ function renderPools(t) {
 let moveKind = null;      // null = both directions
 function renderMoves(d) {
   if (!d || d.available === false) {
-    $("#moves tbody").innerHTML = `<tr><td colspan="7" class="muted">No transfer history
+    $("#moves tbody").innerHTML = `<tr><td colspan="8" class="muted">No transfer history
       yet. It appears once PAMTS has promoted or evicted something.</td></tr>`;
     $("#move-note").textContent = "";
     $("#move-cards").innerHTML = "";
@@ -746,8 +815,9 @@ function renderMoves(d) {
       <td class="n">${fmtB(r.bytes)}</td>
       <td class="n sub c2">${r.rate ? fmtB(r.rate) + "/s" : "\u2013"}</td>
       <td class="sub c2">${esc(r.reason || "")}</td>
+      <td>${usedTag(r)}</td>
       <td class="path">${esc(r.label || r.item || "")}</td>
-    </tr>`).join("") : `<tr><td colspan="7" class="muted">nothing matches this filter</td></tr>`;
+    </tr>`).join("") : `<tr><td colspan="8" class="muted">nothing matches this filter</td></tr>`;
 }
 
 // ------------------------------------------------------------- Graphs view

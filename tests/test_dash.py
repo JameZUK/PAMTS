@@ -988,5 +988,187 @@ check("each known service has its own colour",
       all(f"--svc-{n}" in _pg2 for n in ("plex", "lms", "navidrome", "arr")),
       "a shared colour makes the column unreadable at a glance")
 
+print("=== USE: a promotion that is never read again bought nothing")
+# From the live estate on 2026-10-06: Plex's now-playing resolved to a transcoded
+# duplicate, so 3.5G was promoted for a file the observer has never recorded a single
+# read of, while the copy actually being streamed was promoted three minutes later.
+# Both rows look identical on the Transfers tab. This is what tells them apart.
+_ur = tempfile.mkdtemp()
+_uev, _uobs = os.path.join(_ur, "events.db"), os.path.join(_ur, "observer.db")
+_now = time.time()
+
+_ce = sqlite3.connect(_uev)
+_ce.executescript(pamts_events.SCHEMA)
+_ce.executemany(
+    "INSERT INTO transfers(ts,kind,pool,job,item,bytes,seconds,rate,label,reason) "
+    "VALUES(?,?,?,?,?,?,?,?,?,?)", [
+        # read afterwards: the promotion did its job
+        (_now - 7200, "promote", "__shared__", None,
+         "Film (2016)/Film (2016) WEBDL-1080p.mkv", 5_873_386_224, 27.0, 2e8,
+         "Film", "playing now"),
+        # never read: a mis-promotion
+        (_now - 7400, "promote", "__shared__", None,
+         "Transcode-Output/Film (2016) WEBDL-1080p.m4v", 3_753_303_041, 17.0, 2e8,
+         "Film", "playing now"),
+        # read, but BEFORE it was promoted -- which proves nothing about the promotion
+        (_now - 60, "promote", "__shared__", None, "Show/e09.mkv", 100, 1.0, 100.0,
+         "Show e09", "next-up"),
+        # a demotion is not a promotion and gets no verdict at all
+        (_now - 100, "evict", "__shared__", None, "Old/e01.mkv", 100, 1.0, 100.0,
+         "Old e01", "stale"),
+    ])
+_ce.commit(); _ce.close()
+
+_co = sqlite3.connect(_uobs)
+_co.executescript("""
+CREATE TABLE sessions (ts REAL NOT NULL, path TEXT, dev INTEGER, ino INTEGER,
+  client TEXT, label TEXT NOT NULL, bytes INTEGER, coverage REAL, duration REAL,
+  rate REAL, requests INTEGER, monotonic REAL, method TEXT, tier TEXT, uid INTEGER,
+  tier0 TEXT);
+""")
+_co.executemany(
+    "INSERT INTO sessions(ts,path,label,bytes) VALUES(?,?,?,?)", [
+        (_now - 3600, "/media/library/movies/Film (2016)/Film (2016) "
+         "WEBDL-1080p.mkv", "PLAY", 1_051_071_216),
+        # a backup sweep touching the unread copy must NOT count as use
+        (_now - 3500, "/media/library/movies/Transcode-Output/Film (2016) "
+         "WEBDL-1080p.m4v", "COPY", 3_753_303_041),
+        # read before its promotion
+        (_now - 3000, "/media/library/tv/Show/e09.mkv", "PLAY", 50),
+    ])
+_co.commit(); _co.close()
+
+_ev = dash.EventsSource({"events_db": _uev, "observer_db": _uobs})
+_out = _ev.collect(limit=50)
+_by = {r["item"]: r for r in _out["recent"]}
+
+check("a promotion that was played afterwards is marked as used",
+      _by["Film (2016)/Film (2016) WEBDL-1080p.mkv"]["read_since"]["n"] == 1)
+check("and carries the bytes actually read, not the bytes promoted",
+      _by["Film (2016)/Film (2016) WEBDL-1080p.mkv"]["read_since"]["bytes"]
+      == 1_051_071_216)
+check("a promotion nothing has read shows zero",
+      _by["Transcode-Output/Film (2016) WEBDL-1080p.m4v"]["read_since"]["n"] == 0,
+      "this is the only signal that 3.5G went to a file nobody was playing")
+check("a backup COPY afterwards does not count as use",
+      _by["Transcode-Output/Film (2016) WEBDL-1080p.m4v"]["read_since"]["bytes"] == 0,
+      "COPY outnumbers PLAY by thousands to one; counting it makes every "
+      "promotion look used")
+check("a read BEFORE the promotion does not count either",
+      _by["Show/e09.mkv"]["read_since"]["n"] == 0,
+      "the question is whether promoting it helped, not whether it was ever read")
+check("a demotion gets no verdict at all",
+      "read_since" not in _by["Old/e01.mkv"])
+
+# The join key. There is no stored mapping from a job's item to a union path, so the
+# two are matched on the deepest part they share.
+_mk = dash.EventsSource.match_key
+check("item and union path produce the same key",
+      _mk("Film (2016)/Film (2016) WEBDL-1080p.mkv")
+      == _mk("/media/library/movies/Film (2016)/Film (2016) WEBDL-1080p.mkv"))
+check("two components, so identical basenames in different shows do not collide",
+      _mk("/media/library/tv/Show A/e01.mkv") != _mk("/media/library/tv/Show B/e01.mkv"),
+      "every season has an e01 and every album a cover.jpg")
+check("a single-component item still produces a key",
+      _mk("film.mkv") == "film.mkv")
+check("case does not break the join", _mk("A/B.MKV") == _mk("a/b.mkv"))
+check("an empty path has no key", _mk("") is None and _mk(None) is None)
+
+# Degradation: no observer database must cost the verdict, not the view.
+_ev2 = dash.EventsSource({"events_db": _uev, "observer_db": None})
+_out2 = _ev2.collect(limit=50)
+check("without the observer store the transfers still render",
+      len(_out2["recent"]) == 4)
+check("but no promotion is claimed to be unused",
+      all("read_since" not in r for r in _out2["recent"]),
+      "absent evidence must not read as evidence of absence")
+_ev3 = dash.EventsSource({"events_db": _uev,
+                                "observer_db": os.path.join(_ur, "gone.db")})
+check("a missing observer database does not raise", len(
+      _ev3.collect(limit=50)["recent"]) == 4)
+shutil.rmtree(_ur, ignore_errors=True)
+
+# "Nothing read it since" has two innocent explanations and one interesting one, and
+# the first version of this conflated all three -- it called every unread "playing now"
+# promotion a wrong-file case, which flagged half the music library, because a track is
+# read in full before the promotion that follows it ever lands.
+_ur2 = tempfile.mkdtemp()
+_ev2p, _ob2p = os.path.join(_ur2, "e.db"), os.path.join(_ur2, "o.db")
+_T = time.time() - 86400
+_c = sqlite3.connect(_ev2p); _c.executescript(pamts_events.SCHEMA)
+_c.executemany(
+    "INSERT INTO transfers(ts,kind,item,bytes,reason) VALUES(?,?,?,?,?)", [
+        (_T, "promote", "Album/01.flac", 5_000_000, "playing now"),
+        (_T, "promote", "Wrong/film.m4v", 3_000_000_000, "playing now"),
+        (_T, "promote", "Album/09.flac", 5_000_000, "lookahead"),
+    ])
+_c.commit(); _c.close()
+_c = sqlite3.connect(_ob2p)
+_c.executescript("CREATE TABLE sessions (ts REAL, path TEXT, label TEXT, bytes INT);")
+_c.executemany("INSERT INTO sessions VALUES(?,?,?,?)", [
+    # the track was read 2 minutes BEFORE its promotion -- it played, then was copied
+    (_T - 120, "/media/library/music/Album/01.flac", "PLAY", 5_000_000),
+    # and a different film was being read when the m4v was promoted
+    (_T + 30, "/media/library/movies/Right/film.mkv", "PLAY", 900_000_000),
+])
+_c.commit(); _c.close()
+_r2 = {r["item"]: r["read_since"] for r in
+       dash.EventsSource({"events_db": _ev2p, "observer_db": _ob2p}
+                         ).collect(limit=50)["recent"]}
+
+check("a read before the promotion is counted separately, not as use",
+      _r2["Album/01.flac"]["n"] == 0 and _r2["Album/01.flac"]["before"] == 1,
+      "the copy arrived after the only read it will get; that is late, not wasted")
+check("and such a row is not accused of anything",
+      "instead" not in _r2["Album/01.flac"],
+      "flagging it would flag most of the music library")
+check("an unread 'playing now' names what WAS being read at the time",
+      _r2["Wrong/film.m4v"].get("instead") == ["right/film.mkv"],
+      str(_r2["Wrong/film.m4v"]))
+check("a read of a different KIND of media is not named as the cause",
+      "album/01.flac" not in (_r2["Wrong/film.m4v"].get("instead") or []),
+      "music plays nearly all the time here, so without this every unread film "
+      "promotion would have named whatever track was on")
+check("an unread lookahead is never accused, however unread",
+      _r2["Album/09.flac"]["n"] == 0 and "instead" not in _r2["Album/09.flac"],
+      "a lookahead is a bet that is supposed to lose sometimes")
+shutil.rmtree(_ur2, ignore_errors=True)
+
+print("=== UI: the two findings are visible without reading the databases")
+check("a session promoted mid-read is shown as COLD->HOT, not HOT",
+      "COLD\\u2192HOT" in _pg2,
+      "saying HOT alone credits the fast tier with bytes the array served")
+check("both session views pass the starting tier",
+      _pg2.count("tierTag(s.tier, s.tier0)") == 2,
+      f"{_pg2.count('tierTag(s.tier, s.tier0)')} call sites")
+check("the transfers table has a column for whether a promotion was used",
+      "<th>Used</th>" in _pg2)
+_mv = _re2.search(r'<table id="moves"><thead><tr>(.*?)</tr>', _pg2, _re2.S).group(1)
+_mcols = _mv.count("<th")
+_mspans = set(_re2.findall(r'colspan="(\d+)" class="muted">nothing matches', _pg2))
+check("and its empty-state colspan matches", _mspans == {str(_mcols)},
+      f"{_mcols} columns, colspan {_mspans}")
+check("a promotion too recent to judge is not called unused",
+      "too soon" in _pg2 and "TOO_SOON" in _pg2,
+      "every fresh promotion would otherwise look wasted")
+check("a file read in full BEFORE its promotion is marked late, not unused",
+      '>late<' in _pg2,
+      "a track is read the moment it plays and the gate is 30s, so the copy always "
+      "arrives after the only read it will get -- that is not a fault")
+check("an unread promotion is stated quietly unless something else was read instead",
+      ">not read</span>" in _pg2 and "OTHER FILE " in _pg2,
+      "an unread lookahead is an expected cost; an unread 'playing now' with a "
+      "different file being read at the time is the case worth looking at")
+check("and what was read instead is named, as an observation",
+      "u.instead.join" in _pg2,
+      "a verdict the page cannot support would be worse than the fact")
+check("the Now view links a live read to the promotion it caused",
+      "promoFor" in _pg2 and "promoted ${fmtB(p.bytes)}" in _pg2)
+check("and only when the promotion landed during that read",
+      "r.ts >= s.started - 60" in _pg2,
+      "an older promotion is why the file is hot, not something this play caused")
+check("the page keys the join exactly as the server does",
+      "keyOf" in _pg2 and "slice(-2)" in _pg2,
+      "two different keys would make the two views disagree")
 
 summary()
