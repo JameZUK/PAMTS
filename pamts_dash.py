@@ -337,10 +337,54 @@ class HistorySource(Source):
     name = "history"
     ttl = 3.0
 
+    #: The uid->service map changes only when the observer restarts, so it is fetched
+    #: rarely. A stale map would name a session wrongly, which is worse than naming
+    #: nothing, hence a bounded lifetime rather than caching it forever.
+    map_ttl = 300.0
+
     def __init__(self, cfg=None):
         super().__init__(cfg)
         self.path = self.cfg.get("observer_db", "/var/lib/pamts/observer.db")
         self.limit = int(self.cfg.get("history_limit", 200))
+        self.url = (self.cfg.get("url") or "").rstrip("/")
+        self._map, self._map_at = None, 0.0
+
+    def _service_map(self):
+        """[(client|None, uid, name), ...] from the observer, cached.
+
+        The sessions table stores the uid, never the name, so this is what turns a
+        stored 101000 back into "plex". Failure is not fatal: without it rows simply
+        carry their uid and no name, which is what the dashboard showed before.
+        """
+        now = time.monotonic()
+        if self._map is not None and now - self._map_at < self.map_ttl:
+            return self._map
+        got = []
+        if self.url:
+            try:
+                st = _http_json(self.url + "/stats", timeout=5)
+                for e in st.get("service_map") or []:
+                    got.append((e.get("client"), e.get("uid"), e.get("name")))
+            except Exception:                                   # noqa: BLE001
+                got = self._map or []       # keep the last good map over nothing
+        self._map, self._map_at = got, now
+        return got
+
+    def _name_for(self, client, uid):
+        """Same precedence as the observer's resolver: an exact (client, uid) pair
+        wins over a bare uid, because 1000 is one service on one host and somebody
+        else on the next."""
+        if uid is None:
+            return None
+        pair = bare = None
+        for c, u, n in self._service_map():
+            if u != uid:
+                continue
+            if c == client:
+                pair = n
+            elif c is None:
+                bare = n
+        return pair or bare
 
     def available(self):
         return os.path.exists(self.path)
@@ -369,12 +413,17 @@ class HistorySource(Source):
             # not have the column. Ask once rather than letting every query fail.
             cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
             tier_col = "tier" if "tier" in cols else "NULL AS tier"
+            # uid was added after tier, so guard it the same way: a database written by
+            # an older daemon has neither, and one failed query would empty the view.
+            uid_col = "uid" if "uid" in cols else "NULL AS uid"
             sessions = [
                 {"ts": r[0], "label": r[1], "client": r[2], "bytes": r[3],
                  "coverage": r[4], "duration": r[5], "rate": r[6], "path": r[7],
-                 "tier": r[8]}
+                 "tier": r[8], "uid": r[9],
+                 "service": self._name_for(r[2], r[9])}
                 for r in con.execute(
-                    f"SELECT ts,label,client,bytes,coverage,duration,rate,path,{tier_col} "
+                    f"SELECT ts,label,client,bytes,coverage,duration,rate,path,"
+                    f"{tier_col},{uid_col} "
                     f"FROM sessions WHERE {where} ORDER BY ts DESC LIMIT ?",
                     (*params, limit))]
             plays = [

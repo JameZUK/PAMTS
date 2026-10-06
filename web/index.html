@@ -13,6 +13,10 @@
   --fetch:#0369a1; --unknown:#9ca3af; --seek:#0f766e; --error:#b91c1c;
   --hot:#15803d; --cold:#6e7781;
   --promote:#2563eb; --evict:#b45309; --grid:#eceef2;
+  --svc-plex:#b45309; --svc-lms:#15803d; --svc-navidrome:#7c3aed;
+  --svc-audiomuse:#0891b2; --svc-arr:#be185d; --svc-files:#4338ca;
+  --svc-photos:#0d9488; --svc-qobuz-sync:#a16207; --svc-storage:#6b7280;
+  --svc-downloader:#9f1239;
   --p1:#2563eb; --p2:#7c3aed; --p3:#0f766e; --p4:#b45309;
 }
 @media (prefers-color-scheme: dark){
@@ -23,6 +27,14 @@
     --fetch:#38bdf8; --unknown:#6b7280; --seek:#2dd4bf; --error:#f87171;
     --hot:#4ade80; --cold:#9aa1ad;
     --promote:#60a5fa; --evict:#fbbf24; --grid:#232730;
+  --svc-plex:#fbbf24; --svc-lms:#4ade80; --svc-navidrome:#c084fc;
+  --svc-audiomuse:#22d3ee; --svc-arr:#f472b6; --svc-files:#818cf8;
+  --svc-photos:#2dd4bf; --svc-qobuz-sync:#fcd34d; --svc-storage:#9aa1ad;
+  --svc-downloader:#fb7185;
+    --svc-plex:#fbbf24; --svc-lms:#4ade80; --svc-navidrome:#c084fc;
+    --svc-audiomuse:#22d3ee; --svc-arr:#f472b6; --svc-files:#818cf8;
+    --svc-photos:#2dd4bf; --svc-qobuz-sync:#fcd34d; --svc-storage:#9aa1ad;
+    --svc-downloader:#fb7185;
     --p1:#60a5fa; --p2:#c084fc; --p3:#2dd4bf; --p4:#fbbf24;
   }
 }
@@ -213,7 +225,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
       <div class="filter" id="filter"></div>
       <div class="tblwrap">
         <table id="sessions"><thead><tr>
-          <th>Time</th><th>Verdict</th><th>Tier</th><th>Client</th><th class="n">Size</th>
+          <th>Time</th><th>Verdict</th><th>Tier</th><th>By</th><th>Client</th><th class="n">Size</th>
           <th class="n">Cov</th><th class="n">Rate</th><th>File</th>
         </tr></thead><tbody></tbody></table>
       </div>
@@ -285,6 +297,22 @@ const dirTag = k => k === "promote"
   ? `<span class="tag" style="color:var(--evict)" title="moved out to the slow tier">DEMOTE</span>`
   : tag(k);
 const poolLabel = p => p === "__shared__" ? "shared" : (p || "\u2013");
+// Who did it. The whole point of the uid work: a read is attributable to a service,
+// not just to a host, because several services share one address. An unmapped reader
+// shows as its raw uid rather than vanishing -- that is a gap in --service, and
+// hiding it would hide the gap too.
+const svcTag = (service, uid) => {
+  if (service) {
+    const slug = String(service).toLowerCase().replace(/[^a-z0-9-]/g, "") || "unknown";
+    return `<span class="tag" style="color:var(--svc-${slug},var(--accent))" `
+         + `title="attributed by client address + uid">${esc(service)}</span>`;
+  }
+  if (uid !== null && uid !== undefined) {
+    return `<span class="tag" style="color:var(--unknown)" `
+         + `title="this client/uid pair is not named by --service">uid:${esc(uid)}</span>`;
+  }
+  return `<span class="sub">\u2013</span>`;
+};
 
 // Charts are drawn by hand rather than with a library because this page makes ZERO
 // external requests: it has to work on a storage box with no route to the internet,
@@ -500,7 +528,7 @@ function renderNow(payload) {
     ? `${hidden} hidden by filter` : "";
   $("#live").innerHTML = live.length ? live.map(s =>
     `<div class="row" style="align-items:flex-start">
-       <span>${tag(s.label)} ${tierTag(s.tier)}
+       <span>${tag(s.label)} ${tierTag(s.tier)} ${svcTag(s.service, s.uid)}
          <span class="path"><b>${esc(base(s.path) || "unresolved")}</b><br>${esc(dir(s.path))}</span>
        </span>
        <span class="n">${fmtB(s.bytes)}<br>
@@ -523,13 +551,14 @@ function renderHistory(h) {
        <td class="sub" style="white-space:nowrap">${fmtT(s.ts)}</td>
        <td>${tag(s.label)}</td>
        <td>${tierTag(s.tier)}</td>
+       <td>${svcTag(s.service, s.uid)}</td>
        <td class="sub">${esc(s.client||"")}</td>
        <td class="n">${fmtB(s.bytes)}</td>
        <td class="n sub">${s.coverage != null ? (s.coverage*100).toFixed(0)+"%" : "–"}</td>
        <td class="n sub">${s.rate ? fmtB(s.rate)+"/s" : "–"}</td>
        <td class="path"><b>${esc(base(s.path) || "unresolved")}</b></td>
      </tr>`).join("")
-    || `<tr><td colspan="8" class="muted">no sessions match this filter</td></tr>`;
+    || `<tr><td colspan="9" class="muted">no sessions match this filter</td></tr>`;
   // Where demand reads came from over 24h. Restricted to PLAY/FETCH server-side: a
   // cold PLAY is a spin-up somebody waited for, while a cold COPY is just the backup
   // doing its job and would swamp the ratio.

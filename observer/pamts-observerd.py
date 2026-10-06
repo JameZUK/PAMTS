@@ -318,6 +318,25 @@ class ServiceResolver:
         self.counts[name or ("unmapped:%s:%s" % (client or "?", uid))] += 1
         return name
 
+    def mapping(self):
+        """The map itself, JSON-safe, so consumers can resolve a stored uid.
+
+        The sessions table deliberately stores the uid and NOT the name -- the name is
+        an interpretation, and keeping it out of the history means correcting a wrong
+        mapping also corrects the past. The consequence is that anything reading the
+        table later needs this map to turn a uid back into a service, and until now
+        nothing published it: the dashboard had a uid column it could not name, which
+        is why attribution never appeared there.
+
+        A list rather than a dict because the key is a (client, uid) pair.
+        """
+        out = [{"client": c, "uid": u, "name": n}
+               for (c, u), n in sorted(self.by_pair.items(),
+                                       key=lambda kv: (kv[0][0] or "", kv[0][1]))]
+        out += [{"client": None, "uid": u, "name": n}
+                for u, n in sorted(self.by_uid.items())]
+        return out
+
     def describe(self, client, uid, uids=()):
         """A label for logs and the API: the service name when known, else the
         raw pair, so an unmapped reader is visible rather than silently blank."""
@@ -694,6 +713,9 @@ class Daemon:
             # (client, uid) pair nothing in --service covers, which is the thing
             # to look at when attribution has a hole.
             "services": dict(self.services.counts),
+            # The map, not just the tallies. Consumers that read the sessions table
+            # directly (the dashboard) need this to name a stored uid.
+            "service_map": self.services.mapping(),
             "index_files": self.index.files,
             "index_builds": self.index.builds,
             "index_build_s": round(self.index.last_build_s, 1),

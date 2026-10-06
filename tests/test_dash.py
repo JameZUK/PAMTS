@@ -864,5 +864,129 @@ check("the glyph is not the only carrier of state",
       ".sr-only" in _pg and "sr-only" in _pg.split("renderHealth")[1][:1500],
       "colour and shape alone are not accessible")
 
+# ================================================== attribution reaches the dashboard
+# The uid work made every read attributable to a service, and none of it showed in the
+# web interface. Three separate gaps, each of which alone makes the column blank:
+# the observer published tallies but not the uid->name MAP; HistorySource never
+# selected the uid column; and the page never rendered a service at all.
+print("\n=== ATTRIBUTION: uid -> service name, all the way to the page")
+
+_ad = pathlib.Path(tempfile.mkdtemp(prefix="pamts-attr-"))
+_adb = str(_ad / "observer.db")
+_c = _sq3.connect(_adb)
+_c.executescript("""
+CREATE TABLE plays (path TEXT PRIMARY KEY, last_play REAL NOT NULL,
+  play_count INTEGER NOT NULL DEFAULT 0, last_label TEXT, last_bytes INTEGER,
+  updated REAL NOT NULL);
+CREATE TABLE sessions (ts REAL NOT NULL, path TEXT, dev INTEGER, ino INTEGER,
+  client TEXT, label TEXT NOT NULL, bytes INTEGER, coverage REAL, duration REAL,
+  rate REAL, requests INTEGER, monotonic REAL, method TEXT, tier TEXT, uid INTEGER);
+""")
+_now = time.time()
+for _cl, _uid, _lab, _pth in (
+        ("10.0.0.62", 101000, "PLAY", "/media/library/tv/Show/e01.mkv"),
+        ("10.0.0.11", 114,    "COPY", "/media/library/music/A/01.flac"),
+        ("10.0.0.11", 1000,   "PLAY", "/media/library/music/B/02.flac"),
+        ("10.0.0.99", 4242,   "COPY", "/media/library/tv/Other/e01.mkv")):
+    _c.execute("INSERT INTO sessions(ts,path,client,label,bytes,coverage,duration,"
+               "rate,tier,uid) VALUES(?,?,?,?,?,?,?,?,?,?)",
+               (_now - 10, _pth, _cl, _lab, 1000, 1.0, 2.0, 500.0, "hot", _uid))
+_c.commit(); _c.close()
+
+
+class _MapSrc(dash.HistorySource):
+    """Pins the service map so the resolution logic is tested, not the HTTP fetch."""
+    def __init__(self, cfg, mapping):
+        super().__init__(cfg)
+        self._pinned = mapping
+
+    def _service_map(self):
+        return self._pinned
+
+
+_MAP = [("10.0.0.62", 101000, "plex"),
+        ("10.0.0.11", 114, "lms"),
+        ("10.0.0.11", 1000, "navidrome"),
+        (None, 1001, "downloader")]
+_h2 = _MapSrc({"observer_db": _adb, "history_limit": 50}, _MAP)
+_out = _h2.collect(since=0.0)
+# Keyed on (client, uid), not the basename: two of the fixture rows are both called
+# e01.mkv and a basename key silently kept only one of them.
+_by = {(r["client"], r["uid"]): r for r in _out["sessions"]}
+
+check("history rows now carry the uid",
+      all(r.get("uid") is not None for r in _out["sessions"]),
+      str([(r["client"], r.get("uid")) for r in _out["sessions"]]))
+check("a (client, uid) pair resolves to its service",
+      _by[("10.0.0.62", 101000)]["service"] == "plex",
+      str(_by[("10.0.0.62", 101000)].get("service")))
+check("two services behind ONE address are told apart",
+      (_by[("10.0.0.11", 114)]["service"],
+       _by[("10.0.0.11", 1000)]["service"]) == ("lms", "navidrome"),
+      str((_by[("10.0.0.11", 114)].get("service"),
+           _by[("10.0.0.11", 1000)].get("service"))))
+check("an unmapped pair resolves to None, not a guess",
+      _by[("10.0.0.99", 4242)]["service"] is None,
+      "an unnamed reader must stay unnamed rather than inherit someone else's name")
+
+# A bare uid entry applies to any client, but never beats an exact pair.
+_h3 = _MapSrc({"observer_db": _adb}, [(None, 114, "somewhere-else"),
+                                      ("10.0.0.11", 114, "lms")])
+check("an exact pair still beats a bare uid",
+      [r for r in _h3.collect(since=0.0)["sessions"]
+       if r["client"] == "10.0.0.11" and r["uid"] == 114][0]["service"] == "lms")
+
+# The map comes over HTTP; losing it must degrade to "no name", not break the view.
+class _NoMap(dash.HistorySource):
+    def _service_map(self):
+        return []
+_h4 = _NoMap({"observer_db": _adb})
+_r4 = _h4.collect(since=0.0)
+check("with no map the rows still load, just unnamed",
+      len(_r4["sessions"]) == 4 and all(r["service"] is None for r in _r4["sessions"]),
+      "an unreachable observer must not empty the history view")
+check("and the uid is still there so the page can show it raw",
+      all(r["uid"] is not None for r in _r4["sessions"]))
+
+# A database written before the uid column existed must not break the query.
+_odb = str(_ad / "old.db")
+_c = _sq3.connect(_odb)
+_c.executescript("""
+CREATE TABLE plays (path TEXT PRIMARY KEY, last_play REAL NOT NULL,
+  play_count INTEGER NOT NULL DEFAULT 0, last_label TEXT, last_bytes INTEGER,
+  updated REAL NOT NULL);
+CREATE TABLE sessions (ts REAL NOT NULL, path TEXT, dev INTEGER, ino INTEGER,
+  client TEXT, label TEXT NOT NULL, bytes INTEGER, coverage REAL, duration REAL,
+  rate REAL, requests INTEGER, monotonic REAL, method TEXT);
+""")
+_c.execute("INSERT INTO sessions(ts,path,client,label,bytes) VALUES(?,?,?,?,?)",
+           (_now, "/x.mkv", "10.0.0.1", "PLAY", 1))
+_c.commit(); _c.close()
+_r5 = _MapSrc({"observer_db": _odb}, _MAP).collect(since=0.0)
+check("a pre-uid database still returns rows, with uid None",
+      len(_r5["sessions"]) == 1 and _r5["sessions"][0]["uid"] is None,
+      str(_r5["sessions"]))
+shutil.rmtree(_ad, ignore_errors=True)
+
+print("\n=== ATTRIBUTION: the page actually renders it")
+_pg2 = (ROOT / "web" / "index.html").read_text()
+check("there is a service tag helper", "const svcTag" in _pg2)
+check("it is rendered in the live list AND the sessions table",
+      _pg2.count("svcTag(s.service, s.uid)") == 2,
+      f"{_pg2.count('svcTag(s.service, s.uid)')} call sites")
+check("an unmapped reader shows its raw uid rather than nothing",
+      "uid:${esc(uid)}" in _pg2,
+      "hiding an unmapped pair would hide the gap in --service too")
+check("the sessions table gained a column for it", "<th>By</th>" in _pg2)
+import re as _re2
+_ths = _re2.search(r'<table id="sessions"><thead><tr>(.*?)</tr>', _pg2, _re2.S).group(1)
+_cols = _ths.count("<th")
+_spans = set(_re2.findall(r'colspan="(\d+)" class="muted">no sessions', _pg2))
+check("the empty-state colspan matches the column count",
+      _spans == {str(_cols)}, f"{_cols} columns, colspan {_spans}")
+check("each known service has its own colour", 
+      all(f"--svc-{n}" in _pg2 for n in ("plex", "lms", "navidrome", "arr")),
+      "a shared colour makes the column unreadable at a glance")
+
 
 summary()
